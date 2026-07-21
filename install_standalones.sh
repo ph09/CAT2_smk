@@ -7,12 +7,6 @@
 # for linux.x86_64 into ./standalones/ and marks them executable. `setup_env.sh`
 # then puts ./standalones/ on PATH.
 #
-# A few helpers CAT2 uses are NOT UCSC tools and must be provided separately:
-#   - aln2hints.pl        (ships with AUGUSTUS, under auxprogs/aln2wig or scripts/)
-#   - pal2nal.pl          (http://www.bork.embl.de/pal2nal/)
-# These are listed at the end so you know what still needs to be placed in
-# ./standalones/ by hand (or symlinked from your AUGUSTUS install).
-#
 # Usage:
 #   chmod +x install_standalones.sh
 #   ./install_standalones.sh            # linux.x86_64 (default)
@@ -24,8 +18,6 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="$REPO_DIR/standalones"
 ARCH="${UCSC_ARCH:-linux.x86_64}"
 BASE="http://hgdownload.soe.ucsc.edu/admin/exe/${ARCH}"
-
-mkdir -p "$DEST"
 
 # UCSC Kent command-line utilities required by the pipeline.
 UCSC_TOOLS=(
@@ -98,9 +90,4 @@ if [[ "$fail" -ne 0 ]]; then
 fi
 
 cat <<'EOF'
-
-The following helpers are NOT UCSC tools and are not fetched by this script.
-Place them in ./standalones/ (or symlink from your AUGUSTUS / pal2nal install):
-  - aln2hints.pl   (AUGUSTUS: scripts/aln2hints.pl)
-  - pal2nal.pl     (http://www.bork.embl.de/pal2nal/)
 EOF
