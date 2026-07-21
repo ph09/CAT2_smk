@@ -8,6 +8,7 @@ This is the current version of CAT2 and is under active development.
 cd /path/to/CAT2_smk
 conda env create -f environment.yaml
 conda activate cat2
+pip install --no-deps -e .
 chmod +x install_standalones.sh
 ./install_standalones.sh
 ```

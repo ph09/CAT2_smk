@@ -47,9 +47,22 @@ for needle in "echo start" "consensus_runner.py" "--gp-list TOKEN" "--db-path DB
 done
 pass "run:-block f-strings emitted intact"
 
-# ── 3. real Snakefile: parse + config validation + DAG build ─────────────────
-snakemake -n --configfile input.yaml --config work_dir=.smoke_work >/dev/null \
-    || fail "dry-run failed (parse / config validation / DAG build)"
-pass "Snakefile parses, config validates, full DAG builds (dry-run)"
+# ── 3. cat2 package imports (validates the editable install) ─────────────────
+python -c "import cat, tools; import cat.scheduler; import tools.hal; import tools.sqlInterface" \
+    || fail "cat2 package import failed (did 'pip install --no-deps -e .' run?)"
+pass "cat2 package imports (cat, tools, cat.scheduler, tools.hal)"
+
+# ── 4. real Snakefile: parse + config validation + DAG build ─────────────────
+# This parses the whole Snakefile, which calls `halStats` on the input HAL at
+# import time to enumerate genomes. It therefore needs the HAL tools on PATH
+# (cactus install) and the bundled test HAL, neither of which exists in a bare
+# CI runner. Run it only when both are available; otherwise skip (not fail).
+if command -v halStats >/dev/null 2>&1 && [[ -f test_data/vertebrates.hal ]]; then
+    snakemake -n --configfile input.yaml --config work_dir=.smoke_work >/dev/null \
+        || fail "dry-run failed (parse / config validation / DAG build)"
+    pass "Snakefile parses, config validates, full DAG builds (dry-run)"
+else
+    echo "SKIP: full DAG dry-run (needs halStats on PATH + test_data/vertebrates.hal)"
+fi
 
 echo "SMOKE TEST OK"

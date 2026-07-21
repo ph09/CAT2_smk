@@ -25,6 +25,9 @@ jobs:
           miniforge-version: latest
           conda-remove-defaults: true
 
+      - name: Install cat2 package (editable, no deps)
+        run: pip install --no-deps -e .
+
       - name: Show versions
         run: |
           python --version

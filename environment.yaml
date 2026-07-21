@@ -63,8 +63,11 @@ dependencies:
   - ucsc-wigtobigwig
   - pip:
     # parasail (SW aligner C-extension) is more reliably obtained from PyPI
-    # wheels than conda for this platform; install it (with its deps) first.
+    # wheels than conda for this platform.
     - parasail >=1.3.4
-    # Install cat2 package only; conda deps above must not be re-resolved by pip.
-    - --no-deps
-    - -e .
+    # NOTE: install the cat2 package itself AFTER creating the env, with:
+    #   pip install --no-deps -e .
+    # It is kept out of this pip: block on purpose — bare pip option lines like
+    # "--no-deps" are passed to pip as requirements by conda/mamba and break env
+    # creation. --no-deps ensures the conda-resolved deps above are not
+    # re-resolved from PyPI.
