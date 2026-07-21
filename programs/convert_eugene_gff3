@@ -1,0 +1,162 @@
+#!/usr/bin/env python
+"""Convert EuGene-style GFF3 to CAT-compatible GFF3."""
+import argparse
+import re
+from collections import Counter, OrderedDict
+
+from BCBio import GFF
+
+
+TRANSCRIPT_FEATURE_TYPES = {
+    'ncRNA', 'tRNA', 'rRNA', 'mRNA', 'snRNA', 'snoRNA', 'lncRNA', 'lnc_RNA',
+    'transcript', 'primary_transcript', 'miRNA',
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_gff3', help='EuGene GFF3 file')
+    parser.add_argument('output_gff3', help='CAT-compatible output GFF3')
+    return parser.parse_args()
+
+
+def strip_prefix(feature_id):
+    if ':' in feature_id:
+        return feature_id.split(':', 1)[1]
+    return feature_id
+
+
+def first_value(values):
+    if not values:
+        return None
+    val = values[0]
+    if ',' in val:
+        parts = [p.strip() for p in val.split(',') if p.strip()]
+        for part in parts:
+            if re.match(r'CM\d+\.\d+g\d+', part):
+                return part
+        return parts[-1]
+    return val
+
+
+def sanitize_attr_value(val):
+    return val.replace(';', '%3B').replace('=', '%3D').replace(',', '%2C')
+
+
+def gene_biotype_for_transcript(tx_type):
+    if tx_type == 'mRNA':
+        return 'protein_coding'
+    return tx_type
+
+
+def add_tags_to_feature(feature, gene_info, tx_info):
+    if feature.type == 'gene':
+        gene_id = strip_prefix(first_value(feature.qualifiers.get('ID', feature.qualifiers.get('locus_tag'))))
+        if gene_id is None:
+            return
+        gene_name = first_value(feature.qualifiers.get('Name', feature.qualifiers.get('locus_tag', [gene_id])))
+        gene_name = strip_prefix(gene_name)
+        gene_info['gene_id'] = gene_id
+        gene_info['gene_name'] = gene_name
+        feature.qualifiers['gene_id'] = [gene_id]
+        feature.qualifiers['gene_name'] = [gene_name]
+        return
+
+    if feature.type in TRANSCRIPT_FEATURE_TYPES:
+        gene_id = gene_info['gene_id']
+        gene_name = gene_info['gene_name']
+        tx_id = strip_prefix(first_value(feature.qualifiers.get('ID', feature.qualifiers.get('locus_tag'))))
+        tx_name = first_value(feature.qualifiers.get('Name', [tx_id]))
+        tx_name = strip_prefix(tx_name)
+        biotype = gene_biotype_for_transcript(feature.type)
+        tx_info['transcript_id'] = tx_id
+        tx_info['transcript_name'] = tx_name
+        tx_info['transcript_biotype'] = biotype
+        feature.qualifiers['gene_id'] = [gene_id]
+        feature.qualifiers['gene_name'] = [gene_name]
+        feature.qualifiers['gene_biotype'] = [biotype]
+        feature.qualifiers['transcript_id'] = [tx_id]
+        feature.qualifiers['transcript_name'] = [tx_name]
+        feature.qualifiers['transcript_biotype'] = [biotype]
+        return
+
+    if feature.type in ['CDS', 'exon', 'five_prime_UTR', 'three_prime_UTR', 'UTR']:
+        if 'transcript_id' not in tx_info:
+            return
+        feature.qualifiers['gene_id'] = [gene_info['gene_id']]
+        feature.qualifiers['gene_name'] = [gene_info['gene_name']]
+        feature.qualifiers['gene_biotype'] = [tx_info['transcript_biotype']]
+        feature.qualifiers['transcript_id'] = [tx_info['transcript_id']]
+        feature.qualifiers['transcript_name'] = [tx_info['transcript_name']]
+        feature.qualifiers['transcript_biotype'] = [tx_info['transcript_biotype']]
+
+
+def gene_has_transcript_child(gene_feature):
+    return any(sf.type in TRANSCRIPT_FEATURE_TYPES for sf in gene_feature.sub_features)
+
+
+def add_gene_level_transcript_tags(gene_feature, tx_counts):
+    if 'transcript_id' in gene_feature.qualifiers:
+        return
+    tx_id = gene_feature.qualifiers['gene_id'][0]
+    if tx_id in tx_counts:
+        tx_counts[tx_id] += 1
+        tx_id = f'{tx_id}.{tx_counts[tx_id]}'
+    else:
+        tx_counts[tx_id] = 0
+    child_type = next(sf.type for sf in gene_feature.sub_features)
+    biotype = gene_biotype_for_transcript(child_type)
+    gene_feature.qualifiers['transcript_id'] = [tx_id]
+    gene_feature.qualifiers['transcript_name'] = [tx_id]
+    gene_feature.qualifiers['transcript_biotype'] = [biotype]
+    if 'gene_biotype' not in gene_feature.qualifiers:
+        gene_feature.qualifiers['gene_biotype'] = [biotype]
+
+
+def construct_new_qualifiers(feature):
+    new_qualifiers = OrderedDict()
+    for key, val in feature.qualifiers.items():
+        if key not in ['ID', 'Parent', 'Name']:
+            key = key.lower()
+        if len(val) > 1:
+            val = [' '.join(sanitize_attr_value(x) for x in val)]
+        else:
+            val = [sanitize_attr_value(val[0])]
+        new_qualifiers[key] = val
+    return new_qualifiers
+
+
+def feature_traversal(feature):
+    yield feature
+    for sub_feature in feature.sub_features:
+        yield from feature_traversal(sub_feature)
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    tx_counts = Counter()
+    records = list(GFF.parse(args.input_gff3))
+    for seqrecord in records:
+        for parent_feature in seqrecord.features:
+            gene_info = {}
+            tx_info = {}
+            for feature in feature_traversal(parent_feature):
+                add_tags_to_feature(feature, gene_info, tx_info)
+                new_qualifiers = construct_new_qualifiers(feature)
+                feature.qualifiers = new_qualifiers
+            if parent_feature.type == 'gene' and not gene_has_transcript_child(parent_feature):
+                add_gene_level_transcript_tags(parent_feature, tx_counts)
+                biotype = parent_feature.qualifiers['transcript_biotype'][0]
+                parent_feature.qualifiers['gene_biotype'] = [biotype]
+                for feature in feature_traversal(parent_feature):
+                    if feature.type != 'gene':
+                        feature.qualifiers['gene_id'] = parent_feature.qualifiers['gene_id']
+                        feature.qualifiers['gene_name'] = parent_feature.qualifiers['gene_name']
+                        feature.qualifiers['gene_biotype'] = [biotype]
+                        feature.qualifiers['transcript_id'] = parent_feature.qualifiers['transcript_id']
+                        feature.qualifiers['transcript_name'] = parent_feature.qualifiers['transcript_name']
+                        feature.qualifiers['transcript_biotype'] = [biotype]
+                        feature.qualifiers = construct_new_qualifiers(feature)
+
+    with open(args.output_gff3, 'w') as fh:
+        GFF.write(records, fh)

@@ -1,0 +1,310 @@
+#!/usr/bin/env python
+"""
+Convert CHM13 GFF3 format to CAT2_smk compatible format.
+
+The CHM13 GFF3 uses ID/Parent attributes, but CAT2_smk expects:
+- gene_id attribute on genes
+- transcript_id attribute on transcripts  
+- gene_id attribute on transcripts (linking to parent gene)
+- transcript_name attribute on transcripts
+"""
+import argparse
+import re
+from collections import OrderedDict
+
+
+# Utility constants
+DEFAULT_TRANSCRIPT_PLACEHOLDER_VALUES = {'transcript'}
+
+
+def infer_gene_biotype_from_transcript_attrs(attrs, parent_info=None):
+    """Infer a sensible gene biotype from transcript-level attributes."""
+    parent_info = parent_info or {}
+    existing = parent_info.get('gene_biotype')
+    if existing:
+        return existing
+
+    pseudo = get_attribute(attrs, 'pseudo')
+    if pseudo and pseudo.lower() == 'true':
+        return 'pseudogene'
+
+    transcript_biotype = get_attribute(attrs, 'transcript_biotype')
+    if transcript_biotype:
+        tb = transcript_biotype.lower()
+        mapping = {
+            'mrna': 'protein_coding',
+            'protein_coding': 'protein_coding',
+            'lnc_rna': 'lncRNA',
+            'lncrna': 'lncRNA',
+            'lincrna': 'lncRNA',
+            'mirna': 'miRNA',
+            'ncrna': 'ncRNA',
+            'ncrna_predicted': 'ncRNA',
+            'trna': 'tRNA',
+            'rrna': 'rRNA',
+            'scrna': 'scRNA',
+            'snrna': 'snRNA',
+            'snorna': 'snoRNA',
+            'sirna': 'siRNA',
+            'pirna': 'piRNA',
+            'srp_rna': 'SRP_RNA',
+            'antisense_rna': 'antisense_RNA',
+            'guide_rna': 'guide_RNA',
+            'macro_lncrna': 'lncRNA',
+        }
+        inferred = mapping.get(tb)
+        if inferred:
+            return inferred
+        # fallback to cleaned transcript biotype string
+        return transcript_biotype
+
+    gbkey = get_attribute(attrs, 'gbkey')
+    if gbkey:
+        gk = gbkey.lower()
+        gbkey_mapping = {
+            'mrna': 'protein_coding',
+            'ncrna': 'ncRNA',
+            'mistrna': 'ncRNA',
+            'rrna': 'rRNA',
+            'trna': 'tRNA',
+            'snrna': 'snRNA',
+            'snorna': 'snoRNA',
+            'scrna': 'scRNA',
+            'pirna': 'piRNA',
+            'mirna': 'miRNA',
+            'lincrna': 'lncRNA',
+            'lncrna': 'lncRNA',
+            'misc_rna': 'misc_RNA',
+        }
+        inferred = gbkey_mapping.get(gk)
+        if inferred:
+            return inferred
+
+    return None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Convert CHM13 GFF3 to CAT2_smk compatible format'
+    )
+    parser.add_argument('input_gff3', help='Input CHM13 GFF3 file')
+    parser.add_argument('output_gff3', help='Output converted GFF3 file')
+    return parser.parse_args()
+
+
+def parse_attributes(attr_string):
+    """Parse GFF3 attribute string into a dictionary.
+    
+    Handles spaces in attribute values correctly by only splitting on
+    the first '=' sign for each attribute. Also handles URL-encoded
+    semicolons and equals signs.
+    """
+    attrs = OrderedDict()
+    # Split by semicolon, but be careful with URL-encoded semicolons (%3B)
+    # We'll split on semicolons that are not part of %3B
+    # Simple approach: replace %3B with a placeholder, split, then restore
+    placeholder = '___SEMICOLON_PLACEHOLDER___'
+    attr_string = attr_string.replace('%3B', placeholder)
+    parts = attr_string.split(';')
+    
+    for part in parts:
+        part = part.replace(placeholder, '%3B')  # Restore encoded semicolons
+        part = part.strip()
+        if not part:
+            continue
+        # Split only on the first '=' to handle values with spaces
+        # Also handle URL-encoded equals (%3D)
+        if '=' in part:
+            # Replace %3D with placeholder temporarily
+            part_with_placeholder = part.replace('%3D', '___EQUALS_PLACEHOLDER___')
+            if '=' in part_with_placeholder:
+                key, value = part_with_placeholder.split('=', 1)
+                key = key.replace('___EQUALS_PLACEHOLDER___', '%3D').strip()
+                value = value.replace('___EQUALS_PLACEHOLDER___', '%3D').strip()
+                attrs[key] = value
+            else:
+                # No unescaped equals, treat as attribute without value
+                attrs[part.replace('___EQUALS_PLACEHOLDER___', '%3D')] = ''
+        else:
+            # Handle attributes without values
+            attrs[part] = ''
+    return attrs
+
+
+def format_attributes(attrs):
+    """Format attributes dictionary back into GFF3 attribute string.
+    
+    Properly escapes special characters while preserving spaces in values.
+    Only escapes semicolons and equals that aren't already URL-encoded.
+    """
+    parts = []
+    for key, value in attrs.items():
+        if value:
+            # Escape special characters in values (semicolon and equals)
+            # Note: spaces are allowed in GFF3 attribute values and don't need escaping
+            # We need to avoid double-encoding already-encoded values
+            # Process character by character to detect %XX patterns
+            new_value = []
+            i = 0
+            while i < len(value):
+                char = value[i]
+                # Check if we're in a %XX pattern (look back 2 chars)
+                if i >= 2 and value[i-2] == '%' and value[i-1] in '0123456789ABCDEFabcdef' and char in '0123456789ABCDEFabcdef':
+                    # We're in a %XX pattern, don't encode
+                    new_value.append(char)
+                    i += 1
+                elif char == ';':
+                    new_value.append('%3B')
+                    i += 1
+                elif char == '=':
+                    new_value.append('%3D')
+                    i += 1
+                else:
+                    new_value.append(char)
+                    i += 1
+            value = ''.join(new_value)
+            parts.append(f"{key}={value}")
+        else:
+            parts.append(key)
+    return ';'.join(parts)
+
+
+def get_attribute(attrs, key, default=None):
+    """Get attribute value, case-insensitive."""
+    for k, v in attrs.items():
+        if k.lower() == key.lower():
+            return v
+    return default
+
+
+def set_attribute(attrs, key, value):
+    """Set attribute, preserving case of existing key if present."""
+    # Check if key exists (case-insensitive)
+    for k in attrs.keys():
+        if k.lower() == key.lower():
+            attrs[k] = value
+            return
+    # Key doesn't exist, add it
+    attrs[key] = value
+
+
+def convert_gff3_line(line, gene_id_map, gene_info_map):
+    """Convert a single GFF3 line to CAT2_smk format."""
+    if line.startswith('#'):
+        return line
+    
+    fields = line.rstrip().split('\t')
+    if len(fields) < 9:
+        return line
+    
+    # Parse attributes
+    attrs = parse_attributes(fields[8])
+    feature_type = fields[2]
+    
+    # Process based on feature type
+    if feature_type == 'gene':
+        # Extract gene_id from ID attribute
+        gene_id = get_attribute(attrs, 'ID')
+        if gene_id:
+            set_attribute(attrs, 'gene_id', gene_id)
+        
+        # Ensure gene_name exists (use gene_id if not present)
+        gene_name = get_attribute(attrs, 'gene_name')
+        if not gene_name:
+            gene_name = get_attribute(attrs, 'gene')
+        if not gene_name and gene_id:
+            set_attribute(attrs, 'gene_name', gene_id)
+
+        # Track gene metadata for transcripts
+        gene_biotype = get_attribute(attrs, 'gene_biotype') or get_attribute(attrs, 'gene_type')
+        gene_info_map[gene_id] = {
+            'gene_biotype': gene_biotype,
+            'gene_name': get_attribute(attrs, 'gene_name') or gene_name or gene_id
+        }
+    
+    elif feature_type == 'transcript':
+        # Extract transcript_id from ID attribute
+        transcript_id = get_attribute(attrs, 'ID')
+        if transcript_id:
+            set_attribute(attrs, 'transcript_id', transcript_id)
+        
+        # Extract gene_id from Parent attribute
+        parent_id = get_attribute(attrs, 'Parent')
+        if parent_id:
+            # The Parent should be the gene ID
+            set_attribute(attrs, 'gene_id', parent_id)
+            # Store in map for child features (exons, CDS, etc.)
+            gene_id_map[transcript_id] = parent_id
+
+            # Populate gene-level metadata on transcript
+            parent_info = gene_info_map.setdefault(parent_id, {})
+            gene_biotype = parent_info.get('gene_biotype')
+            inferred_gene_biotype = gene_biotype or infer_gene_biotype_from_transcript_attrs(attrs, parent_info)
+            if inferred_gene_biotype:
+                set_attribute(attrs, 'gene_biotype', inferred_gene_biotype)
+                parent_info['gene_biotype'] = inferred_gene_biotype
+
+            # If transcript biotype is missing or placeholder, assign from gene inference
+            tx_biotype = get_attribute(attrs, 'transcript_biotype')
+            if (not tx_biotype) and inferred_gene_biotype:
+                set_attribute(attrs, 'transcript_biotype', inferred_gene_biotype)
+            elif tx_biotype and inferred_gene_biotype and tx_biotype.lower() in DEFAULT_TRANSCRIPT_PLACEHOLDER_VALUES:
+                set_attribute(attrs, 'transcript_biotype', inferred_gene_biotype)
+
+            # Ensure gene_name propagates from parent if available
+            parent_gene_name = parent_info.get('gene_name')
+            if parent_gene_name and not get_attribute(attrs, 'gene_name'):
+                set_attribute(attrs, 'gene_name', parent_gene_name)
+ 
+        # Set transcript_name (use transcript_id if not present)
+        resolved_tx_name = (get_attribute(attrs, 'transcript_name') or
+                            get_attribute(attrs, 'Name') or
+                            transcript_id)
+        if resolved_tx_name:
+            set_attribute(attrs, 'transcript_name', resolved_tx_name)
+        
+        # Ensure gene_name exists
+        gene_name = get_attribute(attrs, 'gene_name')
+        if not gene_name:
+            gene_name = get_attribute(attrs, 'gene')
+        if not gene_name and parent_id:
+            set_attribute(attrs, 'gene_name', parent_id)
+    
+    elif feature_type in ['exon', 'CDS', 'five_prime_utr', 'three_prime_utr']:
+        # For child features, inherit gene_id from parent transcript
+        parent_id = get_attribute(attrs, 'Parent')
+        if parent_id and parent_id in gene_id_map:
+            gene_id = gene_id_map[parent_id]
+            set_attribute(attrs, 'gene_id', gene_id)
+            parent_info = gene_info_map.get(gene_id, {})
+            gene_biotype = parent_info.get('gene_biotype')
+            if not gene_biotype:
+                gene_biotype = infer_gene_biotype_from_transcript_attrs(attrs, parent_info)
+                if gene_biotype:
+                    parent_info['gene_biotype'] = gene_biotype
+                    gene_info_map[gene_id] = parent_info
+            if gene_biotype and not get_attribute(attrs, 'gene_biotype'):
+                set_attribute(attrs, 'gene_biotype', gene_biotype)
+ 
+    # Reconstruct the line
+    fields[8] = format_attributes(attrs)
+    return '\t'.join(fields) + '\n'
+
+
+def main():
+    args = parse_args()
+    
+    # Map to track gene_id for transcripts and their children
+    # Key: transcript_id or feature_id, Value: gene_id
+    gene_id_map = {}
+    gene_info_map = {}
+    
+    with open(args.input_gff3, 'r') as infile, open(args.output_gff3, 'w') as outfile:
+        for line in infile:
+            converted_line = convert_gff3_line(line, gene_id_map, gene_info_map)
+            outfile.write(converted_line)
+
+
+if __name__ == '__main__':
+    main()
+

@@ -1,0 +1,117 @@
+{% set name = "cat2" %}
+{% set version = "2.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/ComparativeGenomicsToolkit/Comparative-Annotation-Toolkit/archive/refs/tags/v{{ version }}.tar.gz
+  # sha256: run `sha256sum` on the tarball after tagging and fill in here
+
+build:
+  number: 0
+  # Some bundled standalone tools are Linux x86_64 binaries; osx support
+  # requires replacing them with conda deps or compiling from source.
+  skip: True  # [not linux]
+  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -v
+
+requirements:
+  host:
+    - python >=3.7
+    - pip
+    - setuptools
+  run:
+    - python >=3.7
+    # Python packages
+    - toil >=7.0.0
+    - seaborn >=0.13.0
+    - pandas >=2.0.0
+    - frozendict >=2.4.1
+    - configobj >=5.0
+    - sqlalchemy >=2.0
+    - ete3 >=3.0
+    - pysam >=0.19.1
+    - numpy >=2.2.0
+    - scipy >=1.13.3
+    - bx-python >=0.13
+    - gffutils >=0.10
+    - biopython >=1.76
+    # Workflow orchestration
+    - snakemake-minimal >=8.0
+    # Bioinformatics tools
+    - augustus
+    - stringtie
+    - liftoff
+    - minimap2
+    - diamond
+    - samtools >=1.15
+    - bedtools
+    - gffread
+    - hal
+    - miniprot
+    - pal2nal
+    # UCSC genome browser tools (individually packaged in bioconda)
+    - ucsc-axtchain
+    - ucsc-bamtopsl
+    - ucsc-bedsort
+    - ucsc-bedtobigbed
+    - ucsc-chainmergesort
+    - ucsc-chainnet
+    - ucsc-chainsort
+    - ucsc-fasize
+    - ucsc-fatotwobit
+    - ucsc-genepredtobed
+    - ucsc-genepredtogtf
+    - ucsc-gff3togenepred
+    - ucsc-gtftogenepred
+    - ucsc-liftover
+    - ucsc-netchainsubset
+    - ucsc-netfilter
+    - ucsc-netsyntenic
+    - ucsc-pslcdnafilter
+    - ucsc-pslcheck
+    - ucsc-pslmap
+    - ucsc-pslrecalcmatch
+    - ucsc-wigtobigwig
+    # The following UCSC tools may not have individual bioconda packages;
+    # they are bundled in standalones/ and installed via build.sh:
+    #   chainToBigChain, clusterGenes, genePredToBigGenePred,
+    #   genePredToFakePsl, hgLoadChain, pslMapPostChain, pslPosTarget,
+    #   pslToBigPsl, transMapPslToGenePred, bam-to-bigchain
+
+test:
+  commands:
+    - cat_to_ncbi_submit --help
+    - translate_gene_pred --help
+    - snakemake --version
+
+about:
+  home: https://github.com/ComparativeGenomicsToolkit/Comparative-Annotation-Toolkit
+  license: Apache-2.0
+  license_file: LICENSE
+  summary: Comparative Annotation Toolkit for gene annotation across multiple genomes
+  description: |
+    CAT2 is a Snakemake pipeline for comparative genomic annotation.
+    It maps reference gene annotations to target genomes using TransMap,
+    Augustus, an in-house transcript-level transMap (``txTM``, replacing the
+    external Liftoff tool), StringTie, and PacBio long-read data, then builds
+    a consensus gene set with quality metrics and transcript classification.
+
+    Cluster backends: SLURM, SGE (UGE / OGE / SGE-classic), and single-machine
+    local execution are all supported via ``execution_mode`` in input.yaml.
+    The SGE backend is site-agnostic: parallel-environment name, memory
+    resource flag, and hostname-exclude syntax are exposed under
+    ``cluster.sge`` so a single config works at any Grid Engine site.
+
+    After installation, data files (Augustus config, minisplice models) are
+    at $CONDA_PREFIX/share/cat/. Update your input.yaml to point there:
+      tm_cfg_path: "$CONDA_PREFIX/share/cat/extrinsic.ETM1.cfg"
+      tmr_cfg_path: "$CONDA_PREFIX/share/cat/extrinsic.ETM2.cfg"
+      pb_cfg_path:  "$CONDA_PREFIX/share/cat/extrinsic.M.RM.PB.E.W.cfg"
+      minisplice_model: "$CONDA_PREFIX/share/cat/vi2-7k.kan"
+      minisplice_calibration: "$CONDA_PREFIX/share/cat/vi2-7k.kan.cali"
+
+extra:
+  recipe-maintainers:
+    - pnhebbar

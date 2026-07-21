@@ -1,0 +1,432 @@
+# config.yaml
+work_dir: "test_install"
+hal: "test_data/vertebrates.hal"
+annotation: "test_data/GRCm38.mm10.subset.gff3"
+
+# --- Protein set for miniprot / augMP -----------------------------------------
+# augMP aligns a protein database to every target genome with miniprot; it is the
+# one mode that can find genes ABSENT from the reference annotation (lineage-
+# specific genes, or genes lost in the reference lineage). It can only find such
+# genes if the protein DB actually contains proteins from those lineages, so with
+# a single-species (e.g. human-only) reference you will miss non-reference genes.
+#
+# Provide proteins one of two ways:
+#
+#   (A) Static file — a protein FASTA you already have:
+protein_fasta: "test_data/GRCm38.mm10.subset.prot.fa"
+#
+#   (B) Auto-built multi-species DB — list species/taxa and CAT2 downloads UniProt
+#       reference proteomes, merges + de-duplicates them, and uses the result as
+#       the miniprot input. Needs outbound internet on the machine running the
+#       controller (the download runs there, once, and is cached). If `protein_db`
+#       is set it takes precedence over `protein_fasta`. Example for a panprimate
+#       run (pick a handful of well-spread representatives — dumping all species is
+#       slower with no recall gain since most genes are shared):
+#
+# protein_db:
+#   species:                       # names or HAL genome names (auto-normalised)
+#     - "Homo sapiens"
+#     - "Macaca mulatta"
+#     - "Callithrix jacchus"
+#     - "Eulemur fulvus"
+#     - "Mus musculus"             # rodent outgroup broadens coverage
+#   # taxa: [9606, 9544]           # alternative/supplement: NCBI taxon IDs
+#   #
+#   # clades: pull one proteome per member species of a genus/family (or any higher
+#   # rank). Use this for coverage of poorly annotated species via their better-
+#   # annotated relatives — you name the clade, CAT2 finds the members that have a
+#   # proteome and keeps the best (highest BUSCO first, up to max_per_clade). Names
+#   # or taxon IDs both work.
+#   clades:
+#     - "Cercopithecidae"          # Old World monkeys (family)
+#     - "Lemuridae"                # lemurs (family)
+#     - "Callitrichidae"           # marmosets/tamarins (family)
+#   max_per_clade: 25              # cap proteomes taken per clade (best BUSCO first)
+#   clade_include_other: false     # also accept non-reference proteomes when expanding clades
+#   base_fasta: ""                 # optional: also include your own proteins here
+#                                  #   (e.g. proteins derived from the reference GFF3)
+#   dedup: true                    # collapse identical sequences (keeps miniprot fast)
+#   min_len: 20                    # drop proteins shorter than this
+#   out: "panprimate_data/protein_db.fa"   # built DB path (default: <work_dir>/protein_db/protein_db.fa)
+#
+# You can also build the DB by hand and point protein_fasta at it:
+#   python scripts/build_protein_db.py --out panprimate_data/protein_db.fa \
+#       --clades "Cercopithecidae,Lemuridae,Callitrichidae" \
+#       --species "Homo sapiens,Mus musculus"
+ref_genome: "mm10"
+genomes: ["mm10", "bosTau8", "canFam3", "galGal4", "rheMac3", "rn6", "hg38", "monDom5"]
+transcriptomic_data:
+  mm10:
+    bam:
+      - "test_data/bams/mm10/ERR033016Aligned.sortedByCoord.out.bam"
+      - "test_data/bams/mm10/ERR033015Aligned.sortedByCoord.out.bam"
+    intronbam:
+      - "test_data/bams/mm10/16493_7_4Aligned.sortedByCoord.out.bam"
+  galGal4:
+    bam:
+      - "test_data/bams/galGal4/ERR753966Aligned.sortedByCoord.out.bam"
+  rheMac3:
+    bam:
+      - "test_data/bams/rheMac3/SRR636926Aligned.sortedByCoord.out.bam"
+  hg38:
+    bam:
+      - "test_data/bams/hg38/ERR579132Aligned.sortedByCoord.out.bam"
+    isoseq_bam:
+      - "test_data/bams/hg38/isoseqAligned.sortedByCoord.out.bam"
+
+rnaseq_genomes: ["hg38", "galGal4", "rheMac3"]
+isoseq_genomes: ["hg38"]
+augustus: true
+augustus_species: "human"
+tm_cfg_path: "augustus_cfgs/extrinsic.ETM1.cfg"
+tmr_cfg_path: "augustus_cfgs/extrinsic.ETM2.cfg"
+pb_cfg_path: "augustus_cfgs/extrinsic.M.RM.PB.E.W.cfg"
+augustus_pb: true
+stringtie: true
+stringtie_genomes: ["hg38"]
+txTM: true
+pb_genome_chunksize: 11000000
+pb_genome_overlap: 1000000
+stringtie_convert_script: "programs/convert_stringtie_gff3"
+minisplice_model: "standalones/vi2-7k.kan"
+minisplice_calibration: "standalones/vi2-7k.kan.cali"
+
+# miniprot alignment sensitivity (augMP path). All keys are optional; the values
+# below are the built-in defaults, tuned more permissively than miniprot's own
+# defaults so more paralogous / divergent gene copies are recovered. Uncomment
+# and edit to override. Raising sensitivity finds more candidate genes at the
+# cost of runtime and more false positives (which downstream consensus filtering
+# on the real per-alignment metrics is expected to prune).
+# miniprot:
+#   splice_model: 2            # -j  2=vertebrate/insect, 1=general, 0=none
+#   max_intron: "auto"         # "auto" => -I (3.6*sqrt(refLen)); or e.g. "500k" => -G500k
+#   min_secondary_ratio: 0.2   # -p  min secondary-to-primary score ratio (miniprot default 0.7)
+#   max_secondary: 100         # -N  consider at most N secondary alignments (default 30)
+#   out_n: 100                 # --outn  max alignments emitted per query (default 1000)
+#   out_s: 0.5                 # --outs  emit if score >= this * bestScore (default 0.99)
+#   out_c: 0.1                 # --outc  emit if this fraction of query aligned (default 0.1)
+#   extra_flags: ""            # any additional raw miniprot flags
+#   # Converter-time filters (default 0 = keep every alignment, filter later in consensus):
+#   min_coverage: 0.0
+#   min_identity: 0.0
+#   min_mapq: 0
+#   min_score: 0
+intron_rnaseq_support: 0
+exon_rnaseq_support: 0
+intron_annot_support: 0
+exon_annot_support: 0
+original_intron_support: 0
+denovo_num_introns: 1
+denovo_splice_support: 1
+denovo_exon_support: 1
+denovo_ignore_novel_genes: False
+denovo_only_novel_genes: False
+denovo_novel_end_distance: 0
+denovo_allow_novel_ends: False
+denovo_allow_unsupported: True
+denovo_allow_bad_annot_or_tm: False
+require_pacbio_support: False
+in_species_rna_support_only: False
+rebuild_consensus: true
+
+# ─── recall vs precision ──────────────────────────────────────────────────────
+# high_recall is an opt-in master switch. When true, the recall-limiting gates
+# across every mode (transMap paralog/overlap filtering, txTM/augMP coverage
+# floors, consensus length/CNV/fragment cutoffs, denovo support, and the
+# postprocess low-support drop) are loosened in one place so fewer genes are
+# missed, at the cost of precision / more false positives. It overrides the
+# individual keys below. Leave it false (default) and tune individual keys for
+# fine-grained control. See the Snakefile _HIGH_RECALL_OVERRIDES for exact values.
+high_recall: false
+
+# transMap filtering knobs (all now honoured; previously some were hardcoded).
+# global_near_best: pslCDnaFilter -globalNearBest (higher keeps more paralogs).
+global_near_best: 0.15
+# tm_filter_overlapping: collapse overlapping paralogous genes (false keeps more).
+# tm_min_cover / tm_min_span: pslCDnaFilter floors (lower keeps more, default 0.1/0.2).
+# tm_max_ref_span: drop alignments spanning > N x the reference (default 5).
+# tm_paralog_rescue_min_coverage: rescue collapse victims above this cov (default 0.5).
+#tm_filter_overlapping: true
+#tm_min_cover: 0.1
+#tm_min_span: 0.2
+#tm_max_ref_span: 5
+#tm_paralog_rescue_min_coverage: 0.5
+
+# Consensus fragment reclassification: a non-denovo transcript with coverage AND
+# identity below both thresholds is relabelled 'fragment'. Set either to 0 to
+# keep such transcripts as regular orthologs (default 30/30).
+#consensus_fragment_max_coverage: 30
+#consensus_fragment_max_identity: 30
+
+# Protein-only novel genes: lineage-specific genes found ONLY via protein/augMP
+# evidence (a miniprot model whose protein is not a reference transcript, e.g. a
+# non-human primate gene absent from a human reference). Off by default: such
+# models are otherwise kept but mislabeled as 'ortholog' with a synthetic id and
+# exposed to CDS-overlap resolution. When true, they are relabeled putative_novel
+# protein_coding with clean MP-NOVEL-<genome>-N ids, redundant per-locus copies
+# are collapsed, and (unless protein_novel_keep_overlapping) only intergenic loci
+# are kept. Automatically enabled under high_recall. Pair with a multi-species
+# protein_db (above) so augMP actually has non-reference proteins to find.
+#keep_protein_only_novel: false
+#protein_novel_min_coverage: 0.0    # extra miniprot coverage floor (percent) for these genes
+#protein_novel_min_identity: 0.0    # extra miniprot identity floor (percent)
+#protein_novel_keep_overlapping: false  # true = also keep ones overlapping a reference gene's CDS
+
+# Consensus postprocess drop rule tuning (postprocess stays on; disable entirely
+# with consensus_postprocess: false). The low-support drop now protects loci
+# backed by a strong mode (transMap/augTM/augPB/strg) by default.
+#postprocess_min_introns_low_support: 3
+#postprocess_low_support_fraction: 0.3
+#postprocess_augpb_chimera_exon_ratio: 1.5
+
+cnv_score_similarity: 0.88
+txTM_min_coverage: 30
+txTM_strict_metrics: true
+txTM_transmap_anchor_overlap: 0.25
+txTM_min_coverage_no_transmap: 80
+txTM_strict_metrics_no_transmap: true
+augMP_min_coverage_no_anchor: 80
+augMP_strict_metrics_no_anchor: true
+min_pc_len_ratio_txTM_only_rescue: 0.4
+rescue_reference_isoforms: true
+rescue_alternative_isoforms: true
+rescue_min_txTM_coverage: 70
+filter_overlapping_genes: False
+overlapping_ignore_bases: 0
+# Annotate reconstructed ancestral genomes from the Cactus HAL alignment.
+# When enabled, internal tree nodes on the subtree spanning config genomes are
+# auto-detected (or set explicitly via ancestor_genomes) and projected using
+# alignment-only modes (no RNA-seq / Augustus PB).
+annotate_ancestors: true
+ancestor_genomes: ["Anc0", "Anc1", "Anc2", "Anc3", "Anc4", "Anc5", "Anc6"]   # optional explicit list, e.g. ["Anc0", "Anc1"]
+ancestor_modes: ["transMap", "transMap_pairwise", "txTM"]
+
+# Execution mode
+# Determines the cluster backend used by every CAT2 rule and helper script.
+# The pipeline is scheduler-agnostic; pick whatever matches your site.
+#
+#   "auto"  - (default) detect the scheduler from the environment:
+#             sbatch on PATH -> slurm; qsub on PATH with $SGE_ROOT set -> sge;
+#             otherwise -> local. Set one of the values below explicitly if
+#             auto-detection is wrong for your site (e.g. PBS/Torque, LSF, or
+#             an SGE install without $SGE_ROOT — use "local" or set "sge").
+#   "slurm" - submit jobs via `sbatch` and poll with `sacct`/`squeue`. Per-rule
+#             resources are read from the `slurm:` block below.
+#   "sge"   - submit jobs via `qsub` and poll with `qstat` + per-task sentinel
+#             files. Per-rule resources are still read from the `slurm:` block
+#             below (same keys); SGE-specific knobs (parallel environment,
+#             memory flag, hostname exclude syntax) live under `cluster.sge`.
+#   "local" - every rule runs directly on this machine without a scheduler
+#             (works anywhere: laptop, a single large node, or any cluster's
+#             interactive/compute node). augustus_parallel / augustus_pb_parallel
+#             / hints_db process chunks via multiprocessing instead of job
+#             arrays. Best for small inputs or when no supported scheduler is
+#             available; resource hints come from the `local:` block below.
+execution_mode: "auto"
+
+# ─── SGE-specific knobs (used when execution_mode: sge) ──────────────────────
+# Site-agnostic Grid Engine config. The CAT2 pipeline reads these once at
+# Snakefile load and threads them through every SGE job script. Defaults are
+# the most-portable values across UGE / OGE / SGE-classic; override per-site.
+#
+# The per-rule mem / cpus / time still come from the `slurm:` block below,
+# so you can flip execution_mode between slurm and sge without touching the
+# resource numbers.
+#
+# Tip: on first use at a new site, start with one small genome / one rule
+# (evaluate_transcripts is the simplest array exercise) to confirm
+# parallel_env + memory_flag work before scaling up.
+cluster:
+  sge:
+    queue: "all.q"           # default queue; mapped from per-rule "partition" overrides too
+    parallel_env: "smp"      # PE used for #$ -pe; varies by site: smp / threaded / openmp / mpi
+    memory_flag: "h_vmem"    # per-slot memory resource: h_vmem / mem_free / s_vmem
+    hostname_exclude: ""     # SGE form ("!h1&!h2"); a comma list is auto-converted
+    module_load: ""          # `module load` line inserted at top of every job script
+    extra_qsub_flags: []     # site-specific quirks (e.g. ["-P projectcode", "-l gpu=0"])
+
+# ─── Cluster settings (per-rule resources are shared between SLURM and SGE) ──
+# Historically named "slurm:" for back-compat. The keys under `rules:` map to
+# `mem` / `cpus` / `time` and are read regardless of execution_mode (SLURM and
+# SGE both honour them; local mode uses the `local:` block further down).
+slurm:
+  # SLURM partition to submit to. Must exist on your cluster; set to "" to use
+  # the cluster's default partition. Ignored on SGE (uses cluster.sge.queue).
+  partition: "medium"
+  # Optional, site-specific: nodes to avoid (comma list). Safe to set to "".
+  # The value below is specific to the UCSC phoenix cluster — change/clear it.
+  exclude_nodes: "phoenix-22,phoenix-23,phoenix-24,phoenix-09,phoenix-10"
+  # Optional: module to load at the top of every cluster job script.
+  # Set to "" or omit to skip module loading.
+  # Per-rule resource overrides. Absent keys fall back to built-in defaults.
+  # mem: string like "128G"; cpus: int; time: "HH:MM:SS"
+  rules:
+    prepare_genome_files:
+      mem:   "128G"
+      cpus:  64
+      time:  "01:00:00"
+    prepare_reference_files:
+      mem:   "64G"
+      cpus:  2
+      time:  "01:00:00"
+    transmap_map_psl:
+      mem:   "16G"
+      cpus:  4
+      time:  "01:00:00"
+    transmap_unfiltered_gtf:
+      mem:   "16G"
+      cpus:  1
+      time:  "01:00:00"
+    minimap2_bam:
+      mem:   "64G"
+      cpus:  32
+      time:  "12:00:00"
+    bam_to_chain:
+      mem:   "16G"
+      cpus:  4
+      time:  "01:00:00"
+    transmap_pairwise_map_psl:
+      mem:   "16G"
+      cpus:  4
+      time:  "01:00:00"
+    run_chaining_per_genome:
+      mem:   "128G"
+      cpus:  64
+      time:  "12:00:00"
+      timeout_hours: 24
+    run_miniprot:
+      mem:   "128G"
+      cpus:  64
+      time:  "04:00:00"
+      timeout_hours: 12
+      minisplice_parallel: true
+      minisplice_cpus: 4
+      minisplice_mem: "8G"
+      minisplice_time: "01:00:00"
+      minisplice_max_concurrent: 25
+    run_txTM:
+      mem:   "128G"
+      cpus:  64
+      time:  "04:00:00"
+    generate_consensus:
+      mem:   "128G"
+      cpus:  32
+      time:  "12:00:00"
+    generate_hints:
+      mem:   "256G"
+      cpus:  128
+      time:  "12:00:00"
+      max_concurrent_jobs: 50
+    align_transcripts:
+      mem:   "64G"
+      cpus:  64
+      time:  "02:00:00"
+      max_concurrent_jobs: 200
+      timeout_hours: 12
+      chunk_size: 500
+    evaluate_transcripts:
+      mem:   "16G"
+      cpus:  1
+      time:  "01:00:00"
+      max_concurrent_jobs: 20
+      chunk_size: 500
+    find_denovo_parents:
+      mem:   "32G"
+      cpus:  1
+      time:  "01:00:00"
+      max_concurrent_jobs: 20
+
+    # ── Augustus parallel pipelines ─────────────────────────────────────
+    # augustus_parallel.py / augustus_pb_parallel.py run a 3-stage pipeline
+    # (preprocessing → hints/jobs → transcripts/jobs). Each stage has its
+    # own partition, memory, walltime, and concurrency cap. Defaults below
+    # match the historical values used at UCSC; override per-site as needed.
+    augustus_tm:
+      preprocessing_partition: "medium"
+      jobs_partition:          "medium"
+      transcripts_partition:   "medium"
+      hints_mem:               "64G"
+      jobs_mem:                "16G"
+      transcripts_mem:         "16G"
+      setup_time:              "04:00:00"
+      hints_time:              "12:00:00"
+      jobs_time:               "04:00:00"
+      transcripts_time:        "04:00:00"
+      hints_concurrency:       50
+      jobs_concurrency:        200
+      transcripts_concurrency: 100
+    augustus_pb:
+      preprocessing_partition: "medium"
+      jobs_partition:          "medium"
+      transcripts_partition:   "medium"
+      hints_mem:               "64G"
+      jobs_mem:                "16G"
+      transcripts_mem:         "16G"
+      setup_time:              "04:00:00"
+      hints_time:              "12:00:00"
+      jobs_time:               "04:00:00"
+      transcripts_time:        "04:00:00"
+      hints_concurrency:       50
+      jobs_concurrency:        200
+      transcripts_concurrency: 100
+
+# ─── Local mode thread/memory hints ──────────────────────────────────────────
+# These tell Snakemake how many cores/GB a rule consumes when running locally,
+# so it can limit concurrency correctly. Only the heavy rules need entries here.
+local:
+  rules:
+    prepare_genome_files:
+      threads: 64
+      mem_gb:  128
+      time_h:  4
+    prepare_reference_files:
+      threads: 2
+      mem_gb:  64
+      time_h:  2
+    transmap_map_psl:
+      threads: 4
+      mem_gb:  16
+      time_h:  2
+    minimap2_bam:
+      threads: 32
+      mem_gb:  64
+      time_h:  12
+    bam_to_chain:
+      threads: 4
+      mem_gb:  16
+      time_h:  2
+    run_chaining_per_genome:
+      threads: 64
+      mem_gb:  128
+      time_h:  24
+    run_miniprot:
+      threads: 64
+      mem_gb:  128
+      time_h:  4
+      minisplice_parallel: true
+      minisplice_cpus: 4
+      minisplice_max_jobs: 8
+    run_txTM:
+      threads: 64
+      mem_gb:  128
+      time_h:  8
+    generate_consensus:
+      threads: 32
+      mem_gb:  128
+      time_h:  12
+    generate_hints:
+      threads: 128
+      mem_gb:  256
+      time_h:  12
+    align_transcripts:
+      threads: 64
+      mem_gb:  128
+      time_h:  24
+    evaluate_transcripts:
+      threads: 4
+      mem_gb:  16
+      time_h:  24
+    find_denovo_parents:
+      threads: 4
+      mem_gb:  32
+      time_h:  24

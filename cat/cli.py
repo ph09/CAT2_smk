@@ -1,0 +1,55 @@
+import argparse
+import os
+import subprocess
+import sys
+import sysconfig
+
+
+def find_snakefile():
+    """Locate the installed Snakefile."""
+    data_dir = sysconfig.get_path('data')
+    candidate = os.path.join(data_dir, 'share', 'cat2', 'Snakefile')
+    if os.path.exists(candidate):
+        return candidate
+
+    # Fallback: look relative to this module (useful in dev/editable installs)
+    module_dir = os.path.dirname(os.path.realpath(__file__))
+    candidate = os.path.join(module_dir, '..', 'Snakefile')
+    if os.path.exists(candidate):
+        return os.path.realpath(candidate)
+
+    sys.exit(
+        "Error: Could not locate the CAT2 Snakefile. "
+        "Make sure the package is installed correctly."
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Comparative Annotation Toolkit 2',
+        add_help=False,
+    )
+    parser.add_argument('--config', metavar='FILE', required=True,
+                        help='Path to the input YAML configuration file')
+    parser.add_argument('--restart', action='store_true',
+                        help='Restart from incomplete jobs (--rerun-incomplete)')
+    parser.add_argument('-h', '--help', action='store_true',
+                        help='Show this help message and exit')
+
+    args, extra = parser.parse_known_args()
+
+    if args.help:
+        parser.print_help()
+        print("\nAdditional arguments are passed directly to Snakemake.")
+        sys.exit(0)
+
+    snakefile = find_snakefile()
+
+    cmd = ['snakemake', '--snakefile', snakefile]
+    cmd.extend(extra)
+    cmd += ['--configfile', args.config]
+
+    if args.restart:
+        cmd.append('--rerun-incomplete')
+
+    sys.exit(subprocess.call(cmd))

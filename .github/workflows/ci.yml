@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# A full CAT2 run needs a cluster; CI only builds the environment and runs the
+# fast, cluster-free smoke test (snakemake version guard, run:-block f-string
+# regression guard, config validation + full DAG dry-run on bundled test_data).
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          environment-file: environment.yaml
+          activate-environment: cat2
+          miniforge-version: latest
+          conda-remove-defaults: true
+
+      - name: Show versions
+        run: |
+          python --version
+          snakemake --version
+
+      - name: Run smoke test
+        run: ./scripts/smoke_test.sh

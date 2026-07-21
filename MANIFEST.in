@@ -1,0 +1,6 @@
+include LICENSE
+include *.cfg
+include *.yaml
+recursive-include augustus_cfgs *
+recursive-include standalones *
+recursive-include programs *
