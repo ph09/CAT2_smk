@@ -27,6 +27,6 @@ Run the pipeline with:
 ```bash
 snakemake --configfile input.yaml -n all --cores 4
 ```
-The hal associated with the test_data is here: https://public.gi.ucsc.edu/~pnhebbar/share/vertebrates.hal
-
+The hal associated with the test_data is here: https://public.gi.ucsc.edu/~pnhebbar/share/testData/vertebrates.hal
+The bams associated with the test_data are here: https://public.gi.ucsc.edu/~pnhebbar/share/testData/bams/
 The input.yaml is the config file that you will need to modify.  bam means short read bams, isoseq_bam means long read bams, and intron_bam means noisy short read bams.
