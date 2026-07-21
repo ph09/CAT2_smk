@@ -2,7 +2,6 @@ name: cat2
 channels:
   - conda-forge
   - bioconda
-  - defaults
 dependencies:
   # Python 3.11+ is required. Snakemake must be >=9: snakemake 8.x silently
   # corrupts multi-line f-strings inside rule `run:` blocks under Python 3.12
