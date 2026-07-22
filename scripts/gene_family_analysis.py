@@ -14,6 +14,13 @@ extra sequence clustering:
                  in >1 place -> a duplication / gene-copy-number gain).
   * COPY NUMBER: number of distinct consensus loci per ``source_gene`` per genome.
 
+Lineage-specific expansions found only via protein homology are labeled in
+``novel_gene_description`` as ``paralog of GENE`` by ``annotate_novel_genes.py``.
+Those loci are *attributed back* to the matching reference gene (by common name)
+so copy-number / family matrices reflect real expansions (e.g. PSG, VN1R, GGT,
+IGSF3, FRG1, APOBEC3). Unresolved / lineage-specific novels (no ``paralog of``
+hit, or hit to a non-reference symbol) stay in ``novel_genes.tsv``.
+
 From copy number we call, per reference gene and per (heuristic) gene family:
 
   * lost        : 0 copies in a genome (contraction to zero).
@@ -147,6 +154,14 @@ def load_gp_coords(gp_path):
     return coords
 
 
+PARALOG_OF_RE = re.compile(r"^paralog of (.+)$", re.IGNORECASE)
+# VN1R1 / VN2R17-style symbols: default lazy letter+digit regex collapses these
+# to "VN". Keep the receptor root (VN1R / VN2R).
+VN_R_FAMILY_RE = re.compile(r"^(VN\d*R)", re.IGNORECASE)
+# APOBEC3A -> APOBEC3 (not APOBEC), so A3 expansions don't mix with APOBEC1/2/4.
+APOBEC_FAMILY_RE = re.compile(r"^(APOBEC\d+)", re.IGNORECASE)
+
+
 def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
                     biotype_field="source_gene_biotype"):
     """
@@ -154,16 +169,21 @@ def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
 
     Returns:
       loci        : {source_gene: {gene_id: {"tx": set(tx_ids), "modes": set(),
-                                             "classes": set()}}}
-      novel       : list of dicts for PC loci with no reference source_gene
+                                             "classes": set(), "origin": str}}}
+      novel       : list of gene-level dicts for PC loci with no reference
+                    source_gene (deduped on gene_id). Includes
+                    novel_gene_description / novel_class when present so callers
+                    can attribute ``paralog of GENE`` loci back to ortholog groups.
       gene_meta   : {source_gene: {"common_name": str}}
     coords are attached per-locus (min start / max end over its transcripts).
     """
     coords = load_gp_coords(gp_path)
-    loci = defaultdict(lambda: defaultdict(lambda: {"tx": set(), "modes": set(),
-                                                    "classes": set()}))
+    loci = defaultdict(lambda: defaultdict(lambda: {
+        "tx": set(), "modes": set(), "classes": set(), "origin": "projected",
+    }))
     gene_meta = {}
-    novel = []
+    # gene_id -> novel locus accumulator (dedupe transcripts)
+    novel_by_gene = {}
     with open(gp_info_path) as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         for row in reader:
@@ -175,6 +195,8 @@ def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
             tclass = (row.get("transcript_class") or "").strip()
             mode = (row.get("alignment_mode") or "").strip()
             common = (row.get("source_gene_common_name") or "").strip()
+            desc = (row.get("novel_gene_description") or "").strip()
+            nclass = (row.get("novel_class") or "").strip()
 
             # Novel / de novo PC loci: no reference source_gene, but predicted coding.
             # This covers de-novo (augPB/strg) novel genes AND protein-only novel
@@ -186,9 +208,29 @@ def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
             if is_novel:
                 if gene_biotype == select_biotype:
                     c = coords.get(tx_id, ("NA", ".", 0, 0))
-                    novel.append({"gene_id": gene_id, "transcript_id": tx_id,
-                                  "chrom": c[0], "start": c[2], "end": c[3],
-                                  "transcript_class": tclass, "alignment_mode": mode})
+                    rec = novel_by_gene.get(gene_id)
+                    if rec is None:
+                        novel_by_gene[gene_id] = {
+                            "gene_id": gene_id,
+                            "transcript_id": tx_id,  # exemplar
+                            "chrom": c[0], "start": c[2], "end": c[3],
+                            "strand": c[1],
+                            "transcript_class": tclass, "alignment_mode": mode,
+                            "novel_gene_description": desc if desc not in ("", "N/A") else "",
+                            "novel_class": nclass if nclass not in ("", "N/A") else "",
+                            "n_transcripts": 1,
+                        }
+                    else:
+                        rec["n_transcripts"] += 1
+                        if c[0] != "NA":
+                            if rec["chrom"] in ("", "NA"):
+                                rec["chrom"], rec["strand"] = c[0], c[1]
+                            rec["start"] = min(rec["start"], c[2]) if rec["start"] else c[2]
+                            rec["end"] = max(rec["end"], c[3])
+                        if desc and desc not in ("", "N/A") and not rec["novel_gene_description"]:
+                            rec["novel_gene_description"] = desc
+                        if nclass and nclass not in ("", "N/A") and not rec["novel_class"]:
+                            rec["novel_class"] = nclass
                 continue
 
             # Track fate of reference protein-coding genes (by reference biotype).
@@ -215,7 +257,65 @@ def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
             rec["strand"] = strands[0] if strands else "."
             rec["start"] = min(starts) if starts else 0
             rec["end"] = max(ends) if ends else 0
-    return loci, novel, gene_meta
+    return loci, list(novel_by_gene.values()), gene_meta
+
+
+def build_name_to_source_gene(ref_genes, common_names):
+    """
+    Map reference gene common name -> preferred source_gene id.
+
+    Prefer the id whose own stored name matches exactly; if several share a
+    symbol (rare), keep the first seen so attribution is deterministic.
+    """
+    name_to_gid = {}
+    for gid, rec in ref_genes.items():
+        name = (rec.get("name") or "").strip()
+        if name and name not in name_to_gid:
+            name_to_gid[name] = gid
+    for gid, name in common_names.items():
+        name = (name or "").strip()
+        if name and name not in name_to_gid:
+            name_to_gid[name] = gid
+    return name_to_gid
+
+
+def attribute_novel_paralogs(loci, novel_rows, name_to_gid):
+    """
+    Move novel PC loci labeled ``paralog of GENE`` into ``loci[source_gene]``
+    when GENE resolves to a reference protein-coding gene.
+
+    Returns (remaining_novel_rows, n_attributed).
+    """
+    remaining = []
+    n_attributed = 0
+    # O(1) membership vs scanning every source_gene for each novel locus
+    seen_gene_ids = {gid for gmap in loci.values() for gid in gmap}
+    for n in novel_rows:
+        desc = (n.get("novel_gene_description") or "").strip()
+        m = PARALOG_OF_RE.match(desc)
+        target = m.group(1).strip() if m else ""
+        # strip incidental trailing junk (e.g. isoform notes); take first token
+        target_sym = target.split()[0] if target else ""
+        source_gene = name_to_gid.get(target_sym) if target_sym else None
+        if not source_gene:
+            remaining.append(n)
+            continue
+        gene_id = n["gene_id"]
+        if gene_id in seen_gene_ids:
+            remaining.append(n)
+            continue
+        rec = loci[source_gene][gene_id]
+        rec["tx"].add(n.get("transcript_id") or gene_id)
+        rec["modes"].add(n.get("alignment_mode") or "novel_paralog")
+        rec["classes"].add(n.get("transcript_class") or "putative_novel")
+        rec["origin"] = "novel_paralog"
+        rec["chrom"] = n.get("chrom") or "NA"
+        rec["strand"] = n.get("strand") or "."
+        rec["start"] = int(n.get("start") or 0)
+        rec["end"] = int(n.get("end") or 0)
+        seen_gene_ids.add(gene_id)
+        n_attributed += 1
+    return remaining, n_attributed
 
 
 # ─── gene family heuristic ─────────────────────────────────────────────────────
@@ -227,12 +327,19 @@ def family_key(common_name, gene_id, family_re):
     """
     Heuristic gene-family bucket from a gene symbol.
       KLHL4 -> KLHL ; OR4A1 -> OR ; DOCK11 -> DOCK
+      VN1R4 -> VN1R ; APOBEC3G -> APOBEC3
     Unnamed / LOC##### / purely numeric ids get their own singleton family so we
     never merge unrelated unnamed genes.
     """
     name = (common_name or "").strip()
     if not name or LOC_RE.match(name):
         return f"__singleton__:{gene_id}"
+    m = VN_R_FAMILY_RE.match(name)
+    if m:
+        return m.group(1).upper()
+    m = APOBEC_FAMILY_RE.match(name)
+    if m:
+        return m.group(1).upper()
     m = family_re.match(name)
     if m and len(m.group(1)) >= 2:
         return m.group(1).upper()
@@ -482,14 +589,32 @@ def main():
     copy_number = defaultdict(lambda: defaultdict(int))
     tx_count = defaultdict(lambda: defaultdict(int))
     common_names = {}
+    # Seed names from the reference so novel ``paralog of GENE`` labels can resolve
+    # even when the projected ortholog is missing in a genome.
+    for gid, rec in ref_genes.items():
+        common_names[gid] = rec.get("name") or gid
     paralog_rows = []      # multi-copy loci
     novel_rows = []
     per_genome_loci = {}
+    n_novel_paralogs_attributed = 0
 
-    for genome in genomes:
+    for i, genome in enumerate(genomes, 1):
+        sys.stderr.write(f"[info] ({i}/{len(genomes)}) parsing {genome} ...\n")
+        sys.stderr.flush()
         gp_info = os.path.join(consensus_dir, f"{genome}_consensus_novel_annotated.gp_info")
         gp = os.path.join(consensus_dir, f"{genome}_consensus_novel_annotated.gp")
         loci, novel, gene_meta = parse_consensus(gp_info, gp, args.biotype)
+        for source_gene, meta in gene_meta.items():
+            cn = meta.get("common_name")
+            if cn and (source_gene not in common_names
+                       or common_names[source_gene] in (source_gene, "", None)):
+                common_names[source_gene] = cn
+        name_to_gid = build_name_to_source_gene(ref_genes, common_names)
+        novel, n_attr = attribute_novel_paralogs(loci, novel, name_to_gid)
+        n_novel_paralogs_attributed += n_attr
+        sys.stderr.write(f"[info]   loci_src_genes={len(loci)} novels_remaining={len(novel)} "
+                         f"paralog_attributed={n_attr}\n")
+        sys.stderr.flush()
         per_genome_loci[genome] = loci
         for source_gene, gmap in loci.items():
             copy_number[source_gene][genome] = len(gmap)
@@ -506,12 +631,18 @@ def main():
                         "locus_gene_id": gene_id, "n_copies_in_genome": len(gmap),
                         "chrom": rec["chrom"], "start": rec["start"], "end": rec["end"],
                         "strand": rec["strand"], "n_transcripts": len(rec["tx"]),
-                        "alignment_modes": ",".join(sorted(rec["modes"])),
-                        "transcript_classes": ",".join(sorted(rec["classes"])),
+                        "alignment_modes": ",".join(sorted(m for m in rec["modes"] if m)),
+                        "transcript_classes": ",".join(sorted(c for c in rec["classes"] if c)),
+                        "origin": rec.get("origin") or "projected",
                     })
         for n in novel:
             n2 = dict(n); n2["genome"] = genome
             novel_rows.append(n2)
+
+    sys.stderr.write(
+        f"[info] attributed {n_novel_paralogs_attributed} novel 'paralog of GENE' "
+        f"loci to reference ortholog groups\n"
+    )
 
     # universe of reference genes = ref PC genes (so losses are visible) unioned with
     # any source_gene actually seen (guards against ref-db/consensus mismatches).
@@ -538,7 +669,7 @@ def main():
     # ─── paralogs / novel ──────────────────────────────────────────────────────
     def dump(path, rows, fields):
         with open(path, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t")
+            w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t", extrasaction="ignore")
             w.writeheader()
             for r in rows:
                 w.writerow(r)
@@ -547,11 +678,12 @@ def main():
          sorted(paralog_rows, key=lambda r: (-r["n_copies_in_genome"], r["common_name"], r["genome"])),
          ["genome", "source_gene", "common_name", "n_copies_in_genome", "locus_gene_id",
           "chrom", "start", "end", "strand", "n_transcripts", "alignment_modes",
-          "transcript_classes"])
+          "transcript_classes", "origin"])
     dump(os.path.join(out_dir, "novel_genes.tsv"),
          sorted(novel_rows, key=lambda r: (r["genome"], r["chrom"], r["start"])),
          ["genome", "gene_id", "transcript_id", "chrom", "start", "end",
-          "transcript_class", "alignment_mode"])
+          "transcript_class", "alignment_mode", "novel_gene_description", "novel_class",
+          "n_transcripts"])
 
     # ─── gene families ─────────────────────────────────────────────────────────
     # family -> reference gene ids
@@ -667,19 +799,28 @@ def main():
             observed_internal_genomes = internal_names & all_annotated
             # parse observed internal ancestor copy numbers (family sums) lazily
             anc_copy = defaultdict(lambda: defaultdict(int))  # anc_genome -> source_gene -> loci
+            name_to_gid = build_name_to_source_gene(ref_genes, common_names)
             for anc in sorted(observed_internal_genomes):
                 gp_info = os.path.join(consensus_dir, f"{anc}_consensus_novel_annotated.gp_info")
                 gp = os.path.join(consensus_dir, f"{anc}_consensus_novel_annotated.gp")
-                loci, _, _ = parse_consensus(gp_info, gp, args.biotype)
+                loci, novel, _ = parse_consensus(gp_info, gp, args.biotype)
+                novel, _ = attribute_novel_paralogs(loci, novel, name_to_gid)
                 for sg, gmap in loci.items():
                     anc_copy[anc][sg] = len(gmap)
 
             real_families = [f for f in fam_rows
                              if not f["family_key"].startswith("__singleton__")]
-            for f in real_families:
-                gids = [g for g in ref_genes if family_key(common_names[g], g, family_re) == f["family_key"]]
-                gids += [g for g in copy_number if family_key(common_names[g], g, family_re) == f["family_key"]]
-                gids = set(gids)
+            # Precompute family -> member gene ids once (avoid O(families×genes)).
+            fam_to_gids = defaultdict(set)
+            for gid in set(ref_genes) | set(copy_number):
+                fam_to_gids[family_key(common_names[gid], gid, family_re)].add(gid)
+            sys.stderr.write(f"[info] ancestral reconstruction over {len(real_families)} families ...\n")
+            sys.stderr.flush()
+            for fi, f in enumerate(real_families, 1):
+                if fi % 500 == 0:
+                    sys.stderr.write(f"[info]   family {fi}/{len(real_families)}\n")
+                    sys.stderr.flush()
+                gids = fam_to_gids.get(f["family_key"], set())
                 leaf_counts = {g: sum(copy_number[gid].get(g, 0) for gid in gids)
                                for g in tree_leaves}
                 observed_internal = {anc: sum(anc_copy[anc].get(gid, 0) for gid in gids)
@@ -738,7 +879,8 @@ def main():
 
     # ─── summary.md ────────────────────────────────────────────────────────────
     write_summary(out_dir, genomes, ref_genome, ref_genes, copy_number, common_names,
-                  paralog_rows, novel_rows, fam_rows, hal, pa_stats, tree_info)
+                  paralog_rows, novel_rows, fam_rows, hal, pa_stats, tree_info,
+                  n_novel_paralogs_attributed=n_novel_paralogs_attributed)
 
     # ─── heatmap ───────────────────────────────────────────────────────────────
     if args.heatmap_top and pd is not None:
@@ -759,7 +901,8 @@ def main():
 
 
 def write_summary(out_dir, genomes, ref_genome, ref_genes, copy_number, common_names,
-                  paralog_rows, novel_rows, fam_rows, hal, pa_stats=None, tree_info=None):
+                  paralog_rows, novel_rows, fam_rows, hal, pa_stats=None, tree_info=None,
+                  n_novel_paralogs_attributed=0):
     n_ref = len(ref_genes)
     lines = []
     lines.append(f"# Protein-coding gene family / ortholog analysis")
@@ -767,8 +910,12 @@ def write_summary(out_dir, genomes, ref_genome, ref_genes, copy_number, common_n
     lines.append(f"- Reference: **{ref_genome}** ({n_ref} protein-coding genes)")
     lines.append(f"- Target genomes: {len(genomes)}"
                  + (" (ordered by phylogenetic distance from reference)" if hal else ""))
-    lines.append(f"- Orthology: reference `source_gene` shared across genomes. "
+    lines.append(f"- Orthology: reference `source_gene` shared across genomes, plus "
+                 f"novel loci labeled `paralog of GENE` attributed back to that gene. "
                  f"Copy number = distinct consensus loci per gene per genome.")
+    if n_novel_paralogs_attributed:
+        lines.append(f"- Novel-paralog attribution: **{n_novel_paralogs_attributed}** loci "
+                     f"moved from novel → ortholog copy counts.")
     lines.append("")
 
     # per-genome table
