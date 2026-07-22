@@ -15,7 +15,7 @@ genome:
   [Protein set](#protein-set-for-augmp--miniprot).
 - **StringTie** — reference-guided transcript assembly from RNA-seq or Iso-seq.
 
-> This is the current version of CAT2 and is under active development.
+> This is the current version of CAT2 and is under active development. 
 
 ---
 
@@ -72,6 +72,8 @@ snakemake --configfile input.yaml all --cores 4
 ```
 
 `input.yaml` is the template config you will copy and modify for your own data.
+
+If you are looking to also include liftoff in the CAT2 consensus (recommended only when annotating same species or closely related species of the reference), use the optional-liftoff branch.
 
 ---
 
