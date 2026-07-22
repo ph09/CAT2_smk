@@ -604,17 +604,22 @@ def map_mode_to_db_table(mode):
     return mode
 
 
+# Modes whose genePreds use a trailing _N suffix for extra gene copies (CNV /
+# paralog). Both txTM and Liftoff -copies share this convention.
+CNV_COPY_MODES = frozenset({'txTM', 'liftoff'})
+
+
 def normalize_alignment_id(aln_id, mode):
     """
     Normalize alignment IDs according to mode:
     - transMap/transMap_pairwise: keep as-is
-    - txTM: strip underscore and numbers after (e.g., ENST00000123_1 -> ENST00000123)
+    - txTM / liftoff: strip underscore and numbers after (e.g., ENST00000123_1 -> ENST00000123)
     - augTM/augTMR/augMP (and pairwise variants): strip prefix (e.g., augTM-ENST00000123 -> ENST00000123)
     """
     if mode in ['transMap', 'transMap_pairwise']:
         return aln_id
-    elif mode == 'txTM':
-        # Strip cross-mode _cp suffix first, then txTM CNV copy _N (e.g. XM_….1_14_cp9 → XM_….1).
+    elif mode in CNV_COPY_MODES:
+        # Strip cross-mode _cp suffix first, then CNV copy _N (e.g. XM_….1_14_cp9 → XM_….1).
         import re
         base = re.sub(r'_cp\d*$', '', aln_id)
         base = re.sub(r'_\d+$', '', base)
@@ -637,20 +642,14 @@ def normalize_alignment_id(aln_id, mode):
 def normalize_gene_id(gene_id, mode):
     """
     Normalize gene IDs according to mode (same as transcript ID normalization).
-    This is important for txTM CNV copies which append _N to both transcript and gene IDs.
+    Important for txTM / Liftoff CNV copies which append _N to transcript and gene IDs.
     
     - transMap/transMap_pairwise: keep as-is
-    - txTM: strip ONLY if pattern is _N_M (two consecutive number suffixes)
+    - txTM / liftoff: strip ONLY if pattern is _N_M (two consecutive number suffixes)
     - augTM/augTMR/augMP: keep as-is
     - augPB: keep as-is
-    
-    Examples for txTM:
-    - hg002_chrY_paternal_691_1 → hg002_chrY_paternal_691 (CNV copy, strip _1)
-    - hg002_chrY_paternal_691 → hg002_chrY_paternal_691 (original, keep as-is)
-    - hg002_chrY_paternal_157_10 → hg002_chrY_paternal_157 (CNV copy 10, strip _10)
-    - hg002_chrY_paternal_166_cp2 → hg002_chrY_paternal_166_cp2 (paralog, PRESERVE _cp2)
     """
-    if mode == 'txTM':
+    if mode in CNV_COPY_MODES:
         # Only strip the LAST _N if there are TWO consecutive _N patterns
         # Pattern: ends with _digits_digits (e.g., _691_1 or _157_10)
         import re
@@ -679,6 +678,8 @@ def identify_mode(aln_id, gp_file=None):
         if gp_file and 'pairwise' in gp_file:
             return 'augTM_pairwise'
         return 'augTM'
+    elif gp_file and 'liftoff' in gp_file:
+        return 'liftoff'
     elif gp_file and 'txTM' in gp_file:
         return 'txTM'
     elif gp_file and 'transMap_pairwise' in gp_file:
@@ -701,15 +702,16 @@ def _strip_cross_mode_cp_suffix(aln_id):
     return re.sub(r'_cp\d*$', '', str(aln_id))
 
 
-def _build_txtm_metrics_match_keys(valid_aln_ids, alignment_source_map):
+def _build_txtm_metrics_match_keys(valid_aln_ids, alignment_source_map, mode='txTM'):
     """
-    AlignmentIds usable to find txTM rows in the metrics DB.
+    AlignmentIds usable to find CNV-copy-mode rows in the metrics DB.
 
     tx_dict may use cross-mode _cp suffixes (XM_….1_cp9) while the DB stores XM_….1.
+    ``mode`` is typically ``txTM`` or ``liftoff``.
     """
     keys = set()
     for aid in valid_aln_ids:
-        if alignment_source_map.get(aid) != 'txTM':
+        if alignment_source_map.get(aid) != mode:
             continue
         keys.add(str(aid))
         base_no_cp = _strip_cross_mode_cp_suffix(aid)
@@ -751,22 +753,23 @@ def _txtm_allowed_db_ids(match_keys):
     return allowed
 
 
-def remap_metrics_to_txtm_cp_aliases(metrics_df, valid_aln_ids, alignment_source_map):
+def remap_metrics_to_txtm_cp_aliases(metrics_df, valid_aln_ids, alignment_source_map, mode='txTM'):
     """
-    Attach metrics to txTM AlignmentIds renamed with _cp for cross-mode conflicts.
+    Attach metrics to CNV-copy-mode AlignmentIds renamed with _cp for cross-mode conflicts.
 
     GenePred loading renames e.g. XM_….1 → XM_….1_cp9 when another mode used XM_….1 first.
     Metrics remain keyed by the DB id; duplicate rows under the tx_dict id before merge.
+    ``mode`` is typically ``txTM`` or ``liftoff``.
     """
     if metrics_df is None or len(metrics_df) == 0 or 'Mode' not in metrics_df.columns:
         return metrics_df
-    if not (metrics_df['Mode'] == 'txTM').any():
+    if not (metrics_df['Mode'] == mode).any():
         return metrics_df
 
     existing = set(metrics_df['AlignmentId'].astype(str))
     alias_targets = {}
     for aid in valid_aln_ids:
-        if alignment_source_map.get(aid) != 'txTM':
+        if alignment_source_map.get(aid) != mode:
             continue
         base_no_cp = _strip_cross_mode_cp_suffix(aid)
         if base_no_cp == aid:
@@ -794,7 +797,7 @@ def remap_metrics_to_txtm_cp_aliases(metrics_df, valid_aln_ids, alignment_source
             for rec in base_recs:
                 r = dict(rec)
                 r['AlignmentId'] = tx_id
-                r['Mode'] = 'txTM'
+                r['Mode'] = mode
                 new_rows.append(r)
             existing.add(tx_id)
 
@@ -802,7 +805,7 @@ def remap_metrics_to_txtm_cp_aliases(metrics_df, valid_aln_ids, alignment_source
         return metrics_df
 
     logger.info(
-        f"    Remapped txTM metrics onto {len(new_rows)} cross-mode _cp alias rows "
+        f"    Remapped {mode} metrics onto {len(new_rows)} cross-mode _cp alias rows "
         f"({len(alias_targets)} DB ids with aliases)"
     )
     out = pd.concat([metrics_df, pd.DataFrame(new_rows)], ignore_index=True)
@@ -834,9 +837,9 @@ def _txtm_cnv_copy_ids(base_id, valid_aln_ids, max_copy=99):
     return copies
 
 
-def expand_txtm_cnv_metrics(metrics_df, valid_aln_ids):
+def expand_txtm_cnv_metrics(metrics_df, valid_aln_ids, mode='txTM'):
     """
-    Propagate txTM base alignment metrics onto numbered CNV copy IDs in genePred.
+    Propagate base alignment metrics onto numbered CNV copy IDs in genePred.
 
     On Y (and similar loci), genePred often has both a bare accession (XM_… .1) and
     numbered copies (XM_….1_14). The DB stores metrics on every ID. Older logic
@@ -848,17 +851,19 @@ def expand_txtm_cnv_metrics(metrics_df, valid_aln_ids):
     - Remove a base row only when it is not in genePred but numbered copies are
       (metrics live only under the base accession in the DB).
     - Add propagated rows only for copy IDs that lack metrics rows already.
+
+    ``mode`` is typically ``txTM`` or ``liftoff`` (both use _N CNV copies).
     """
     if metrics_df is None or len(metrics_df) == 0 or 'Mode' not in metrics_df.columns:
         return metrics_df
-    if not (metrics_df['Mode'] == 'txTM').any():
+    if not (metrics_df['Mode'] == mode).any():
         return metrics_df
 
-    non_txtm = metrics_df[metrics_df['Mode'] != 'txTM']
-    txtm = metrics_df[metrics_df['Mode'] == 'txTM'].copy()
+    non_txtm = metrics_df[metrics_df['Mode'] != mode]
+    txtm = metrics_df[metrics_df['Mode'] == mode].copy()
     existing_ids = set(txtm['AlignmentId'].astype(str))
 
-    # Precompute genePred CNV copies per txTM base id in a SINGLE pass over
+    # Precompute genePred CNV copies per base id in a SINGLE pass over
     # valid_aln_ids. The old code called _txtm_cnv_copy_ids() once per base, and
     # each call scanned ALL of valid_aln_ids -> O(n_bases * n_valid), which at
     # panprimate scale (hundreds of thousands of txTM bases x ~2.2M ids) is ~10^11+
@@ -866,7 +871,7 @@ def expand_txtm_cnv_metrics(metrics_df, valid_aln_ids):
     # single O(n_valid) pass: `c` is a CNV copy of base `b` iff strip_cp(c) starts
     # with strip_cp(b)+"_" and ends in _<digits> (exactly the old Part-B condition,
     # which also subsumes the numbered Part-A candidates). Bucket each qualifying
-    # `c` under every underscore-boundary prefix that is a known txTM base root.
+    # `c` under every underscore-boundary prefix that is a known base root.
     txtm_roots = {_strip_cross_mode_cp_suffix(str(a))
                   for a in txtm['AlignmentId'].unique()
                   if not _is_txtm_cnv_copy_id(a)}
@@ -904,7 +909,7 @@ def expand_txtm_cnv_metrics(metrics_df, valid_aln_ids):
             for _, row in base_metrics.iterrows():
                 cnv_row = row.copy()
                 cnv_row['AlignmentId'] = cnv_id
-                cnv_row['Mode'] = 'txTM'
+                cnv_row['Mode'] = mode
                 expanded_rows.append(cnv_row)
             existing_ids.add(cnv_id)
 
@@ -922,7 +927,7 @@ def expand_txtm_cnv_metrics(metrics_df, valid_aln_ids):
 
     if n_added > 0 or bases_to_drop:
         logger.info(
-            f"    txTM CNV metrics expansion: {len(bases_with_copies)} bases with copies, "
+            f"    {mode} CNV metrics expansion: {len(bases_with_copies)} bases with copies, "
             f"+{n_added} propagated rows, {len(bases_to_drop)} unused base-only rows removed"
         )
 
@@ -955,8 +960,8 @@ def backfill_cnv_metrics(mrna_metrics_df, cds_metrics_df, valid_aln_ids, alignme
         base_id = None
         
         # Case 1: TxTM CNV copy (_N suffix)
-        if mode == 'txTM' and '_' in aln_id.split('.')[-1]:
-            # This is a txTM CNV copy (_N suffix)
+        if mode in CNV_COPY_MODES and '_' in aln_id.split('.')[-1]:
+            # txTM / Liftoff CNV copy (_N suffix)
             base_id = normalize_alignment_id(aln_id, mode)  # Strips _N
         
         # Case 2: Internal paralog copy (_cp, _cp2, _cp3, etc. suffix)
@@ -1565,6 +1570,8 @@ def generate_consensus(args):
             mode = 'transMap_pairwise'  # Keep as separate mode
         elif 'transMap' in gp_file:
             mode = 'transMap'
+        elif 'liftoff' in gp_file:
+            mode = 'liftoff'
         elif 'txTM' in gp_file:
             mode = 'txTM'
         elif 'augTMR_pairwise' in gp_file:
@@ -1604,7 +1611,7 @@ def generate_consensus(args):
             
             # Normalize txTM IDs BEFORE duplicate detection to catch CNV copies at different loci
             # TxTM uses _N suffix (e.g., gene_1, gene_2) for CNV copies that should be preserved
-            if actual_mode == 'txTM':
+            if actual_mode in CNV_COPY_MODES:
                 normalized_name = normalize_alignment_id(t.name, actual_mode)
                 if normalized_name != t.name:
                     #logger.debug(f"    Normalized txTM ID: {t.name} → {normalized_name}")
@@ -1921,10 +1928,15 @@ def generate_consensus(args):
     
     if tx_modes_with_metrics:
         logger.info(f"Loading metrics for modes: {tx_modes_with_metrics}")
-        txtm_metrics_match_keys = _build_txtm_metrics_match_keys(valid_aln_ids, alignment_source_map)
-        # Precompute the acceptable txTM DB ids once so the per-mode filters below
-        # can use a single vectorized isin() instead of a row-wise Python loop.
-        txtm_allowed_db_ids = _txtm_allowed_db_ids(txtm_metrics_match_keys)
+        # Precompute acceptable DB ids once per CNV-copy mode so the per-mode
+        # filters below can use a single vectorized isin().
+        cnv_allowed_db_ids = {}
+        for cnv_mode in CNV_COPY_MODES:
+            if cnv_mode in tx_modes_with_metrics:
+                match_keys = _build_txtm_metrics_match_keys(
+                    valid_aln_ids, alignment_source_map, mode=cnv_mode
+                )
+                cnv_allowed_db_ids[cnv_mode] = _txtm_allowed_db_ids(match_keys)
         
         mrna_dfs = []
         for tx_mode in tx_modes_with_metrics:
@@ -1934,19 +1946,22 @@ def generate_consensus(args):
             # Add mode column to track source
             df['Mode'] = tx_mode
             # Filter early to reduce memory and speed up merges
-            # For txTM, database has base IDs (ENST00000002596.6) but tx_dict has CNV copies (ENST00000002596.6_1, etc.)
-            # So we need to check if the base ID or any CNV copy is in valid_aln_ids
-            if tx_mode == 'txTM':
-                df = df[df['AlignmentId'].astype(str).isin(txtm_allowed_db_ids)]
+            # For txTM/liftoff, database has base IDs but tx_dict has CNV copies (_N)
+            if tx_mode in cnv_allowed_db_ids:
+                df = df[df['AlignmentId'].astype(str).isin(cnv_allowed_db_ids[tx_mode])]
             else:
                 df = df[df['AlignmentId'].isin(valid_aln_ids)]
             mrna_dfs.append(df)
         mrna_metrics_df = pd.concat(mrna_dfs) if mrna_dfs else pd.DataFrame()
-        if len(mrna_metrics_df) > 0 and 'txTM' in tx_modes_with_metrics:
-            mrna_metrics_df = expand_txtm_cnv_metrics(mrna_metrics_df, valid_aln_ids)
-            mrna_metrics_df = remap_metrics_to_txtm_cp_aliases(
-                mrna_metrics_df, valid_aln_ids, alignment_source_map
-            )
+        if len(mrna_metrics_df) > 0:
+            for cnv_mode in CNV_COPY_MODES:
+                if cnv_mode in tx_modes_with_metrics:
+                    mrna_metrics_df = expand_txtm_cnv_metrics(
+                        mrna_metrics_df, valid_aln_ids, mode=cnv_mode
+                    )
+                    mrna_metrics_df = remap_metrics_to_txtm_cp_aliases(
+                        mrna_metrics_df, valid_aln_ids, alignment_source_map, mode=cnv_mode
+                    )
         logger.info(f"✓ Loaded {len(mrna_metrics_df)} mRNA metrics (filtered to actual transcripts)")
         
         cds_dfs = []
@@ -1956,18 +1971,22 @@ def generate_consensus(args):
             df = load_metrics_from_db(args.db_path, db_mode, 'CDS')
             # Add mode column to track source
             df['Mode'] = tx_mode
-            # Same logic as mRNA: for txTM, match base IDs to CNV copies
-            if tx_mode == 'txTM':
-                df = df[df['AlignmentId'].astype(str).isin(txtm_allowed_db_ids)]
+            # Same logic as mRNA: for txTM/liftoff, match base IDs to CNV copies
+            if tx_mode in cnv_allowed_db_ids:
+                df = df[df['AlignmentId'].astype(str).isin(cnv_allowed_db_ids[tx_mode])]
             else:
                 df = df[df['AlignmentId'].isin(valid_aln_ids)]
             cds_dfs.append(df)
         cds_metrics_df = pd.concat(cds_dfs) if cds_dfs else pd.DataFrame()
-        if len(cds_metrics_df) > 0 and 'txTM' in tx_modes_with_metrics:
-            cds_metrics_df = expand_txtm_cnv_metrics(cds_metrics_df, valid_aln_ids)
-            cds_metrics_df = remap_metrics_to_txtm_cp_aliases(
-                cds_metrics_df, valid_aln_ids, alignment_source_map
-            )
+        if len(cds_metrics_df) > 0:
+            for cnv_mode in CNV_COPY_MODES:
+                if cnv_mode in tx_modes_with_metrics:
+                    cds_metrics_df = expand_txtm_cnv_metrics(
+                        cds_metrics_df, valid_aln_ids, mode=cnv_mode
+                    )
+                    cds_metrics_df = remap_metrics_to_txtm_cp_aliases(
+                        cds_metrics_df, valid_aln_ids, alignment_source_map, mode=cnv_mode
+                    )
         logger.info(f"✓ Loaded {len(cds_metrics_df)} CDS metrics (filtered to actual transcripts)")
         
         # Backfill metrics for txTM CNV copies (_N suffix) that don't have metrics
@@ -3120,15 +3139,20 @@ def create_support_dataframe(tx_dict, db_path, ref_df, alignment_source_map, den
         logger.info(f"    Updated GeneId from tx_dict for {has_tx_gene.sum()} transcripts (includes _cp paralogs)")
     support_df.drop(columns=['GeneId_from_tx'], inplace=True)
     
-    # Normalize GeneId for txTM transcripts to strip _N suffix (but NOT _cpN suffix!)
+    # Normalize GeneId for txTM/liftoff transcripts to strip _N suffix (but NOT _cpN!)
     # This ensures consistency with the normalized gene IDs in tx_dict
     # Note: _cp suffixes are preserved because they don't match the _\d+$ pattern
-    txTM_mask = support_df['AlignmentId'].apply(lambda x: alignment_source_map.get(x, '') == 'txTM')
-    if txTM_mask.any():
-        support_df.loc[txTM_mask, 'GeneId'] = support_df.loc[txTM_mask, 'GeneId'].apply(
-            lambda x: normalize_gene_id(x, 'txTM') if pd.notna(x) else x
+    cnv_mask = support_df['AlignmentId'].apply(
+        lambda x: alignment_source_map.get(x, '') in CNV_COPY_MODES
+    )
+    if cnv_mask.any():
+        support_df.loc[cnv_mask, 'GeneId'] = support_df.loc[cnv_mask].apply(
+            lambda row: normalize_gene_id(
+                row['GeneId'], alignment_source_map.get(row['AlignmentId'], 'txTM')
+            ) if pd.notna(row['GeneId']) else row['GeneId'],
+            axis=1,
         )
-        logger.info(f"    Normalized GeneId for {txTM_mask.sum()} txTM transcripts in support_df")
+        logger.info(f"    Normalized GeneId for {cnv_mask.sum()} txTM/liftoff transcripts in support_df")
     
     # Add missing transcripts (e.g., augPB, txTM without metrics)
     logger.info("  Adding missing transcripts to support dataframe...")
@@ -3154,8 +3178,8 @@ def create_support_dataframe(tx_dict, db_path, ref_df, alignment_source_map, den
                 gene_id = f'UNKNOWN_GENE_{tx_id}'
             
             # Normalize based on mode for TranscriptId lookup
-            if mode == 'txTM':
-                # Strip txTM's _N suffix first, then strip_alignment_numbers handles the rest
+            if mode in CNV_COPY_MODES:
+                # Strip CNV _N suffix first, then strip_alignment_numbers handles the rest
                 normalized_id = normalize_alignment_id(tx_id, mode)
                 base_tx_id = tools.nameConversions.strip_alignment_numbers(normalized_id)
                 if len(txTM_examples) < 3:

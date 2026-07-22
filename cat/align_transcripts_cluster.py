@@ -266,7 +266,7 @@ def run_cluster_alignment_pipeline(args):
     }
 
     for tx_mode in ['transMap', 'transMap_pairwise', 'augTM', 'augTM_pairwise',
-                    'augTMR', 'augTMR_pairwise', 'augMP', 'txTM']:
+                    'augTMR', 'augTMR_pairwise', 'augMP', 'txTM', 'liftoff']:
         if tx_mode not in transcript_modes:
             continue
 

@@ -103,6 +103,12 @@ def validate_config():
                     f"ancestor_modes contains unsupported mode '{m}' "
                     "(allowed: transMap, transMap_pairwise, txTM)"
                 )
+            if m == "transMap_pairwise" and not config.get("transmap_pairwise", True):
+                warnings.append(
+                    "ancestor_modes lists 'transMap_pairwise' but "
+                    "transmap_pairwise: false — pairwise will be skipped for "
+                    "ancestors as well"
+                )
 
     for w in warnings:
         print(f"CONFIG WARNING: {w}", file=sys.stderr)
@@ -163,23 +169,44 @@ if not PROTEIN_FASTA:
     PROTEIN_FASTA = f"{config['work_dir']}/protein_db/protein_db.fa"
 
 # Pipeline modes and constraints
-VALID_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM", "augPB", "strg"]
-VALID_ALIGNMENT_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM"]
+VALID_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM", "liftoff", "augPB", "strg"]
+VALID_ALIGNMENT_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM", "liftoff"]
 
-# Active alignment modes (filtered based on config)
-ACTIVE_ALIGNMENT_MODES = ["transMap", "transMap_pairwise"]  # transMap and transMap_pairwise are always active
+# Active alignment modes (filtered based on config).
+# transMap is always on; the BAM/minimap2-based pairwise path (transMap_pairwise
+# and its Augustus refinements) is gated by `transmap_pairwise` (default true).
+# Set that to false for highly diverged targets where pairwise chaining fails or
+# is not useful — the DAG then skips minimap2_bam → bam_to_chain →
+# transmap_pairwise_* → augTM/TMR_pairwise entirely.
+#
+# liftoff (external UCSC Liftoff) is OFF by default. Enable only when lifting
+# annotations between assemblies of the *same species* (haplotypes / near-
+# identical genomes). It is not a substitute for cross-species projection
+# (use transMap / txTM / augMP for that).
+TRANSMAP_PAIRWISE = bool(config.get("transmap_pairwise", True))
+LIFTOFF = bool(config.get("liftoff", False))
+ACTIVE_ALIGNMENT_MODES = ["transMap"]
+if TRANSMAP_PAIRWISE:
+    ACTIVE_ALIGNMENT_MODES.append("transMap_pairwise")
 if config.get("augustus", False):
     ACTIVE_ALIGNMENT_MODES.append("augTM")
-    ACTIVE_ALIGNMENT_MODES.append("augTM_pairwise")
+    if TRANSMAP_PAIRWISE:
+        ACTIVE_ALIGNMENT_MODES.append("augTM_pairwise")
     if RNASEQ_GENOMES:
         ACTIVE_ALIGNMENT_MODES.append("augTMR")
-        ACTIVE_ALIGNMENT_MODES.append("augTMR_pairwise")
+        if TRANSMAP_PAIRWISE:
+            ACTIVE_ALIGNMENT_MODES.append("augTMR_pairwise")
     ACTIVE_ALIGNMENT_MODES.append("augMP")  # Augustus MP mode
 if config.get("txTM", False):
     ACTIVE_ALIGNMENT_MODES.append("txTM")
+if LIFTOFF:
+    ACTIVE_ALIGNMENT_MODES.append("liftoff")
 
 # Ancestor genome annotation (internal Cactus HAL nodes)
-ANCESTOR_MODES_DEFAULT = ["transMap", "transMap_pairwise", "txTM"]
+ANCESTOR_MODES_DEFAULT = (
+    ["transMap", "transMap_pairwise", "txTM"] if TRANSMAP_PAIRWISE
+    else ["transMap", "txTM"]
+)
 VALID_ANCESTOR_MODES = ["transMap", "transMap_pairwise", "txTM"]
 
 def _genome_wc(genomes):
@@ -196,7 +223,12 @@ def _resolve_ancestor_genomes():
     return list(extract_ancestor_genomes(config["hal"], target_set))
 
 ANCESTOR_GENOMES = _resolve_ancestor_genomes()
-ANCESTOR_MODES = config.get("ancestor_modes", ANCESTOR_MODES_DEFAULT)
+ANCESTOR_MODES = list(config.get("ancestor_modes", ANCESTOR_MODES_DEFAULT))
+# Honour the global pairwise toggle for ancestors too (the BAM chain path is
+# shared). Explicit ancestor_modes entries are dropped rather than erroring so a
+# copied config with pairwise modes still works after flipping the switch.
+if not TRANSMAP_PAIRWISE:
+    ANCESTOR_MODES = [m for m in ANCESTOR_MODES if m != "transMap_pairwise"]
 if ANCESTOR_GENOMES:
     invalid = [m for m in ANCESTOR_MODES if m not in VALID_ANCESTOR_MODES]
     if invalid:
@@ -217,8 +249,10 @@ ANCESTOR_ALIGNMENT_MODES = [m for m in ANCESTOR_MODES if m in VALID_ANCESTOR_MOD
 ALL_ALIGNMENT_MODES = list(dict.fromkeys(ACTIVE_ALIGNMENT_MODES + ANCESTOR_ALIGNMENT_MODES))
 TXTM_GENOMES = ([g for g in TARGET_GENOMES if config.get("txTM", False)] +
                 [g for g in ANCESTOR_GENOMES if "txTM" in ANCESTOR_MODES])
+LIFTOFF_GENOMES = TARGET_GENOMES if LIFTOFF else []
 ANNOTATION_GENOME_WC = _genome_wc(ANNOTATION_GENOMES)
 TXTM_GENOME_WC = _genome_wc(TXTM_GENOMES)
+LIFTOFF_GENOME_WC = _genome_wc(LIFTOFF_GENOMES)
 # Per-mode genome wildcard patterns (reused across the Augustus rules).
 AUGUSTUS_GENOME_WC = _genome_wc(AUGUSTUS_GENOMES)
 RNASEQ_GENOME_WC = _genome_wc(RNASEQ_GENOMES)
@@ -263,6 +297,7 @@ def mode_gp_paths(genome, work_dir=None):
         'augTMR_pairwise':    f"{wd}/augustus/{genome}_augTMR_pairwise.gp",
         'augMP':              f"{wd}/augustus/{genome}_augMP.gp",
         'txTM':               f"{wd}/txTM/{genome}_txTM.gp",
+        'liftoff':            f"{wd}/liftoff/{genome}_liftoff.gp",
         'augPB':              f"{wd}/augustus_pb/{genome}_augPB.gp",
         'strg':               f"{wd}/stringtie/{genome}_strg.gp",
     }
@@ -285,6 +320,7 @@ def get_gp_path_for_mode(mode, genome):
         'augTMR_pairwise': WORK_DIR / f"augustus/{genome}_augTMR_pairwise.gp",
         'augMP': WORK_DIR / f"augustus/{genome}_augMP.gp",
         'txTM': WORK_DIR / f"txTM/{genome}_txTM.gp",
+        'liftoff': WORK_DIR / f"liftoff/{genome}_liftoff.gp",
         'augPB': WORK_DIR / f"augustus_pb/{genome}_augPB.gp",
         'strg': WORK_DIR / f"stringtie/{genome}_strg.gp"
     }
@@ -324,6 +360,8 @@ _RULE_DEFAULTS = {
                                  "minisplice_parallel": True, "minisplice_cpus": 4, "minisplice_mem": "8G",
                                  "minisplice_time": "01:00:00", "minisplice_max_concurrent": 25},
     "run_txTM":               {"mem": "128G", "cpus": 64,  "time": "04:00:00", "timeout_hours": 12},
+    "run_liftoff":            {"mem": "128G", "cpus": 64,  "time": "06:00:00", "timeout_hours": 8},
+    "liftoff_process_outputs": {"mem": "8G", "cpus": 2, "time": "02:00:00"},
     "stringtie_merge":           {"mem": "16G",  "cpus": 8,   "time": "04:00:00"},
     "stringtie_sort":            {"mem": "128G", "cpus": 64,  "time": "06:00:00"},
     "stringtie_run":             {"mem": "128G", "cpus": 64,  "time": "12:00:00"},
@@ -349,6 +387,8 @@ _LOCAL_DEFAULTS = {
     "run_miniprot":            {"threads": 64,  "mem_gb": 128, "time_h": 4,
                                  "minisplice_parallel": True, "minisplice_cpus": 4, "minisplice_max_jobs": 8},
     "run_txTM":             {"threads": 64,  "mem_gb": 128, "time_h": 8},
+    "run_liftoff":          {"threads": 64,  "mem_gb": 128, "time_h": 8},
+    "liftoff_process_outputs": {"threads": 2, "mem_gb": 8, "time_h": 2},
     "stringtie_merge":         {"threads": 8,   "mem_gb": 16,  "time_h": 4},
     "stringtie_sort":          {"threads": 64,  "mem_gb": 128, "time_h": 6},
     "stringtie_run":           {"threads": 64,  "mem_gb": 128, "time_h": 12},
@@ -777,7 +817,7 @@ def run_or_submit(script_body, job_script_path, outputs_to_check,
 # concurrency is gated by threads: / mem_gb: in each rule's resources block.
 localrules: setup_pipeline_directories, build_db, prepare_genome_files, \
     prepare_reference_files, transmap_map_psl, run_miniprot, run_transcript_map, \
-    run_chaining_per_genome, transmap_unfiltered_gtf, minimap2_bam, \
+    run_liftoff, run_chaining_per_genome, transmap_unfiltered_gtf, minimap2_bam, \
     bam_to_chain, transmap_pairwise_map_psl, augustus_run_tm_and_tmr, \
     augustus_run_tm_only, augustus_run_tm_pairwise_and_tmr_pairwise, \
     augustus_run_tm_pairwise_only, run_augustus_pb, \
@@ -799,7 +839,7 @@ rule setup_pipeline_directories:
         # Define directory structure
         directories = [
             "genome_files", "reference", "hints_database", "chaining",
-            "miniprot", "stringtie", "txTM", "transMap", "augustus",
+            "miniprot", "stringtie", "txTM", "liftoff", "transMap", "augustus",
             "augustus_pb", "databases", "transcript_alignment", 
             "consensus_gene_set", "chaining_bam", "transMap_pairwise",
             "plots"
@@ -809,7 +849,8 @@ rule setup_pipeline_directories:
             "prepare_genome_files", "prepare_reference_files", "generate_hints",
             "build_db", "chaining", "stringtie_merge", "stringtie_sort", 
             "stringtie_run",
-            "miniprot", "txTM", "transcript_map", "transmap_map",
+            "miniprot", "txTM", "liftoff", "liftoff_process", "transcript_map",
+            "transmap_map",
             "transmap_filter", "transmap_evaluate", "transmap_gtf",
             "augustus_extract_coding_gp", "augustus_run", "augustus_convert",
             "augustus_pb", "find_denovo_parents", "fix_augmp_gene_names",
@@ -2369,6 +2410,132 @@ python3 cat/transcript_map_runner.py \\
             )
 
 
+rule run_liftoff:
+    """
+    Lift reference annotations onto a target genome with Liftoff.
+
+    Only enable via ``liftoff: true`` when the target is another assembly of the
+    *same species* (haplotypes / near-identical genomes). Cross-species work
+    should use transMap / txTM / augMP instead.
+
+    Tunables (optional config keys):
+      liftoff_sc: sequence-identity cutoff (default 0.85)
+    """
+    input:
+        gff3_db=f"{config['work_dir']}/reference/{config['ref_genome']}.gff3_db",
+        target_fasta=f"{config['work_dir']}/genome_files/{{genome}}.fa",
+        ref_fasta=f"{config['work_dir']}/genome_files/{config['ref_genome']}.fa",
+    output:
+        gff3=f"{config['work_dir']}/liftoff/{{genome}}_liftoff.gff3",
+        unmapped=f"{config['work_dir']}/liftoff/{{genome}}_unmapped_features.txt",
+        intermediate_dir=directory(f"{config['work_dir']}/liftoff/{{genome}}_intermediate_files"),
+    wildcard_constraints:
+        genome = LIFTOFF_GENOME_WC
+    log:
+        f"{config['work_dir']}/logs/liftoff/{{genome}}.log"
+    threads: 1 if IS_CLUSTER else get_local_res("run_liftoff", "threads")
+    resources:
+        mem_gb=1 if IS_CLUSTER else get_local_res("run_liftoff", "mem_gb"),
+        time_h=1 if IS_CLUSTER else get_local_res("run_liftoff", "time_h"),
+        job_id=lambda wildcards, attempt: f"liftoff-submit-{wildcards.genome}-{attempt}"
+    run:
+        import os
+        from pathlib import Path
+
+        work_dir = config["work_dir"]
+        genome = wildcards.genome
+        Path(f"{work_dir}/liftoff").mkdir(parents=True, exist_ok=True)
+        job_script = f"{work_dir}/liftoff/{genome}_liftoff_job.sh"
+        cpus = get_res("run_liftoff", "cpus") if IS_CLUSTER else snakemake.threads
+        liftoff_sc = config.get("liftoff_sc", 0.85)
+        timeout_s = int(get_res("run_liftoff", "timeout_hours") * 3600)
+
+        script_content = build_sbatch_header(
+            "run_liftoff",
+            f"liftoff-{genome}",
+            f"{work_dir}/logs/liftoff/{genome}_slurm.out",
+            f"{work_dir}/logs/liftoff/{genome}_slurm.err",
+        ) + f"""
+echo "Starting Liftoff for: {genome}"
+echo "Job ID: ${{SLURM_JOB_ID:-local}}"
+echo "Start time: $(date)"
+command -v liftoff >/dev/null 2>&1 || {{
+    echo "ERROR: liftoff not on PATH. Install via conda (environment.yaml) or disable liftoff: false." >&2
+    exit 1
+}}
+mkdir -p {work_dir}/liftoff/{genome}_intermediate_files
+liftoff -p {cpus} \\
+        -sc {liftoff_sc} \\
+        -copies \\
+        -db {input.gff3_db} \\
+        -polish \\
+        -dir {work_dir}/liftoff/{genome}_intermediate_files \\
+        -u {output.unmapped} \\
+        {input.target_fasta} \\
+        {input.ref_fasta} \\
+        -o {output.gff3}
+echo "Completed Liftoff for: {genome}"
+echo "End time: $(date)"
+"""
+
+        with open(log[0], "a") as log_file:
+            log_file.write(f"Submitting Liftoff job for {genome}...\n")
+            run_or_submit(
+                script_content,
+                job_script,
+                [output.gff3, output.unmapped],
+                log_file,
+                "run_liftoff",
+                max_wait_s=timeout_s,
+            )
+            # Validate GFF3 header after the job finishes.
+            with open(output.gff3, "rb") as fh:
+                head = fh.read(2048).decode("utf-8", errors="ignore")
+            if "##gff-version 3" not in head.lower():
+                raise RuntimeError(
+                    f"Liftoff GFF3 for {genome} missing '##gff-version 3' header"
+                )
+
+
+rule liftoff_process_outputs:
+    """
+    Convert Liftoff GFF3 to GenePred / GTF / attrs (same shape as other modes).
+    """
+    input:
+        gff3=f"{config['work_dir']}/liftoff/{{genome}}_liftoff.gff3",
+    output:
+        gp=f"{config['work_dir']}/liftoff/{{genome}}_liftoff.gp",
+        gtf=f"{config['work_dir']}/liftoff/{{genome}}_liftoff.gtf",
+        attrs=f"{config['work_dir']}/liftoff/{{genome}}_liftoff.gp_attrs",
+        dups=f"{config['work_dir']}/liftoff/{{genome}}_liftoff.duplicates.txt",
+    wildcard_constraints:
+        genome = LIFTOFF_GENOME_WC
+    log:
+        f"{config['work_dir']}/logs/liftoff_process/{{genome}}.log"
+    threads: 1 if IS_CLUSTER else get_local_res("liftoff_process_outputs", "threads")
+    resources:
+        mem_gb=1 if IS_CLUSTER else get_local_res("liftoff_process_outputs", "mem_gb"),
+        time_h=1 if IS_CLUSTER else get_local_res("liftoff_process_outputs", "time_h"),
+        job_id=lambda wildcards, attempt: f"liftoff-proc-{wildcards.genome}-{attempt}"
+    shell:
+        r"""
+        set -euo pipefail
+        fixed_gff3={input.gff3}.fixed
+        if python cat/fix_gff3_escape.py {input.gff3} "$fixed_gff3" >> {log} 2>&1 && [ -s "$fixed_gff3" ]; then
+            gff3_file=$fixed_gff3
+        else
+            echo "Warning: escape fixing failed or empty; using original GFF3" >> {log}
+            gff3_file={input.gff3}
+        fi
+        gff3ToGenePred -warnAndContinue -refseqHacks \
+            -rnaNameAttr=transcript_id -geneNameAttr=gene_id \
+            -attrsOut={output.attrs} "$gff3_file" {output.gp} >> {log} 2>&1
+        cut -f1 {output.gp} | sort | uniq -d > {output.dups} 2>> {log} || true
+        gffread "$gff3_file" -T -o {output.gtf} 2>> {log}
+        rm -f "$fixed_gff3"
+        """
+
+
 rule augustus_extract_coding_gp:
     """
     Extracts only coding transcripts from the filtered transMap genePred.
@@ -3158,17 +3325,23 @@ def get_active_modes_for_wildcards(wildcards):
     if genome in ANCESTOR_GENOMES:
         return [m for m in ANCESTOR_MODES if m in VALID_ANCESTOR_MODES]
 
-    modes = ['transMap', 'transMap_pairwise'] # transMap and transMap_pairwise are always active for target genomes
+    modes = ['transMap']
+    if TRANSMAP_PAIRWISE:
+        modes.append('transMap_pairwise')
 
     # Add modes based on the main config flags
     if config.get("txTM", False):
         modes.append('txTM')
+    if LIFTOFF:
+        modes.append('liftoff')
     if config.get("augustus", False):
         modes.append('augTM')
-        modes.append('augTM_pairwise')
+        if TRANSMAP_PAIRWISE:
+            modes.append('augTM_pairwise')
         if genome in config.get("rnaseq_genomes", []):
             modes.append('augTMR')
-            modes.append('augTMR_pairwise')
+            if TRANSMAP_PAIRWISE:
+                modes.append('augTMR_pairwise')
         modes.append('augMP')
     if config.get("augustus_pb", False) and genome in config.get("isoseq_genomes", []):
         modes.append('augPB')
@@ -3429,20 +3602,20 @@ def get_consensus_inputs(wildcards):
         'ref_gp': f"{work_dir}/reference/{config['ref_genome']}.gp",
         'tm_eval_done': f"{work_dir}/databases/{genome}.tm_eval.done",
         'eval_done': f"{work_dir}/logs/{genome}_evaluation.done",
-        # Pairwise map + filter must finish before consensus; consensus uses unfiltered .gp
-        # (filter --filter-overlapping-genes drops many ref PC genes e.g. at collapsed loci).
-        'transmap_pairwise_gp': f"{work_dir}/transMap_pairwise/{genome}.gp",
-        'transmap_pairwise_filtered': f"{work_dir}/transMap_pairwise/{genome}_filtered.gp",
     }
+    # Pairwise map + filter (only when the pairwise path is enabled). Consensus
+    # uses the *unfiltered* pairwise GP (filter --filter-overlapping-genes drops
+    # many ref PC genes e.g. at collapsed loci).
+    if TRANSMAP_PAIRWISE and "transMap_pairwise" in active_modes:
+        inputs['transmap_pairwise_gp'] = f"{work_dir}/transMap_pairwise/{genome}.gp"
+        inputs['transmap_pairwise_filtered'] = f"{work_dir}/transMap_pairwise/{genome}_filtered.gp"
 
     # Map each mode to its specific genePred file path
     gp_path_map = mode_gp_paths(genome, work_dir)
     # Consensus intentionally consumes the *unfiltered* pairwise GP (not _filtered.gp).
-    gp_path_map['transMap_pairwise'] = f"{work_dir}/transMap_pairwise/{genome}.gp"
+    if TRANSMAP_PAIRWISE:
+        gp_path_map['transMap_pairwise'] = f"{work_dir}/transMap_pairwise/{genome}.gp"
     gp_list = [gp_path_map[mode] for mode in active_modes]
-    transmap_pairwise_gp = gp_path_map['transMap_pairwise']
-    if transmap_pairwise_gp not in gp_list:
-        gp_list.append(transmap_pairwise_gp)
     inputs['gp_list'] = gp_list
 
     parent_modes = {'augPB', 'strg'}
@@ -3477,7 +3650,8 @@ def get_consensus_inputs(wildcards):
         if config.get("txTM", False):
             done_files.append(f"{work_dir}/databases/{genome}_txTM_psl_metrics.done")
         done_files.append(f"{work_dir}/databases/{genome}_transMap_psl_metrics.done")
-        done_files.append(f"{work_dir}/databases/{genome}_transMap_pairwise_psl_metrics.done")
+        if TRANSMAP_PAIRWISE:
+            done_files.append(f"{work_dir}/databases/{genome}_transMap_pairwise_psl_metrics.done")
         # augMP has no native DB metrics tables; add the real miniprot-PSL-derived
         # coverage/identity (see generate_augMP_psl) so consensus filtering treats
         # augMP like other modes.
@@ -3497,6 +3671,24 @@ def psl_metrics_prior_after_txTM(wildcards):
     if config.get("txTM", False):
         return f"{config['work_dir']}/databases/{wildcards.genome}_txTM_psl_metrics.done"
     return f"{config['work_dir']}/.setup_done"
+
+
+def psl_metrics_prior_for_augMP(wildcards):
+    """Order augMP PSL metric writes after the last upstream mode to avoid sqlite locks.
+
+    Prefer pairwise when enabled; otherwise wait on regular transMap (or setup).
+    """
+    work_dir = config["work_dir"]
+    genome = wildcards.genome
+    if genome in ANCESTOR_GENOMES:
+        if "transMap_pairwise" in ANCESTOR_MODES:
+            return f"{work_dir}/databases/{genome}_transMap_pairwise_psl_metrics.done"
+        if "transMap" in ANCESTOR_MODES:
+            return f"{work_dir}/databases/{genome}_transMap_psl_metrics.done"
+        return f"{work_dir}/.setup_done"
+    if TRANSMAP_PAIRWISE:
+        return f"{work_dir}/databases/{genome}_transMap_pairwise_psl_metrics.done"
+    return f"{work_dir}/databases/{genome}_transMap_psl_metrics.done"
 
 
 rule store_psl_metrics_txTM:
@@ -3673,7 +3865,8 @@ rule store_psl_metrics_augMP:
         # freshness is tracked by the *_psl_metrics.done markers.
         db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
         ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
-        prior_pairwise=f"{config['work_dir']}/databases/{{genome}}_transMap_pairwise_psl_metrics.done",
+        # Wait on pairwise metrics when that mode is on; otherwise on transMap.
+        prior_upstream=psl_metrics_prior_for_augMP,
     output:
         done=f"{config['work_dir']}/databases/{{genome}}_augMP_psl_metrics.done"
     wildcard_constraints:

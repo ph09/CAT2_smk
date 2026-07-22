@@ -68,8 +68,13 @@ class MrnaAugMpEval(EvaluationColumns, Base):
     __tablename__ = 'mRNA_augMP_Evaluation'
 
 class MrnaTxTmEval(EvaluationColumns, Base):
-    """Table for evaluations of mRNA alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
+    """Table for evaluations of mRNA alignments of transcripts derived from txTM (in-house transcript-level transMap)"""
     __tablename__ = 'mRNA_txTM_Evaluation'
+
+
+class MrnaLiftoffEval(EvaluationColumns, Base):
+    """Table for evaluations of mRNA alignments of transcripts derived from Liftoff"""
+    __tablename__ = 'mRNA_liftoff_Evaluation'
 
 
 class CdsTmEval(EvaluationColumns, Base):
@@ -91,8 +96,13 @@ class CdsAugMpEval(EvaluationColumns, Base):
     __tablename__ = 'CDS_augMP_Evaluation'
 
 class CdsTxTmEval(EvaluationColumns, Base):
-    """Table for evaluations of CDS alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
+    """Table for evaluations of CDS alignments of transcripts derived from txTM (in-house transcript-level transMap)"""
     __tablename__ = 'CDS_txTM_Evaluation'
+
+
+class CdsLiftoffEval(EvaluationColumns, Base):
+    """Table for evaluations of CDS alignments of transcripts derived from Liftoff"""
+    __tablename__ = 'CDS_liftoff_Evaluation'
 
 
 class MetricsColumns(object):
@@ -176,8 +186,13 @@ class MrnaAugMpMetrics(MetricsColumns, Base):
     __tablename__ = 'mRNA_augMP_Metrics'
 
 class MrnaTxTmMetrics(MetricsColumns, Base):
-    """Table for evaluations of mRNA alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
+    """Table for evaluations of mRNA alignments of transcripts derived from txTM (in-house transcript-level transMap)"""
     __tablename__ = 'mRNA_txTM_Metrics'
+
+
+class MrnaLiftoffMetrics(MetricsColumns, Base):
+    """Table for evaluations of mRNA alignments of transcripts derived from Liftoff"""
+    __tablename__ = 'mRNA_liftoff_Metrics'
 
 
 class CdsTmMetrics(MetricsColumns, Base):
@@ -214,8 +229,13 @@ class CdsAugMpMetrics(MetricsColumns, Base):
     __tablename__ = 'CDS_augMP_Metrics'
 
 class CdsTxTmMetrics(MetricsColumns, Base):
-    """Table for evaluations of CDS alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
+    """Table for evaluations of CDS alignments of transcripts derived from txTM (in-house transcript-level transMap)"""
     __tablename__ = 'CDS_txTM_Metrics'
+
+
+class CdsLiftoffMetrics(MetricsColumns, Base):
+    """Table for evaluations of CDS alignments of transcripts derived from Liftoff"""
+    __tablename__ = 'CDS_liftoff_Metrics'
 
 
 class AlternativeGeneIdColumns(object):
@@ -283,7 +303,8 @@ tables = {'CDS': {'augTM': {'metrics': CdsAugTmMetrics, 'evaluation': CdsAugTmEv
                   'transMap_pairwise': {'metrics': CdsTmPairwiseMetrics, 'evaluation': CdsTmEval},
                   'augTM_pairwise': {'metrics': CdsAugTmPairwiseMetrics, 'evaluation': CdsAugTmEval},
                   'augTMR_pairwise': {'metrics': CdsAugTmrPairwiseMetrics, 'evaluation': CdsAugTmrEval},
-                  'txTM': {'metrics': CdsTxTmMetrics, 'evaluation': CdsTxTmEval}},
+                  'txTM': {'metrics': CdsTxTmMetrics, 'evaluation': CdsTxTmEval},
+                  'liftoff': {'metrics': CdsLiftoffMetrics, 'evaluation': CdsLiftoffEval}},
           'mRNA': {'augTM': {'metrics': MrnaAugTmMetrics, 'evaluation': MrnaAugTmEval},
                    'augTMR': {'metrics': MrnaAugTmrMetrics, 'evaluation': MrnaAugTmrEval},
                    'augMP': {'metrics': MrnaAugMpMetrics, 'evaluation': MrnaAugMpEval},
@@ -291,7 +312,8 @@ tables = {'CDS': {'augTM': {'metrics': CdsAugTmMetrics, 'evaluation': CdsAugTmEv
                    'transMap_pairwise': {'metrics': MrnaTmPairwiseMetrics, 'evaluation': MrnaTmEval},
                    'augTM_pairwise': {'metrics': MrnaAugTmPairwiseMetrics, 'evaluation': MrnaAugTmEval},
                    'augTMR_pairwise': {'metrics': MrnaAugTmrPairwiseMetrics, 'evaluation': MrnaAugTmrEval},
-                   'txTM': {'metrics': MrnaTxTmMetrics, 'evaluation': MrnaTxTmEval}},
+                   'txTM': {'metrics': MrnaTxTmMetrics, 'evaluation': MrnaTxTmEval},
+                   'liftoff': {'metrics': MrnaLiftoffMetrics, 'evaluation': MrnaLiftoffEval}},
           'alt_names': {'exRef': ExRefAlternativeGenes,
                         'augPB': AugPbAlternativeGenes,
                         'strg': StrgAlternativeGenes}}

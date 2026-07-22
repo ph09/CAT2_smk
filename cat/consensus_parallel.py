@@ -34,9 +34,11 @@ DENOVO_PREFIXES = ('augPB-', 'strg-')
 
 # Higher value wins when resolving overlapping genes at the same assembly locus.
 # augMP is lowest among map-based modes (rescue only when txTM/transMap absent).
+# Liftoff (same-species lifts) ranks with transMap as a high-identity projection.
 OVERLAP_RESOLUTION_SOURCE_PRIORITY = {
     'transMap': 3,
     'transMap_pairwise': 3,
+    'liftoff': 3,
     'txTM': 2,
     'augTM': 1,
     'augTMR': 1,
@@ -44,6 +46,10 @@ OVERLAP_RESOLUTION_SOURCE_PRIORITY = {
     'augTMR_pairwise': 1,
     'augMP': 0,
 }
+
+# Modes whose genePreds use a trailing _N suffix for extra gene copies (CNV /
+# paralog). Both txTM and Liftoff -copies share this convention.
+CNV_COPY_MODES = frozenset({'txTM', 'liftoff'})
 
 # Reference gene biotypes eligible for non-PC rescue (transMap / txTM only).
 RESCUE_REF_NONCODING_BIOTYPES = frozenset({
@@ -248,7 +254,7 @@ def _lookup_tx_coverage(coverage_map, aln_id, tx_obj, mode=None):
         val = coverage_map.get(norm_ref_transcript_id(str(key)))
         if val is not None:
             return val
-        if mode == 'txTM':
+        if mode in CNV_COPY_MODES:
             val = coverage_map.get(
                 norm_ref_transcript_id(normalize_alignment_id(str(key), mode))
             )
@@ -260,12 +266,12 @@ def _lookup_tx_coverage(coverage_map, aln_id, tx_obj, mode=None):
 def _index_rescue_candidates(tx_dict, alignment_source_map):
     """Map versionless transcript name -> [(aln_id, tx_obj, mode)]."""
     by_tx = collections.defaultdict(list)
-    rescue_modes = {'transMap', 'transMap_pairwise', 'txTM'}
+    rescue_modes = {'transMap', 'transMap_pairwise', 'txTM', 'liftoff'}
     for aln_id, tx_obj in tx_dict.items():
         mode = alignment_source_map.get(aln_id, '')
         if mode not in rescue_modes:
             continue
-        base_id = normalize_alignment_id(aln_id, mode) if mode == 'txTM' else tx_obj.name
+        base_id = normalize_alignment_id(aln_id, mode) if mode in CNV_COPY_MODES else tx_obj.name
         base = norm_match_transcript_id(base_id)
         by_tx[base].append((aln_id, tx_obj, mode))
     return by_tx
@@ -945,13 +951,13 @@ def normalize_alignment_id(aln_id, mode):
     """
     Normalize alignment IDs according to mode:
     - transMap: keep as-is
-    - txTM: strip underscore and numbers after (e.g., ENST00000123_1 -> ENST00000123)
+    - txTM / liftoff: strip underscore and numbers after (e.g., ENST00000123_1 -> ENST00000123)
     - augTM/augTMR: strip prefix (e.g., augTM-ENST00000123 -> ENST00000123)
     """
     if mode == 'transMap':
         return aln_id
-    elif mode == 'txTM':
-        # Strip cross-mode _cp suffix first, then txTM CNV copy _N (e.g. XM_….1_14_cp9 → XM_….1).
+    elif mode in CNV_COPY_MODES:
+        # Strip cross-mode _cp suffix first, then CNV copy _N (e.g. XM_….1_14_cp9 → XM_….1).
         import re
         base = re.sub(r'_cp\d*$', '', aln_id)
         base = re.sub(r'_\d+$', '', base)
@@ -974,20 +980,14 @@ def normalize_alignment_id(aln_id, mode):
 def normalize_gene_id(gene_id, mode):
     """
     Normalize gene IDs according to mode (same as transcript ID normalization).
-    This is important for txTM CNV copies which append _N to both transcript and gene IDs.
+    Important for txTM / Liftoff CNV copies which append _N to transcript and gene IDs.
     
     - transMap: keep as-is
-    - txTM: strip _N suffix (where N is 1-20) OR _N_M pattern
+    - txTM / liftoff: strip _N suffix OR _N_M pattern
     - augTM/augTMR/augMP: keep as-is
     - augPB: keep as-is
-    
-    Examples for txTM:
-    - ENSG00000026103.25_1 → ENSG00000026103.25 (CNV copy, strip _1)
-    - hg002_chrY_paternal_691_1 → hg002_chrY_paternal_691 (CNV copy, strip _1)
-    - hg002_chrY_paternal_691 → hg002_chrY_paternal_691 (original, keep as-is)
-    - hg002_chrY_paternal_157_10 → hg002_chrY_paternal_157 (CNV copy 10, strip _10)
     """
-    if mode == 'txTM':
+    if mode in CNV_COPY_MODES:
         import re
         # First, check for double _N_M pattern (e.g., _691_1 or _157_10)
         match = re.search(r'_\d+_(\d+)$', gene_id)
@@ -995,10 +995,8 @@ def normalize_gene_id(gene_id, mode):
             # Has double _N_M pattern, strip the last _M
             base = re.sub(r'_\d+$', '', gene_id)
             return base
-        # Second, check for simple _N suffix (txTM CNV copies)
-        # This handles ENSG00000026103.25_1 → ENSG00000026103.25
+        # Second, check for simple _N suffix (CNV copies)
         # Match _<digits> where there's a version number (dot + digits) before it
-        # This ensures we only strip CNV suffixes, not gene names ending in numbers
         match = re.search(r'\.\d+_(\d+)$', gene_id)
         if match:
             # Has version.number_CNV pattern (e.g., ENSG...25_21), strip the _CNV part
@@ -1024,6 +1022,8 @@ def identify_mode(aln_id, gp_file=None):
         if gp_file and 'augTM_pairwise' in gp_file:
             return 'augTM_pairwise'
         return 'augTM'
+    elif gp_file and 'liftoff' in gp_file:
+        return 'liftoff'
     elif gp_file and 'txTM' in gp_file:
         return 'txTM'
     elif gp_file and 'transMap_pairwise' in gp_file:
@@ -1110,8 +1110,8 @@ def backfill_cnv_metrics(mrna_metrics_df, cds_metrics_df, valid_aln_ids, alignme
     
     for aln_id in valid_aln_ids:
         mode = alignment_source_map.get(aln_id, 'unknown')
-        if mode == 'txTM' and '_' in aln_id.split('.')[-1]:
-            # This is a txTM CNV copy (_N suffix)
+        if mode in CNV_COPY_MODES and '_' in aln_id.split('.')[-1]:
+            # txTM / Liftoff CNV copy (_N suffix)
             base_id = normalize_alignment_id(aln_id, mode)  # Strips _N
             
             # Check if this copy is missing metrics but base has them
@@ -1122,7 +1122,7 @@ def backfill_cnv_metrics(mrna_metrics_df, cds_metrics_df, valid_aln_ids, alignme
                 missing_cds.append((aln_id, base_id))
     
     if missing_mrna or missing_cds:
-        logger.info(f"  Backfilling metrics for {len(set([x[0] for x in missing_mrna + missing_cds]))} txTM CNV copies...")
+        logger.info(f"  Backfilling metrics for {len(set([x[0] for x in missing_mrna + missing_cds]))} CNV copies (txTM/liftoff)...")
     
     # Duplicate metrics for missing CNV copies
     if missing_mrna and len(mrna_metrics_df) > 0:
@@ -1181,6 +1181,8 @@ def generate_consensus(args):
             mode = 'transMap_pairwise'
         elif 'transMap' in gp_file:
             mode = 'transMap'
+        elif 'liftoff' in gp_file:
+            mode = 'liftoff'
         elif 'txTM' in gp_file:
             mode = 'txTM'
         elif 'augTMR_pairwise' in gp_file:
@@ -1210,7 +1212,7 @@ def generate_consensus(args):
             
             # Normalize txTM IDs BEFORE duplicate detection to catch CNV copies at different loci
             # TxTM uses _N suffix (e.g., gene_1, gene_2) for CNV copies that should be preserved
-            if actual_mode == 'txTM':
+            if actual_mode in CNV_COPY_MODES:
                 normalized_name = normalize_alignment_id(t.name, actual_mode)
                 if normalized_name != t.name:
                     logger.debug(f"    Normalized txTM ID: {t.name} → {normalized_name}")
@@ -1861,15 +1863,20 @@ def create_support_dataframe(tx_dict, db_path, ref_df, alignment_source_map, den
         logger.info(f"    Updated GeneId from tx_dict for {has_tx_gene.sum()} transcripts (includes _cp paralogs)")
     support_df.drop(columns=['GeneId_from_tx'], inplace=True)
     
-    # Normalize GeneId for txTM transcripts to strip _N suffix (but NOT _cpN suffix!)
+    # Normalize GeneId for txTM/liftoff transcripts to strip _N suffix (but NOT _cpN!)
     # This ensures consistency with the normalized gene IDs in tx_dict
     # Note: _cp suffixes are preserved because they don't match the _\d+$ pattern
-    txTM_mask = support_df['AlignmentId'].apply(lambda x: alignment_source_map.get(x, '') == 'txTM')
-    if txTM_mask.any():
-        support_df.loc[txTM_mask, 'GeneId'] = support_df.loc[txTM_mask, 'GeneId'].apply(
-            lambda x: normalize_gene_id(x, 'txTM') if pd.notna(x) else x
+    cnv_mask = support_df['AlignmentId'].apply(
+        lambda x: alignment_source_map.get(x, '') in CNV_COPY_MODES
+    )
+    if cnv_mask.any():
+        support_df.loc[cnv_mask, 'GeneId'] = support_df.loc[cnv_mask].apply(
+            lambda row: normalize_gene_id(
+                row['GeneId'], alignment_source_map.get(row['AlignmentId'], 'txTM')
+            ) if pd.notna(row['GeneId']) else row['GeneId'],
+            axis=1,
         )
-        logger.info(f"    Normalized GeneId for {txTM_mask.sum()} txTM transcripts in support_df")
+        logger.info(f"    Normalized GeneId for {cnv_mask.sum()} txTM/liftoff transcripts in support_df")
     
     # Add missing transcripts (e.g., augPB, txTM without metrics)
     logger.info("  Adding missing transcripts to support dataframe...")
@@ -1895,8 +1902,8 @@ def create_support_dataframe(tx_dict, db_path, ref_df, alignment_source_map, den
                 gene_id = f'UNKNOWN_GENE_{tx_id}'
             
             # Normalize based on mode for TranscriptId lookup
-            if mode == 'txTM':
-                # Strip txTM's _N suffix first, then strip_alignment_numbers handles the rest
+            if mode in CNV_COPY_MODES:
+                # Strip CNV _N suffix first, then strip_alignment_numbers handles the rest
                 normalized_id = normalize_alignment_id(tx_id, mode)
                 base_tx_id = tools.nameConversions.strip_alignment_numbers(normalized_id)
                 if len(txTM_examples) < 3:
@@ -3150,8 +3157,8 @@ def select_consensus_with_cnv(scored_df, tx_dict, alignment_source_map, multi_lo
     # This replaces slow DataFrame filtering (scored_df[scored_df['AlignmentId'] == aln_id])
     logger.info(f"      Building AlignmentId index for fast lookups...")
     aln_id_to_row = {}
-    # Track source priority (lower is better): transMap=0, txTM=1, augTM=2, augMP=2, augPB=9
-    source_priority = {'transMap': 0, 'transMap_pairwise': 0, 'txTM': 1,
+    # Track source priority (lower is better): transMap/liftoff=0, txTM=1, augTM=2, augMP=2, augPB=9
+    source_priority = {'transMap': 0, 'transMap_pairwise': 0, 'liftoff': 0, 'txTM': 1,
                       'augTM': 2, 'augTMR': 2, 'augMP': 2, 'augPB': 9, 'strg': 9}
     for idx, row in scored_df.iterrows():
         aln_id = row['AlignmentId']
@@ -3179,7 +3186,7 @@ def select_consensus_with_cnv(scored_df, tx_dict, alignment_source_map, multi_lo
             locus_alignment_ids = [aln_id]
             # Check if there are other sources at this locus (look at original_gene_id)
             # For now, just calculate score from this alignment's mode
-            if mode in ['txTM', 'transMap', 'augTM', 'augTMR', 'augMP']:
+            if mode in ['txTM', 'liftoff', 'transMap', 'augTM', 'augTMR', 'augMP']:
                 core_score = total_score  # This mode is a core source
             else:
                 core_score = 0  # augPB doesn't count for CNV threshold
@@ -4081,8 +4088,8 @@ def filter_gene_fragments(deduplicated_consensus, tx_dict, ref_gene_coords, metr
         if mode in ('augPB', 'strg'):
             continue
         
-        # Skip txTM - can have species-specific genes not in reference
-        if mode == 'txTM':
+        # Skip txTM / liftoff - can have CNV copies / species-specific gene IDs
+        if mode in CNV_COPY_MODES:
             continue
         
         # Check if source_gene is a valid gene ID in reference
@@ -4527,7 +4534,7 @@ def resolve_conflicting_source_genes(
             # PASS 2: one protein-coding gene per assembly overlap cluster when genes do not
             # overlap each other in the reference (collapsed paralog / array projections).
             _MODE_PRIORITY = [
-                'transMap', 'transMap_pairwise', 'txTM', 'augTM',
+                'transMap', 'transMap_pairwise', 'liftoff', 'txTM', 'augTM',
                 'augTM_pairwise', 'augMP', 'augPB', 'strg',
             ]  # earlier = preferred; augMP last among projection modes
             def _mode_rank(modes_set):

@@ -85,6 +85,18 @@ augustus_pb: true
 stringtie: true
 stringtie_genomes: ["hg38"]
 txTM: true
+# BAM/minimap2-based pairwise transMap path (and its Augustus refinements
+# augTM_pairwise / augTMR_pairwise). On by default. Set to false for highly
+# diverged genomes where pairwise chaining fails or is not useful — the DAG then
+# skips minimap2_bam → bam_to_chain → transmap_pairwise_* entirely. Also strips
+# transMap_pairwise from ancestor_modes when annotate_ancestors is on.
+transmap_pairwise: true
+# External Liftoff annotation lift. OFF by default. Enable ONLY when annotating
+# another genome / haplotype of the SAME species (near-identical assemblies).
+# Do not use for cross-species projection — use transMap / txTM / augMP instead.
+# Optional: liftoff_sc (default 0.85) is the Liftoff -sc sequence-identity cutoff.
+liftoff: false
+#liftoff_sc: 0.85
 pb_genome_chunksize: 11000000
 pb_genome_overlap: 1000000
 stringtie_convert_script: "programs/convert_stringtie_gff3"

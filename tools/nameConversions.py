@@ -14,14 +14,15 @@ def set_alignment_source_map(source_map):
     alignment_source_map = source_map
 
 
-def remove_alignment_number(aln_id, aln_re=re.compile("-[0-9]+$"), txTM_copy_re=re.compile("_[0-9]+$")):
+def remove_alignment_number(aln_id, aln_re=re.compile("-[0-9]+$"), cnv_copy_re=re.compile("_[0-9]+$")):
     """
     If the name of the transcript ends with -d as in
     ENSMUST00000169901.2-1, return ENSMUST00000169901.2
-    Also handles txTM copy suffixes like _7 in ENST00000567343.1_7
+    Also handles CNV copy suffixes like _7 in ENST00000567343.1_7
+    (used by both txTM and Liftoff -copies).
     :param aln_id: name string
     :param aln_re: compiled regular expression for transMap alignment numbers
-    :param txTM_copy_re: compiled regular expression for txTM copy numbers
+    :param cnv_copy_re: compiled regular expression for CNV copy numbers (_N)
     :return: string
     """
     # Remove both types of suffixes, repeating until no more matches
@@ -29,8 +30,8 @@ def remove_alignment_number(aln_id, aln_re=re.compile("-[0-9]+$"), txTM_copy_re=
     prev_aln_id = None
     while prev_aln_id != aln_id:
         prev_aln_id = aln_id
-        # Try to remove txTM-style copy numbers (_d)
-        aln_id = txTM_copy_re.split(aln_id)[0]
+        # Try to remove CNV-style copy numbers (_d) from txTM / Liftoff
+        aln_id = cnv_copy_re.split(aln_id)[0]
         # Try to remove transMap-style alignment numbers (-d)
         aln_id = aln_re.split(aln_id)[0]
     return aln_id
@@ -75,17 +76,21 @@ def alignment_id_to_ref_transcript_id(aln_id):
 
 def strip_alignment_numbers_preserve_txTM_copies(aln_id):
     """
-    Strip alignment numbers but preserve txTM copy numbers for gene families.
-    This is used in consensus to preserve gene family expansion identified by txTM.
+    Strip alignment numbers but preserve CNV copy numbers (_N) for gene families.
+    Used in consensus for gene-family expansion from txTM and Liftoff -copies.
     :param aln_id: name string
     :return: string
     """
-    # Remove Augustus prefix but preserve txTM copy numbers
+    # Remove Augustus/txTM prefix but preserve CNV copy numbers
     aln_id = remove_augustus_alignment_number(aln_id)
     
-    # Only remove transMap-style alignment numbers (-d), not txTM copy numbers (_d)
+    # Only remove transMap-style alignment numbers (-d), not CNV copy numbers (_d)
     aln_re = re.compile("-[0-9]+$")
     return aln_re.split(aln_id)[0]
+
+
+# Alias: Liftoff -copies uses the same _N suffix convention as txTM.
+strip_alignment_numbers_preserve_cnv_copies = strip_alignment_numbers_preserve_txTM_copies
 
 
 def aln_id_is_augustus(aln_id):

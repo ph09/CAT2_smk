@@ -38,6 +38,8 @@ dependencies:
   - miniprot
   - minisplice
   - pal2nal
+  # Optional: only needed when liftoff: true (same-species annotation lifts)
+  - liftoff >=1.6.3
   # UCSC genome browser tools
   - ucsc-axtchain
   - ucsc-bamtopsl

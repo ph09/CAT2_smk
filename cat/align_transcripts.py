@@ -141,7 +141,7 @@ def setup(job, args, input_file_ids, resources):
     ref_transcript_dict = tools.transcripts.get_gene_pred_dict(annotation_gp)
     # will hold a mapping of output file paths to lists of Promise objects containing output
     results = collections.defaultdict(list)
-    for tx_mode in ['transMap', 'transMap_pairwise', 'augTM', 'augTM_pairwise', 'augTMR', 'augTMR_pairwise', 'augMP', 'txTM']:
+    for tx_mode in ['transMap', 'transMap_pairwise', 'augTM', 'augTM_pairwise', 'augTMR', 'augTMR_pairwise', 'augMP', 'txTM', 'liftoff']:
         if tx_mode not in args.transcript_modes:
             continue
         # output file paths

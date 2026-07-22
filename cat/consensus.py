@@ -108,6 +108,8 @@ def generate_consensus(args):
                 alignment_source_map[t.name] = 'transMap_pairwise'
             elif 'transMap' in gp_file:
                 alignment_source_map[t.name] = 'transMap'
+            elif 'liftoff' in gp_file:
+                alignment_source_map[t.name] = 'liftoff'
             elif 'txTM' in gp_file:
                 alignment_source_map[t.name] = 'txTM'
             elif 'augTMR_pairwise' in gp_file:
@@ -142,7 +144,7 @@ def generate_consensus(args):
     tm_eval_df = load_transmap_evals(args.db_path)
     # pd.set_option('max_columns', None)
     # Determine which modes are available for this genome
-    txms = ['transMap', 'augTM', 'augTMR', 'augMP', 'txTM']
+    txms = ['transMap', 'augTM', 'augTMR', 'augMP', 'txTM', 'liftoff']
     
     # Check if augPB data exists for this genome by looking for augPB transcripts
     has_augpb = any(_is_denovo(tx_id) for tx_id in tx_dict.keys())
@@ -154,7 +156,7 @@ def generate_consensus(args):
     if not has_augmp and 'augMP' in txms:
         txms.remove('augMP')
     
-    tx_modes = [x for x in txms if x in ['transMap', 'augTM', 'augTMR', 'augMP', 'txTM', 'augPB', 'strg']]
+    tx_modes = [x for x in txms if x in ['transMap', 'augTM', 'augTMR', 'augMP', 'txTM', 'liftoff', 'augPB', 'strg']]
     # denovo and augMP don't have metrics tables, so exclude them from metrics loading
     tx_modes_with_metrics = [x for x in tx_modes if x not in ['augPB', 'strg', 'augMP']]
     # Get tm df but don't drop AlignmentId yet
