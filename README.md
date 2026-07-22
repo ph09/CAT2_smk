@@ -15,7 +15,7 @@ genome:
   [Protein set](#protein-set-for-augmp--miniprot).
 - **StringTie** — reference-guided transcript assembly from RNA-seq or Iso-seq.
 
-> This is the current version of CAT2 and is under active development.
+> This is the current version of CAT2 and is under active development. 
 
 ---
 
@@ -72,6 +72,8 @@ snakemake --configfile input.yaml all --cores 4
 ```
 
 `input.yaml` is the template config you will copy and modify for your own data.
+
+If you are looking to also include liftoff in the CAT2 consensus (recommended only when annotating same species or closely related species of the reference), use the optional-liftoff branch.
 
 ---
 
@@ -196,22 +198,12 @@ isoseq_genomes: ["hg38"]        # genomes with usable long reads
 
 ### Mode toggles
 
-`liftoff` is **off by default**. Turn it on only when annotating another genome
-or haplotype of the **same species** (near-identical assemblies). For
-cross-species projection, leave it off and use transMap / txTM / augMP.
-
 ```yaml
 augustus: true            # AugustusTM/TMR refinement
 augustus_pb: true         # AugustusPB (needs isoseq)
 stringtie: true           # StringTie assembly
 stringtie_genomes: ["hg38"]
-txTM: true                # transcript-level minimap2 map (best on close relatives)
-transmap_pairwise: true   # BAM/minimap2 pairwise transMap (+ augTM/TMR_pairwise).
-                          # Set false for highly diverged genomes where pairwise
-                          # chaining fails — skips minimap2_bam → bam_to_chain →
-                          # the whole pairwise path.
-liftoff: false            # External Liftoff; same-species haplotypes only (see above)
-# liftoff_sc: 0.85        # optional Liftoff -sc sequence-identity cutoff
+txTM: true                # transMap at the transcript-level. Only helpful in genomes close to reference annotations set.
 augustus_species: "human" # Augustus species parameter set
 ```
 
