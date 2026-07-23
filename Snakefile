@@ -3905,7 +3905,9 @@ rule annotate_novel_genes:
         metrics_json = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_novel_annotated.json",
         done    = touch(f"{config['work_dir']}/{{genome}}_novel_annotation.done"),
     wildcard_constraints:
-        genome = "|".join(TARGET_GENOMES)
+        # Must cover ANNOTATION_GENOMES (targets + ancestors): gene_family_report
+        # consumes *_consensus_novel_annotated.* for every annotated genome.
+        genome = ANNOTATION_GENOME_WC
     log:
         f"{config['work_dir']}/logs/consensus/{{genome}}_novel_annotation.log"
     threads: 1 if IS_CLUSTER else get_local_res("annotate_novel_genes", "threads")
@@ -4062,7 +4064,7 @@ rule gene_family_report:
 rule finish_pipeline:
     input:
         expand(str(WORK_DIR / "{genome}_consensus.done"), genome=ANNOTATION_GENOMES),
-        expand(str(WORK_DIR / "{genome}_novel_annotation.done"), genome=TARGET_GENOMES),
+        expand(str(WORK_DIR / "{genome}_novel_annotation.done"), genome=ANNOTATION_GENOMES),
         str(WORK_DIR / "plots.done"),
         *( [str(WORK_DIR / "gene_family_report.done")]
            if config.get("gene_family_report", True) else [] )
