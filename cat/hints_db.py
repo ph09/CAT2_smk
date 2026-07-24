@@ -2153,6 +2153,17 @@ def run_hints_pipeline(genome: str,
     logger.info(f'Processing {len(bams or [])} BAM files, {len(iso_bams or [])} IsoSeq files')
     logger.info(f'Estimated total BAM size: {resources["total_bam_size_gb"]:.1f}GB')
     logger.info(f'Optimal BAM processing: {resources["bam_cpus"]} CPUs, {resources["bam_memory_gb"]}GB memory')
+
+    # Toil's FileJobStore.initialize() uses os.mkdir (not makedirs), so the
+    # parent of the job store path must already exist.
+    job_store = getattr(toil_options, "jobStore", None)
+    if job_store:
+        job_store_path = str(job_store)
+        if job_store_path.startswith("file:"):
+            job_store_path = job_store_path[5:]
+        parent = os.path.dirname(os.path.abspath(job_store_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
     
     with Toil(toil_options) as toil:
         if not toil.options.restart:
