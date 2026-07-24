@@ -2327,7 +2327,10 @@ rule run_transcript_map:
 
         work_dir = config['work_dir']
         genome   = wildcards.genome
-        threads  = get_res('run_txTM', 'cpus') if IS_CLUSTER else snakemake.threads
+        # In run: blocks, `threads` is provided by Snakemake (smk 8+/9); there is
+        # no snakemake.threads attribute. Cluster mode uses the rule's cpus
+        # request for the submitted job body.
+        job_threads = get_res('run_txTM', 'cpus') if IS_CLUSTER else threads
         job_script = f"{work_dir}/txTM/{genome}_txTM_job.sh"
 
         Path(f"{work_dir}/txTM").mkdir(parents=True, exist_ok=True)
@@ -2349,7 +2352,7 @@ rule run_transcript_map:
 python3 cat/transcript_map_runner.py \\
     --config {cfg_snapshot} \\
     --genome {genome} \\
-    --threads {threads} \\
+    --threads {job_threads} \\
     --log {log[0]} \\
     --output-gp {output.gp} \\
     --output-psl {output.psl} \\
