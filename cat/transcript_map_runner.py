@@ -96,8 +96,29 @@ def run_for_genome(cfg: dict, genome: str, threads: int, log_path: str,
     out_dir = f"{work_dir}/txTM"
     ref_db = f"{work_dir}/databases/{ref_genome}.db"
 
-    tmp_base = os.environ.get('TMPDIR', '/data/tmp')
-    Path(tmp_base).mkdir(parents=True, exist_ok=True)
+    # Prefer TMPDIR when writable; otherwise fall back to work_dir/tmp then
+    # the system temp dir. Do not hard-require site-specific paths like /data/tmp.
+    candidates = []
+    if os.environ.get('TMPDIR'):
+        candidates.append(os.environ['TMPDIR'])
+    candidates.append(f"{work_dir}/tmp")
+    candidates.append(tempfile.gettempdir())
+    tmp_base = None
+    for cand in candidates:
+        try:
+            Path(cand).mkdir(parents=True, exist_ok=True)
+            probe = Path(cand) / f".cat2_write_probe_{os.getpid()}"
+            probe.touch()
+            probe.unlink()
+            tmp_base = cand
+            break
+        except OSError:
+            continue
+    if tmp_base is None:
+        raise PermissionError(
+            "No writable temp directory found. Set TMPDIR to a writable path "
+            f"(tried: {', '.join(candidates)})."
+        )
 
     with tempfile.TemporaryDirectory(prefix='txmap_', dir=tmp_base) as tmp_dir:
         run_transcript_map(
