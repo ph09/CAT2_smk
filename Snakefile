@@ -1623,8 +1623,8 @@ rule generate_hints:
         intron_bams = lambda wc: config.get("transcriptomic_data", {}).get(wc.genome, {}).get("intronbam", []),
         iso_bams = lambda wc: config.get("transcriptomic_data", {}).get(wc.genome, {}).get("isoseq_bam", []),
         annotation_gp = lambda wc: [p] if (p := config.get("transcriptomic_data", {}).get(wc.genome, {}).get("annotation")) else [],
-        protein_fasta = lambda wc: [p] if (p := config.get("transcriptomic_data", {}).get(wc.genome, {}).get("protein_fasta")) else []
-        #setup_done = rules.setup_pipeline_directories.output.setup_done
+        protein_fasta = lambda wc: [p] if (p := config.get("transcriptomic_data", {}).get(wc.genome, {}).get("protein_fasta")) else [],
+        setup_done = rules.setup_pipeline_directories.output.setup_done,
     output:
         hints = f"{WORK_DIR}/hints_database/{{genome}}_extrinsic_hints.gff"
     wildcard_constraints:
@@ -1682,6 +1682,7 @@ rule generate_hints:
               --slurm_max_jobs {params.slurm_max_jobs} >> {log} 2>&1
         else
             echo "Using local hints generation for {wildcards.genome}" > {log}
+            mkdir -p "$(dirname {params.jobStore})"
             rm -rf {params.jobStore}
             python3 cat/hints_db.py \
               --mode toil \
@@ -3281,6 +3282,7 @@ rule align_transcripts:
               --cleanup >> {log} 2>&1
         else
             echo "Using local transcript alignment for {wildcards.genome} {wildcards.alignment_mode}" > {log}
+            mkdir -p "$(dirname {params.job_store_dir})"
             rm -rf {params.job_store_dir}
             python {input.script} \
               --mode toil \
