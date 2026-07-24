@@ -552,7 +552,7 @@ def run_augustus_parallel(*, input, output, params, wildcards, log_path,
     os.makedirs(genome_work_dir, exist_ok=True)
 
     cmd = [
-        "python", input.script,
+        "python", "-m", "cat.augustus_parallel",
         "--genome_fasta", input.fasta,
         "--coding_gp", input.coding_gp,
         "--filtered_tm_psl", input.filtered_tm_psl,
@@ -1031,7 +1031,7 @@ gffutils.create_db("{input.gff3}", "{output.gff3_db}",
                    merge_strategy="create_unique", force=True)
 EOF
 
-python3 cat/augment_reference_for_lifting.py \\
+python -m cat.augment_reference_for_lifting \\
     --gff3-db   {output.gff3_db} \\
     --ref-gp    {output.gp} \\
     --ref-fa    {output.transcript_fasta} \\
@@ -1174,7 +1174,7 @@ rule transmap_filter:
         min_span=rcfg("tm_min_span", 0.2),
         max_ref_span=rcfg("tm_max_ref_span", 5),
         paralog_rescue_min_coverage=rcfg("tm_paralog_rescue_min_coverage", 0.5),
-        script="cat/filter_transmap.py"
+        script="cat.filter_transmap"
     log:
         f"{config['work_dir']}/logs/transmap_filter/{{genome}}.log"
     resources:
@@ -1184,7 +1184,7 @@ rule transmap_filter:
     shell:
         """
         set -euo pipefail
-        python {params.script} \
+        python -m {params.script} \
             --tm-psl {input.tm_psl} \
             --ref-psl {input.ref_psl} \
             --tm-gp {input.tm_gp} \
@@ -1233,7 +1233,7 @@ rule transmap_evaluate:
         genome = ANNOTATION_GENOME_WC
     params:
         db_path=f"{config['work_dir']}/databases/{{genome}}.db",
-        script="cat/transmap_classify.py"
+        script="cat.transmap_classify"
     log:
         f"{config['work_dir']}/logs/transmap_evaluate/{{genome}}.log"
     resources:
@@ -1242,7 +1242,7 @@ rule transmap_evaluate:
         job_id=lambda wildcards, attempt: f"tm-eval-{wildcards.genome}-{attempt}"
     shell:
         """
-        python {params.script} \
+        python -m {params.script} \
             --filtered-tm-psl {input.filtered_psl} \
             --filtered-tm-gp {input.filtered_gp} \
             --ref-psl {input.ref_psl} \
@@ -1577,7 +1577,7 @@ rule transmap_pairwise_filter:
         global_near_best=config.get("tm_global_near_best", 0.1),
         filter_overlapping_genes="--filter-overlapping-genes" if config.get("tm_filter_overlapping", True) else "",
         overlapping_ignore_bases=config.get("tm_overlapping_ignore_bases", 0),
-        script="cat/filter_transmap.py"
+        script="cat.filter_transmap"
     log:
         f"{config['work_dir']}/logs/transmap_pairwise_filter/{{genome}}.log"
     resources:
@@ -1586,7 +1586,7 @@ rule transmap_pairwise_filter:
         job_id=lambda wildcards, attempt: f"tm-bam-filter-{wildcards.genome}-{attempt}"
     shell:
         """
-        python {params.script} \
+        python -m {params.script} \
             --tm-psl {input.tm_psl} \
             --ref-psl {input.ref_psl} \
             --tm-gp {input.tm_gp} \
@@ -1660,7 +1660,8 @@ rule generate_hints:
         r"""
         if [ "{params.use_cluster}" = "True" ]; then
             echo "Using {params.execution_mode}-based parallel hints generation for {wildcards.genome}" > {log}
-            python3 cat/hints_db.py \
+            # Module form required so Toil can reload jobs from the `cat` package.
+            python -m cat.hints_db \
               --mode cluster \
               --execution_mode {params.execution_mode} \
               --exclude_nodes "{params.exclude_nodes}" \
@@ -1684,7 +1685,9 @@ rule generate_hints:
             echo "Using local hints generation for {wildcards.genome}" > {log}
             mkdir -p "$(dirname {params.jobStore})"
             rm -rf {params.jobStore}
-            python3 cat/hints_db.py \
+            TOIL_WORKDIR="${{TMPDIR:-/tmp}}"
+            mkdir -p "$TOIL_WORKDIR"
+            python -m cat.hints_db \
               --mode toil \
               --genome {wildcards.genome} \
               --fasta {input.fasta} \
@@ -1697,7 +1700,7 @@ rule generate_hints:
               --batchSystem single_machine \
               --maxCores {threads} \
               --maxMemory {resources.mem_gb}G \
-              --workDir {params.workDir} \
+              --workDir "$TOIL_WORKDIR" \
               {params.jobStore} >> {log} 2>&1
         fi
         """
@@ -2349,7 +2352,7 @@ rule run_transcript_map:
             f"{work_dir}/logs/transcript_map/{genome}_slurm.out",
             f"{work_dir}/logs/transcript_map/{genome}_slurm.err"
         ) + f"""
-python3 cat/transcript_map_runner.py \\
+python -m cat.transcript_map_runner \\
     --config {cfg_snapshot} \\
     --genome {genome} \\
     --threads {job_threads} \\
@@ -2735,7 +2738,7 @@ rule miniprot_paf_to_genepred:
         min_score=config.get('miniprot', {}).get('min_score', 0),
     shell:
         """
-        python3 cat/convert_miniprot_to_genepred.py {input.paf} {output.gp} \
+        python -m cat.convert_miniprot_to_genepred {input.paf} {output.gp} \
             --psl {output.psl} \
             --min-coverage {params.min_coverage} \
             --min-identity {params.min_identity} \
@@ -2804,7 +2807,7 @@ rule augustus_run_mp:
                 shell(f"echo 'Running Augustus MP for {num_transcripts} miniprot-only transcripts' >> {log[0]}")
 
                 cmd = [
-                    "python3", input.script,
+                    "python", "-m", "cat.augustus_parallel",
                     "--genome_fasta", input.fasta,
                     "--coding_gp", input.coding_gp,
                     "--filtered_tm_psl", input.filtered_tm_psl,
@@ -2921,7 +2924,7 @@ rule fix_augmp_gene_names:
         job_id=lambda wildcards, attempt: f"fix-augmp-{wildcards.genome}-{attempt}"
     shell:
         """
-        python cat/fix_augmp_gene_names.py \
+        python -m cat.fix_augmp_gene_names \
             --ref-db {input.ref_db} \
             --augmp-files {input.gp} \
             >> {log} 2>&1 && touch {output.done}
@@ -2962,7 +2965,7 @@ rule run_augustus_pb:
 
         # Run the parallel Augustus PB pipeline
         cmd = [
-            "python", input.script,
+            "python", "-m", "cat.augustus_pb_parallel",
             "--genome_fasta", input.fasta,
             "--chrom_sizes", input.sizes,
             "--hints_gff", input.hints_gff,
@@ -3016,7 +3019,7 @@ rule convert_stringtie_to_strg:
             f"{work_dir}/logs/stringtie_run/{genome}_strg_convert_slurm.out",
             f"{work_dir}/logs/stringtie_run/{genome}_strg_convert_slurm.err",
         ) + f"""
-python3 {input.script} {input.temp_gtf} {output.gtf} >> {log[0]} 2>&1
+python -m cat.convert_stringtie_to_augpb_format {input.temp_gtf} {output.gtf} >> {log[0]} 2>&1
 """
 
         with open(log[0], 'a') as log_file:
@@ -3108,7 +3111,7 @@ rule find_denovo_parents:
     output:
         done_file=temp(f"{config['work_dir']}/databases/{{genome}}_{{mode}}_parents.done")
     params:
-        script="cat/parent_gene_assignment_cluster.py" if IS_CLUSTER else "cat/parent_gene_assignment.py",
+        script="cat.parent_gene_assignment_cluster" if IS_CLUSTER else "cat.parent_gene_assignment",
         db_path=f"{config['work_dir']}/databases/{{genome}}.db",
         table_name=get_denovo_parent_tablename,
         cluster_args=(
@@ -3133,7 +3136,7 @@ rule find_denovo_parents:
         job_id=lambda wildcards, attempt: f"parents-{wildcards.genome}-{wildcards.mode}-{attempt}"
     shell:
         """
-        python {params.script} \
+        python -m {params.script} \
             --filtered-tm-gp {input.filtered_tm_gp} \
             --unfiltered-tm-gp {input.unfiltered_tm_gp} \
             --chrom-sizes {input.sizes} \
@@ -3262,7 +3265,9 @@ rule align_transcripts:
         r"""
         if [ "{params.use_cluster}" = "True" ]; then
             echo "Using {params.execution_mode}-based transcript alignment for {wildcards.genome} {wildcards.alignment_mode}" > {log}
-            python {input.script} \
+            # Invoke as a module so Toil can load jobs from the `cat` package
+            # (python cat/align_transcripts.py fails: "loading a user script from a package directory").
+            python -m cat.align_transcripts \
               --mode cluster \
               --execution-mode {params.execution_mode} \
               --genome {params.genome_name} \
@@ -3287,10 +3292,13 @@ rule align_transcripts:
             echo "Using local transcript alignment for {wildcards.genome} {wildcards.alignment_mode}" > {log}
             mkdir -p "$(dirname {params.job_store_dir})"
             rm -rf {params.job_store_dir}
-            python {input.script} \
+            # Short workDir avoids Toil path-length issues on deep shared filesystems.
+            TOIL_WORKDIR="${{TMPDIR:-/tmp}}"
+            mkdir -p "$TOIL_WORKDIR"
+            python -m cat.align_transcripts \
               --mode toil \
               {params.job_store} \
-              --workDir {params.work_dir} \
+              --workDir "$TOIL_WORKDIR" \
               --batchSystem single_machine \
               --maxCores {threads} \
               --logFile {log} \
@@ -3323,7 +3331,7 @@ rule evaluate_transcripts:
         genome=ANNOTATION_GENOME_WC,
         alignment_mode=f"({'|'.join(ALL_ALIGNMENT_MODES)})"
     params:
-        script="cat/classify_cluster.py" if IS_CLUSTER else "cat/classify.py",
+        script="cat.classify_cluster" if IS_CLUSTER else "cat.classify",
         db_path=f"{config['work_dir']}/databases/{{genome}}.db",
         ref_db_path=f"{config['work_dir']}/databases/{config['ref_genome']}.db",
         mode_file_args=lambda w, input: f"{w.alignment_mode} {input.gp} {input.mrna_psl} {input.cds_psl}",
@@ -3350,7 +3358,7 @@ rule evaluate_transcripts:
         job_id=lambda wildcards, attempt: f"eval-{wildcards.genome}-{wildcards.alignment_mode}-{attempt}"
     shell:
         """
-        python {params.script} \\
+        python -m {params.script} \\
             --annotation-gp {input.ref_gp} \\
             --ref-db-path {params.ref_db_path} \\
             --fasta {input.target_fasta} \\
@@ -3523,7 +3531,7 @@ rule store_psl_metrics_txTM:
         genome = TXTM_GENOME_WC
     run:
         shell(
-            "python3 cat/store_psl_metrics.py "
+            "python -m cat.store_psl_metrics "
             f"--db-path {input.db_path} "
             f"--psl {input.psl} "
             "--mode txTM "
@@ -3547,7 +3555,7 @@ rule store_psl_metrics_transMap:
         genome = ANNOTATION_GENOME_WC
     run:
         shell(
-            "python3 cat/store_psl_metrics.py "
+            "python -m cat.store_psl_metrics "
             f"--db-path {input.db_path} "
             f"--psl {input.psl} "
             "--mode transMap "
@@ -3571,7 +3579,7 @@ rule store_psl_metrics_transMap_pairwise:
         genome = ANNOTATION_GENOME_WC
     run:
         shell(
-            "python3 cat/store_psl_metrics.py "
+            "python -m cat.store_psl_metrics "
             f"--db-path {input.db_path} "
             f"--psl {input.psl} "
             "--mode transMap_pairwise "
@@ -3609,7 +3617,7 @@ rule generate_augMP_psl:
     shell:
         """
         rm -f {output.psl}
-        python3 cat/generate_augMP_psl.py \
+        python -m cat.generate_augMP_psl \
             --augmp-gp {input.gp} \
             --miniprot-psl {input.miniprot_psl} \
             --out-psl {output.psl} > {log} 2>&1
@@ -3655,7 +3663,7 @@ rule filter_augMP:
         f"{config['work_dir']}/logs/filter_augMP/{{genome}}.log"
     shell:
         """
-        python3 cat/filter_augMP.py \
+        python -m cat.filter_augMP \
             --in-gp {input.raw_gp} \
             --in-psl {input.raw_psl} \
             --out-gp {output.gp} \
@@ -3692,7 +3700,7 @@ rule store_psl_metrics_augMP:
             echo "ERROR: augMP PSL empty — rerun generate_augMP_psl (missing {input.generated})" >&2
             exit 1
         fi
-        python3 cat/store_psl_metrics.py \
+        python -m cat.store_psl_metrics \
             --db-path {input.db_path} \
             --psl {input.psl} \
             --mode augMP \
@@ -3787,7 +3795,7 @@ rule generate_consensus:
             f"{work_dir}/logs/consensus/{genome}_slurm.err"
         ) + f"""
 # Run consensus_runner.py with the specified parameters
-python cat/consensus_runner.py \\
+python -m cat.consensus_runner \\
     --gp-list {gp_list_str} \\
     --db-path {input.db_path} \\
     --ref-db-path {input.ref_db_path} \\
@@ -3946,7 +3954,7 @@ echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
-python cat/annotate_novel_genes.py \\
+python -m cat.annotate_novel_genes \\
     --consensus-protein-fasta {input.protein_fasta} \\
     --consensus-gp-info       {input.gp_info} \\
     --consensus-gff3          {input.gff3} \\
