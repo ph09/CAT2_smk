@@ -493,7 +493,7 @@ def _slurm_partition(rule_name=None):
         r = config.get("slurm", {}).get("rules", {}).get(rule_name, {})
         if "partition" in r:
             return r["partition"]
-    return config.get("slurm", {}).get("partition", "high_priority")
+    return config.get("slurm", {}).get("partition", "")
 
 def _slurm_exclude():
     return config.get("slurm", {}).get("exclude_nodes", "")
