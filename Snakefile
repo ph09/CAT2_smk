@@ -902,7 +902,7 @@ rule prepare_genome_files:
         ) + f"""
 # Log start time
 echo "Starting genome preparation for: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
@@ -995,7 +995,7 @@ rule prepare_reference_files:
         ) + f"""
 # Log start time
 echo "Starting reference preparation for: {REF_GENOME}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
@@ -1118,7 +1118,7 @@ rule transmap_map_psl:
         ) + f"""
 # Log start time
 echo "Starting transMap PSL mapping for: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
@@ -1300,7 +1300,7 @@ rule transmap_unfiltered_gtf:
         ) + f"""
 # Log start time
 echo "Starting transMap unfiltered GTF creation for: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
@@ -1368,7 +1368,7 @@ rule minimap2_bam:
             f"{work_dir}/logs/minimap2_bam/{genome}_slurm.err"
         ) + f"""
 echo "Starting minimap2 alignment for: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Start time: $(date)"
 
 # Run minimap2 to align query (reference) to target genome
@@ -1438,7 +1438,7 @@ rule bam_to_chain:
             f"{work_dir}/logs/bam_to_chain/{genome}_slurm.err"
         ) + f"""
 echo "Starting BAM to chain conversion for: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Start time: $(date)"
 
 # Check if BAM file exists and has alignments
@@ -1524,7 +1524,7 @@ rule transmap_pairwise_map_psl:
             f"{work_dir}/logs/transmap_pairwise_map/{wildcards.genome}_slurm.err"
         ) + f"""
 echo "Starting transMap BAM-based PSL mapping for: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Start time: $(date)"
 
 # Run pslMap, trying both normal and -swapMap in case chain is reversed
@@ -1786,13 +1786,13 @@ rule run_chaining_per_genome:
             return f"""
 # Log start time
 echo "Starting chaining for genome: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
 # Create output directory and temporary working directory
 mkdir -p "{os.path.abspath(os.path.dirname(chain_file))}"
-TEMP_DIR="{os.path.abspath(os.path.dirname(chain_file))}/temp_${{SLURM_JOB_ID}}"
+TEMP_DIR="{os.path.abspath(os.path.dirname(chain_file))}/temp_${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 mkdir -p "$TEMP_DIR"
 cd "$TEMP_DIR"
 
@@ -3937,7 +3937,7 @@ rule annotate_novel_genes:
             f"{work_dir}/logs/consensus/{genome}_novel_annotation_slurm.err"
         ) + f"""
 echo "Annotating novel genes for: {genome}"
-echo "Job ID: ${{SLURM_JOB_ID}}"
+echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
