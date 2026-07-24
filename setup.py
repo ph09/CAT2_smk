@@ -12,6 +12,7 @@ setup(
         'toil>=7.0.0',
         'seaborn>=0.13.0',
         'pandas>=2.0.0',
+        'pyyaml>=6.0',
         'frozendict>=2.4.1',
         'configobj>=5.0',
         'sqlalchemy>=2.0',
