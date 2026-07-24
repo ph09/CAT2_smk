@@ -39,10 +39,6 @@ chmod +x install_standalones.sh
 ./install_standalones.sh          # fetches UCSC Kent binaries into ./standalones/
 ```
 
-`install_standalones.sh` downloads the UCSC utilities the pipeline calls. Two
-non-UCSC helpers (`aln2hints.pl` from AUGUSTUS, `pal2nal.pl`) must be placed in
-`./standalones/` by hand — the script prints a reminder.
-
 ## Setup
 
 `setup_env.sh` activates the conda env and puts Cactus's HAL tools and the repo
