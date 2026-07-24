@@ -5,7 +5,7 @@
 #   script, which would prepend venv Python and break Snakemake
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate cat
+conda activate cat2
 
 export PYTHONNOUSERSITE=1
 
