@@ -41,15 +41,24 @@ chmod +x install_standalones.sh
 
 ## Setup
 
-`setup_env.sh` activates the conda env and puts Cactus's HAL tools and the repo
-`standalones/` on `PATH`:
+Point `CACTUS_BIN` at a Cactus binary install that provides HAL tools
+(`halStats`, `hal2fasta`, …), then source the env helper. Conda stays first on
+`PATH` so a Cactus-bundled Python cannot shadow the `cat2` env:
 
 ```bash
-export CACTUS_BIN=/your/path/to/cactus-bin-v3.2.1
+export CACTUS_BIN=/path/to/cactus-bin-v3.2.1
 source setup_env.sh
+which python    # should be .../envs/cat2/bin/python
+which halStats  # should be under $CACTUS_BIN
 ```
 
-## Quick start (bundled test data)
+On sites that ship Cactus as an environment module, load the module (or set
+`CACTUS_BIN` to that prefix), then `conda activate cat2` again so conda Python
+wins. Set site scheduler knobs in your config (`slurm.partition`,
+`slurm.exclude_nodes`, or `cluster.sge.*`); empty partition/exclude means “use
+the cluster default”.
+
+## Quick start 
 
 The repo ships small parser/test fixtures, but the test HAL and BAMs are hosted
 separately. Download them into `test_data/` first:
@@ -61,10 +70,10 @@ Then dry-run, then run:
 
 ```bash
 # dry-run: parse Snakefile, validate config, build the DAG
-snakemake --configfile input.yaml -n all --cores 4
+snakemake --configfile input.yaml --cores 4 -n all 
 
 # run locally
-snakemake --configfile input.yaml all --cores 4
+snakemake --configfile input.yaml --cores 4 all
 ```
 
 `input.yaml` is the template config you will copy and modify for your own data.
