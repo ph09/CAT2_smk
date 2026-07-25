@@ -13,6 +13,8 @@ setup(
         'seaborn>=0.13.0',
         'pandas>=2.0.0',
         'pyyaml>=6.0',
+        'six',
+        'matplotlib>=3.7',
         'frozendict>=2.4.1',
         'configobj>=5.0',
         'sqlalchemy>=2.0',
