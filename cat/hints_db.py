@@ -65,6 +65,19 @@ def _cap_cores(requested) -> int:
     return max(1, min(n, _toil_max_cores()))
 
 
+def _samtools_view_regions(ref_group):
+    """Optional region args for ``samtools view``.
+
+    In this pipeline ``ref_group`` is usually a BAM basename string (a dict key).
+    Passing ``list(that_string)`` would treat each character as a chromosome
+    (e.g. ``ERR753966...`` -> ``E``, ``R``, ``R``, …). Only real sequences of
+    region names are forwarded.
+    """
+    if isinstance(ref_group, (list, tuple)):
+        return [str(r) for r in ref_group if r]
+    return []
+
+
 def _init_scheduler(args) -> Scheduler:
     """Construct and stash the Scheduler from CLI args, returning the instance.
 
@@ -2458,12 +2471,13 @@ def namesort_bam_dynamic(job: Job, bam_fid, bai_fid, ref_group, num_reads=50_000
         cores = min(job.cores, 64)  # Use job-allocated cores
         memory_per_thread = f'{max(1, int(job.memory // (1024**3) // cores))}G'
         
-        # Correctly construct the command to view the entire BAM file
-        cmd = [['samtools', 'view', '-@', str(cores//2), '-b', bam_path] + list(ref_group),
-               ['sambamba', 'sort', '-t', str(cores//2), '-m', memory_per_thread, 
+        # View the whole BAM (ref_group is a label/basename, not regions)
+        regions = _samtools_view_regions(ref_group)
+        cmd = [['samtools', 'view', '-@', str(max(1, cores // 2)), '-b', bam_path] + regions,
+               ['sambamba', 'sort', '-t', str(max(1, cores // 2)), '-m', memory_per_thread,
                 '-o', '/dev/stdout', '-n', '/dev/stdin']]
         
-        logger.info(f'Running BAM sort with {cores//2} threads and {memory_per_thread} memory per thread')
+        logger.info(f'Running BAM sort with {max(1, cores // 2)} threads and {memory_per_thread} memory per thread')
         tools.procOps.run_proc(cmd, stdout=tmp)
         
     except Exception as e:
@@ -2471,7 +2485,8 @@ def namesort_bam_dynamic(job: Job, bam_fid, bai_fid, ref_group, num_reads=50_000
         # Fallback: still honour allocated cores / memory, not hardcoded 32/64G
         fb_cores = max(1, _cap_cores(job.cores))
         fb_mem_gb = max(1, int((job.memory or (4 * 1024**3)) // (1024**3)))
-        cmd = [['samtools', 'view', '-@', str(fb_cores), '-b', bam_path] + list(ref_group),
+        regions = _samtools_view_regions(ref_group)
+        cmd = [['samtools', 'view', '-@', str(fb_cores), '-b', bam_path] + regions,
                ['sambamba', 'sort', '-t', str(fb_cores), '-m', f'{fb_mem_gb}G',
                 '-o', '/dev/stdout', '-n', '/dev/stdin']]
         tools.procOps.run_proc(cmd, stdout=tmp)
@@ -3337,10 +3352,11 @@ def namesort_bam(job: Job, bam_fid, bai_fid, ref_group, num_reads=50_000_000):
     job.fileStore.readGlobalFile(bai_fid, bam_path + '.bai')
     tmp = tools.fileOps.get_tmp_toil_file(suffix='name_sorted.bam')
     is_paired = bam_is_paired(bam_path)
-    # Correctly construct the command to view the entire BAM file.
-    # The original command was incorrectly trying to use 'ref_group'.
-    cmd = [['samtools', 'view', '-t', '8', '-b', bam_path] + list(ref_group),
-           ['sambamba', 'sort', '-t', '8', '-m', '12G', '-o', '/dev/stdout', '-n', '/dev/stdin']]
+    # View the whole BAM; ref_group is a label/basename, not samtools regions.
+    cores = max(1, _cap_cores(job.cores if job.cores else 8))
+    regions = _samtools_view_regions(ref_group)
+    cmd = [['samtools', 'view', '-@', str(cores), '-b', bam_path] + regions,
+           ['sambamba', 'sort', '-t', str(cores), '-m', '12G', '-o', '/dev/stdout', '-n', '/dev/stdin']]
     tools.procOps.run_proc(cmd, stdout=tmp)
 
     handle = pysam.Samfile(tmp)
