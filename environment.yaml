@@ -36,6 +36,7 @@ dependencies:
   - minimap2
   - diamond
   - samtools >=1.15
+  - sambamba
   - bedtools
   - gffread
   - miniprot
