@@ -89,5 +89,13 @@ if [[ "$fail" -ne 0 ]]; then
   echo "WARNING: one or more UCSC downloads failed; re-run or fetch manually from $BASE" >&2
 fi
 
+# Ensure any hand-placed helpers are executable (copy/rsync often drops +x).
+shopt -s nullglob
+for helper in "$DEST"/*.pl "$DEST"/bam-to-bigchain; do
+  [[ -f "$helper" ]] || continue
+  chmod +x "$helper" || true
+done
+shopt -u nullglob
+
 cat <<'EOF'
 EOF
