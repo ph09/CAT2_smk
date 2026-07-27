@@ -169,6 +169,9 @@ def setup(job, args, input_file_ids, resources):
             filtered_transcripts = transcript_dict
         transcript_dict = filtered_transcripts
         for aln_mode, out_path in zip(*[['mRNA', 'CDS'], [mrna_path, cds_path]]):
+            # Always register expected outputs so empty inputs still produce empty PSLs
+            # (valid for ancestors / sparse pairwise modes with no surviving projections).
+            results.setdefault(out_path, [])
             seq_iter = get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta,
                                                ref_genome_fasta, aln_mode)
             for chunk in group_transcripts(seq_iter):
@@ -177,9 +180,10 @@ def setup(job, args, input_file_ids, resources):
                                     disk=resources['chunk_disk'])
                 results[out_path].append(j.rv())
 
-    if len(results) == 0:
-        err_msg = 'Align Transcripts pipeline did not detect any input genePreds for {}'.format(args.genome)
-        raise RuntimeError(err_msg)
+    if not any(results.values()):
+        job.fileStore.logToMaster(
+            'No alignable transcripts for {}; writing empty PSL outputs'.format(args.genome),
+            level=logging.WARNING)
     # convert the results Promises into resolved values
     return job.addFollowOnJobFn(merge, results, args, 
                                memory=resources['merge_memory'], 
@@ -289,7 +293,7 @@ def main():
     # Cluster-mode arguments. Names mirror cat/align_transcripts_cluster.py so
     # we can forward them through unchanged.
     parser.add_argument("--execution-mode", choices=("auto", "slurm", "sge", "local"), default="auto")
-    parser.add_argument("--partition", default="short")
+    parser.add_argument("--partition", default="")
     parser.add_argument("--exclude-nodes", default="")
     parser.add_argument("--module-load", default="")
     parser.add_argument("--sge-parallel-env", default="smp")
