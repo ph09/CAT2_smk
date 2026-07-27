@@ -38,6 +38,33 @@ logger = logging.getLogger('cat')
 _SCHEDULER: Scheduler = None
 
 
+# Set in run_hints_pipeline from Toil --maxCores; used when worker env lacks the var.
+_TOIL_MAX_CORES_OVERRIDE = None
+
+
+def _toil_max_cores() -> int:
+    """Upper bound for Toil job cores (honours --maxCores / CAT2_TOIL_MAX_CORES)."""
+    if _TOIL_MAX_CORES_OVERRIDE is not None:
+        return _TOIL_MAX_CORES_OVERRIDE
+    for key in ("CAT2_TOIL_MAX_CORES", "TOIL_MAX_CORES"):
+        val = os.environ.get(key)
+        if val:
+            try:
+                return max(1, int(float(val)))
+            except ValueError:
+                pass
+    return max(1, mp.cpu_count() or 1)
+
+
+def _cap_cores(requested) -> int:
+    """Clamp a core request so SingleMachine --maxCores is never exceeded."""
+    try:
+        n = int(requested)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(n, _toil_max_cores()))
+
+
 def _init_scheduler(args) -> Scheduler:
     """Construct and stash the Scheduler from CLI args, returning the instance.
 
@@ -101,7 +128,7 @@ def _hints_header(*, job_name, log_file, error_file, partition, memory_gb, cpus,
 
 def generate_slurm_bam2hints_job(bam_path, output_path, job_id, temp_dir, 
                                  memory_gb=256, cpus=128, time_limit="12:00:00", 
-                                 partition="medium", hint_type="intron"):
+                                 partition="", hint_type="intron"):
     """
     DEPRECATED: Use generate_slurm_bam_intron_job() or generate_slurm_bam_exon_job() instead.
     Generate a Slurm job script for running bam2hints on a single BAM file.
@@ -361,7 +388,7 @@ def submit_slurm_jobs(job_scripts, max_concurrent_jobs=50, check_interval=30, lo
 
 def run_parallel_bam2hints_slurm(bam_files, output_dir, hint_type="intron", 
                                 memory_gb=256, cpus=128, time_limit="12:00:00",
-                                partition="medium", max_concurrent_jobs=50):
+                                partition="", max_concurrent_jobs=50):
     """
     DEPRECATED: Use run_parallel_bam_intron_slurm() or run_parallel_bam_exon_slurm() instead.
     Run bam2hints on multiple BAM files using parallel Slurm jobs.
@@ -504,7 +531,7 @@ def concatenate_hints_files(hints_files, output_file, sort_hints=True):
 
 def concatenate_and_sort_hints_slurm(hints_files, output_file, logs_dir=None,
                                      memory_gb=256, cpus=64, time_limit="12:00:00",
-                                     partition="medium", tmp_dir=None):
+                                     partition="", tmp_dir=None):
     """
     Cluster-based concatenation and sorting of hints files.
 
@@ -717,7 +744,7 @@ def generate_iso_seq_hints_slurm(bam_path, output_file):
 
 def generate_slurm_isoseq_job(bam_path, output_path, job_id, temp_dir,
                               memory_gb=192, cpus=96, time_limit="16:00:00",
-                              partition="long"):
+                              partition=""):
     """
     Generate a Slurm job script for running IsoSeq-to-hints on a single BAM file.
     This does not chunk the BAM; it processes the full file in one job.
@@ -731,7 +758,7 @@ def generate_slurm_isoseq_job(bam_path, output_path, job_id, temp_dir,
         bam_to_psl_local = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'standalones', 'bamToPsl'))
         bam_to_psl = bam_to_psl_local if os.path.exists(bam_to_psl_local) else 'bamToPsl'
 
-    # The hardcoded SLURM-only "phoenix-06,phoenix-12" exclude used to live here
+    # Node excludes come from config / --exclude-nodes (site-specific).
     # for isoseq jobs that historically OOMed on those nodes. It is now resolved
     # from the active Scheduler's default exclude_nodes (set via
     # --exclude-nodes / cluster.{slurm,sge}.{exclude_nodes,hostname_exclude}).
@@ -775,7 +802,7 @@ fi
 
 def run_parallel_isoseq_slurm(bam_files, output_dir, logs_dir=None,
                               memory_gb=64, cpus=32, time_limit="12:00:00",
-                              partition="medium", max_concurrent_jobs=50):
+                              partition="", max_concurrent_jobs=50):
     """
     Run IsoSeq hints generation on multiple BAM files using parallel Slurm jobs.
     One job is launched per BAM; no chunking is performed.
@@ -891,7 +918,7 @@ def run_parallel_isoseq_slurm(bam_files, output_dir, logs_dir=None,
 
 def generate_slurm_bam_intron_job(bam_path, output_path, job_id, temp_dir,
                                   memory_gb=256, cpus=128, time_limit="12:00:00",
-                                  partition="medium"):
+                                  partition=""):
     """
     Generate a Slurm job script for running bam2hints intron processing on a single BAM file.
     Uses parallel processing by chromosome for speed improvement.
@@ -979,7 +1006,7 @@ fi
 
 def generate_slurm_bam_exon_job(bam_path, output_path, job_id, temp_dir,
                                 memory_gb=256, cpus=128, time_limit="12:00:00",
-                                partition="medium"):
+                                partition=""):
     """
     Generate a Slurm job script for running bam2hints exon processing on a single BAM file.
     Uses bam2wig + wig2hints.pl pipeline with parallel processing by chromosome.
@@ -1063,7 +1090,7 @@ fi
 
 def generate_slurm_protein_job(protein_fasta, genome_fasta, output_path, job_id, temp_dir,
                                memory_gb=256, cpus=128, time_limit="24:00:00",
-                               partition="long"):
+                               partition=""):
     """
     Generate a Slurm job script for running protein-to-genome alignment using exonerate.
     """
@@ -1116,7 +1143,7 @@ fi
 
 def generate_slurm_annotation_job(annotation_gp, output_path, job_id, temp_dir,
                                   memory_gb=256, cpus=128, time_limit="12:00:00",
-                                  partition="medium"):
+                                  partition=""):
     """
     Generate a Slurm job script for converting annotation to hints.
     """
@@ -1184,7 +1211,7 @@ fi
 
 def run_parallel_bam_intron_slurm(bam_files, output_dir, logs_dir=None,
                                   memory_gb=256, cpus=128, time_limit="12:00:00",
-                                  partition="medium", max_concurrent_jobs=50):
+                                  partition="", max_concurrent_jobs=50):
     """
     Run BAM intron hints generation on multiple BAM files using parallel Slurm jobs.
     """
@@ -1287,7 +1314,7 @@ def run_parallel_bam_intron_slurm(bam_files, output_dir, logs_dir=None,
 
 def run_parallel_bam_exon_slurm(bam_files, output_dir, logs_dir=None,
                                 memory_gb=256, cpus=128, time_limit="12:00:00",
-                                partition="medium", max_concurrent_jobs=50):
+                                partition="", max_concurrent_jobs=50):
     """
     Run BAM exon hints generation on multiple BAM files using parallel Slurm jobs.
     """
@@ -1390,7 +1417,7 @@ def run_parallel_bam_exon_slurm(bam_files, output_dir, logs_dir=None,
 
 def run_protein_hints_slurm(protein_fasta, genome_fasta, output_file, logs_dir=None,
                             memory_gb=256, cpus=128, time_limit="24:00:00",
-                            partition="long"):
+                            partition=""):
     """
     Run protein hints generation using Slurm.
     """
@@ -1451,7 +1478,7 @@ def run_protein_hints_slurm(protein_fasta, genome_fasta, output_file, logs_dir=N
 
 def run_annotation_hints_slurm(annotation_gp, output_file, logs_dir=None,
                                memory_gb=256, cpus=128, time_limit="12:00:00",
-                               partition="medium"):
+                               partition=""):
     """
     Run annotation hints generation using Slurm.
     """
@@ -1682,32 +1709,33 @@ def calculate_dynamic_resources(bam_files, iso_bam_files, annotation_gp, protein
             except:
                 annotation_transcripts = 10000  # Conservative estimate
         
-        # Calculate optimal resources based on data characteristics
-        available_cpus = 64
+        # Cap CPU requests to Toil --maxCores (local) or machine size. Never
+        # request more cores than SingleMachine was configured with.
+        available_cpus = _toil_max_cores()
         
         # BAM processing resources
         if total_bam_size_gb > 50:  # Large BAM datasets
-            bam_memory_gb = max(64, int(total_bam_size_gb / 5))  # 1GB per 5GB BAM
-            bam_cpus = max(64, available_cpus)
+            bam_memory_gb = max(8, min(64, int(total_bam_size_gb / 5) or 8))
+            bam_cpus = available_cpus
             chunk_size = 25_000_000  # Smaller chunks for large files
         elif total_bam_size_gb > 10:  # Medium BAM datasets
-            bam_memory_gb = max(64, int(total_bam_size_gb / 2))   # 1GB per 2GB BAM
-            bam_cpus = max(64, available_cpus)
+            bam_memory_gb = max(8, min(64, int(total_bam_size_gb / 2) or 8))
+            bam_cpus = available_cpus
             chunk_size = 50_000_000  # Standard chunks
         else:  # Small BAM datasets
-            bam_memory_gb = 64
-            bam_cpus = max(64, available_cpus)
+            bam_memory_gb = min(64, max(4, available_cpus * 2))
+            bam_cpus = available_cpus
             chunk_size = 100_000_000  # Larger chunks for small files
         
         # Protein processing resources
         if protein_size_mb > 100:  # Large protein datasets
-            protein_memory_gb = max(64, int(protein_size_mb / 50))  # 1GB per 50MB protein
+            protein_memory_gb = max(8, min(64, int(protein_size_mb / 50) or 8))
             protein_chunk_size = 50  # Smaller protein chunks
-            protein_cpus = max(64, available_cpus)
+            protein_cpus = available_cpus
         else:  # Standard protein datasets
-            protein_memory_gb = 64
+            protein_memory_gb = min(64, max(4, available_cpus * 2))
             protein_chunk_size = 100  # Standard protein chunks
-            protein_cpus = max(64, available_cpus)
+            protein_cpus = available_cpus
         
         # Merge and final processing resources
         merge_memory_gb = max(64, int(total_bam_size_gb / 3))  # Scale with total data
@@ -1729,16 +1757,17 @@ def calculate_dynamic_resources(bam_files, iso_bam_files, annotation_gp, protein
         
     except Exception as e:
         logger.warning(f'Error calculating dynamic resources: {str(e)}')
-        # Fallback to conservative estimates
+        # Fallback to conservative estimates (still capped to --maxCores)
+        cpus = _toil_max_cores()
         return {
-            'bam_memory_gb': 128,
-            'bam_cpus': 64,
+            'bam_memory_gb': min(32, max(4, cpus * 2)),
+            'bam_cpus': cpus,
             'bam_chunk_size': 50_000_000,
-            'protein_memory_gb': 128,
-            'protein_cpus': 64,
+            'protein_memory_gb': min(32, max(4, cpus * 2)),
+            'protein_cpus': cpus,
             'protein_chunk_size': 100,
-            'merge_memory_gb': 128,
-            'merge_disk_gb': 128,
+            'merge_memory_gb': min(32, max(4, cpus * 2)),
+            'merge_disk_gb': 32,
             'total_bam_size_gb': 1.0,
             'genome_size_gb': 3.0,
             'annotation_transcripts': 50000
@@ -1878,7 +1907,7 @@ def run_hints_pipeline_slurm(genome: str,
         'memory_gb': 256,
         'cpus': 128,
         'time_limit': '12:00:00',
-        'partition': 'medium',
+        'partition': '',
         'max_concurrent_jobs': 50,
         'use_slurm': True
     }
@@ -2144,6 +2173,17 @@ def run_hints_pipeline(genome: str,
     Main entry function for the hints Toil pipeline with dynamic resource allocation.
     """
     logger.info('Starting hints pipeline with dynamic resource allocation')
+
+    # Honour Toil --maxCores so SingleMachine never sees jobs requesting more
+    # cores than Snakemake allocated (e.g. --cores 4 → --maxCores 4).
+    global _TOIL_MAX_CORES_OVERRIDE
+    max_cores = getattr(toil_options, "maxCores", None)
+    if max_cores is None or float(max_cores) <= 0:
+        max_cores = mp.cpu_count() or 1
+    max_cores = max(1, int(float(max_cores)))
+    _TOIL_MAX_CORES_OVERRIDE = max_cores
+    os.environ["CAT2_TOIL_MAX_CORES"] = str(max_cores)
+    logger.info(f'Toil core cap (CAT2_TOIL_MAX_CORES)={max_cores}')
     
     # Calculate dynamic resources based on input characteristics
     resources = calculate_dynamic_resources(bams, iso_bams, annotation_gp, protein_fasta, fasta)
@@ -2273,18 +2313,18 @@ def _setup_hints(job: Job, input_ids: dict):
                 # Calculate adaptive resources for this BAM
                 bam_size_gb = os.path.getsize(bam_path) / (1024**3)
                 
-                # Dynamic resource calculation
+                # Dynamic resource calculation (cores capped to Toil --maxCores)
                 if bam_size_gb > 20:  # Large BAM
-                    cores = min(64, mp.cpu_count())
-                    memory = f'{max(64, int(bam_size_gb))}G'
+                    cores = _cap_cores(64)
+                    memory = f'{max(8, min(64, int(bam_size_gb) or 8))}G'
                     chunk_reads = 25_000_000
                 elif bam_size_gb > 5:  # Medium BAM
-                    cores = min(64, mp.cpu_count())
-                    memory = f'{max(64, int(bam_size_gb * 2))}G'
+                    cores = _cap_cores(64)
+                    memory = f'{max(8, min(64, int(bam_size_gb * 2) or 8))}G'
                     chunk_reads = 50_000_000
                 else:  # Small BAM
-                    cores = min(64, mp.cpu_count())
-                    memory = '64G'
+                    cores = _cap_cores(64)
+                    memory = f'{max(4, min(64, _toil_max_cores() * 2))}G'
                     chunk_reads = 100_000_000
                 
                 disk = tools.toilInterface.find_total_disk_usage([bam_fid, bai_fid]) * 3 + 4
@@ -2300,7 +2340,7 @@ def _setup_hints(job: Job, input_ids: dict):
                 # Fallback to conservative resources
                 disk = tools.toilInterface.find_total_disk_usage([bam_fid, bai_fid]) * 3 + 2
                 j = job.addChildJobFn(namesort_bam, bam_fid, bai_fid, ref_group,
-                                      disk=disk, cores=8, memory='12G')
+                                      disk=disk, cores=_cap_cores(8), memory='12G')
                 filtered[dtype][ref_group].append(j.rv())
 
     # IsoSeq with dynamic resources
@@ -2310,15 +2350,8 @@ def _setup_hints(job: Job, input_ids: dict):
             disk = tools.toilInterface.find_total_disk_usage([bam_fid, bai_fid]) * 2
             
             # Adaptive resources for IsoSeq based on dataset size
-            if len(input_ids['iso_seq_bams']) > 10:  # Many IsoSeq files
-                memory = '128G'
-                cores = 64
-            elif len(input_ids['iso_seq_bams']) > 5:  # Medium number
-                memory = '128G'
-                cores = 64
-            else:  # Few IsoSeq files
-                memory = '128G'
-                cores = 64
+            memory = f'{max(4, min(64, _toil_max_cores() * 2))}G'
+            cores = _cap_cores(64)
             
             logger.info(f'Processing IsoSeq BAM {i+1}/{len(input_ids["iso_seq_bams"])}: {cores} cores, {memory} memory')
             
@@ -2344,17 +2377,13 @@ def _setup_hints(job: Job, input_ids: dict):
             
             # Adaptive resources for protein alignment
             if protein_size_mb > 200:  # Large protein dataset
-                memory = '128G'
-                cores = 64
                 chunk_size = 50  # Smaller chunks
             elif protein_size_mb > 50:  # Medium protein dataset
-                memory = '128G'
-                cores = 64
                 chunk_size = 75
             else:  # Small protein dataset
-                memory = '128G'
-                cores = 64
                 chunk_size = 100
+            memory = f'{max(4, min(64, _toil_max_cores() * 2))}G'
+            cores = _cap_cores(64)
             
             disk = tools.toilInterface.find_total_disk_usage([input_ids['protein_fasta'], input_ids['genome_fasta']]) * 2
             
@@ -2388,15 +2417,8 @@ def _setup_hints(job: Job, input_ids: dict):
                 transcript_count = sum(1 for line in f if line.strip())
             
             # Adaptive resources for annotation processing
-            if transcript_count > 100000 or annotation_size_mb > 100:  # Large annotation
-                memory = '128G'
-                cores = 64
-            elif transcript_count > 50000 or annotation_size_mb > 50:  # Medium annotation
-                memory = '128G'
-                cores = 64
-            else:  # Small annotation
-                memory = '128G'
-                cores = 64
+            memory = f'{max(4, min(64, _toil_max_cores() * 2))}G'
+            cores = _cap_cores(64)
             
             disk = tools.toilInterface.find_total_disk_usage(input_ids['annotation']) * 2
             
@@ -2470,7 +2492,7 @@ def namesort_bam_dynamic(job: Job, bam_fid, bai_fid, ref_group, num_reads=50_000
                 # Dynamic resource allocation for filtering
                 chunk_size_gb = os.path.getsize(outf) / (1024**3)
                 filter_memory = f'{max(4, int(chunk_size_gb * 2))}G'
-                filter_cores = min(4, max(1, job.cores // 4))
+                filter_cores = _cap_cores(min(4, max(1, job.cores // 4)))
                 
                 fid = job.addChildJobFn(filter_bam_dynamic, job.fileStore.writeGlobalFile(outf), is_paired,
                                        disk='32G', memory=filter_memory, cores=filter_cores).rv()
@@ -2490,7 +2512,7 @@ def namesort_bam_dynamic(job: Job, bam_fid, bai_fid, ref_group, num_reads=50_000
             
             chunk_size_gb = os.path.getsize(outf) / (1024**3)
             filter_memory = f'{max(4, int(chunk_size_gb * 2))}G'
-            filter_cores = min(4, max(1, job.cores // 4))
+            filter_cores = _cap_cores(min(4, max(1, job.cores // 4)))
             
             fids.append(job.addChildJobFn(filter_bam_dynamic, job.fileStore.writeGlobalFile(outf), is_paired,
                                          disk='8G', memory=filter_memory, cores=filter_cores).rv())
@@ -2537,7 +2559,7 @@ def filter_bam_dynamic(job: Job, file_id, is_paired):
         out_filter = tools.fileOps.get_tmp_toil_file()
         
         # Adaptive sorting based on available resources
-        cores = max(job.cores, 64)
+        cores = _cap_cores(job.cores)
         memory_gb = max(32, int(job.memory // (1024**3) // 2))  # Use half available memory
         
         sort_cmd = ['sambamba', 'sort', tmp_filtered, '-o', out_filter, 
@@ -2673,7 +2695,7 @@ def generate_protein_hints_dynamic(job: Job, protein_fasta_file_id, genome_fasta
             
             # Dynamic resource allocation per chunk
             chunk_memory = f'{max(64, min(16, len(chunk_proteins) // 10 + 4))}G'
-            chunk_cores = min(64, max(1, available_cores // optimal_chunks))
+            chunk_cores = _cap_cores(min(64, max(1, available_cores // optimal_chunks)))
             
             logger.info(f'Chunk {chunk_count}: {len(chunk_proteins)} proteins, {chunk_cores} cores, {chunk_memory} memory')
             
@@ -2692,7 +2714,7 @@ def generate_protein_hints_dynamic(job: Job, protein_fasta_file_id, genome_fasta
         
         # Merge results with dynamic resources
         merge_memory = f'{max(64, min(128, len(results) + 64))}G'
-        merge_cores = min(64, max(32, available_cores // 2))
+        merge_cores = _cap_cores(min(64, max(32, available_cores // 2)))
         
         return job.addFollowOnJobFn(convert_protein_aln_results_to_hints_dynamic, results,
                                    memory=merge_memory, cores=merge_cores).rv()
@@ -2839,15 +2861,15 @@ def merge_bams_dynamic(job: Job, filtered_bam_file_ids, annotation_hints_file_id
                 
                 if num_chunks > 20:  # Many chunks - high resource job
                     memory = '128G'
-                    cores = 32
+                    cores = _cap_cores(32)
                     disk_multiplier = 4
                 elif num_chunks > 10:  # Medium chunks
                     memory = '64G'
-                    cores = 16
+                    cores = _cap_cores(16)
                     disk_multiplier = 3
                 else:  # Few chunks
                     memory = '32G'
-                    cores = 8
+                    cores = _cap_cores(8)
                     disk_multiplier = 2
                 
                 disk_usage = tools.toilInterface.find_total_disk_usage(valid_file_ids) * disk_multiplier
@@ -2864,20 +2886,20 @@ def merge_bams_dynamic(job: Job, filtered_bam_file_ids, annotation_hints_file_id
                 # Fallback to original approach
                 disk_usage = tools.toilInterface.find_total_disk_usage(valid_file_ids)
                 merged_bam_file_ids[dtype][ref_group] = job.addChildJobFn(cat_sort_bams, valid_file_ids, 
-                                                                        disk=disk_usage, memory='16G', cores=4).rv()
+                                                                        disk=disk_usage, memory='16G', cores=_cap_cores(4)).rv()
     
     # Adaptive final processing based on total workload
     total_ref_groups = sum(len(merged_bam_file_ids[dtype]) for dtype in merged_bam_file_ids)
     
     if total_ref_groups > 50:  # Large dataset
         final_memory = '128G'
-        final_cores = 64
+        final_cores = _cap_cores(64)
     elif total_ref_groups > 20:  # Medium dataset
         final_memory = '64G'
-        final_cores = 32
+        final_cores = _cap_cores(32)
     else:  # Small dataset
         final_memory = '32G'
-        final_cores = 16
+        final_cores = _cap_cores(16)
 
     logger.info(f'Final hints building: {total_ref_groups} reference groups, {final_cores} cores, {final_memory} memory')
     
@@ -2990,13 +3012,13 @@ def build_hints_dynamic(job: Job, merged_bam_file_ids, anno_hints, iso_hints, pr
                 if dtype == 'INTRONBAM':
                     # Intron processing is typically lighter
                     intron_memory = '8G'
-                    intron_cores = 2
+                    intron_cores = _cap_cores(2)
                 elif resources_metadata.get('total_bam_files', 0) > 20:  # Many BAMs
                     intron_memory = '12G'
-                    intron_cores = 4
+                    intron_cores = _cap_cores(4)
                 else:
                     intron_memory = '10G'
-                    intron_cores = 3
+                    intron_cores = _cap_cores(3)
                 
                 logger.info(f'Processing intron hints for {dtype} {ref_group}: {intron_cores} cores, {intron_memory} memory')
                 
@@ -3010,10 +3032,10 @@ def build_hints_dynamic(job: Job, merged_bam_file_ids, anno_hints, iso_hints, pr
                     # Exon processing is more resource intensive
                     if resources_metadata.get('total_bam_files', 0) > 20:  # Many BAMs
                         exon_memory = '16G'
-                        exon_cores = 6
+                        exon_cores = _cap_cores(6)
                     else:
                         exon_memory = '12G'
-                        exon_cores = 4
+                        exon_cores = _cap_cores(4)
                     
                     logger.info(f'Processing exon hints for {dtype} {ref_group}: {exon_cores} cores, {exon_memory} memory')
                     
@@ -3034,19 +3056,19 @@ def build_hints_dynamic(job: Job, merged_bam_file_ids, anno_hints, iso_hints, pr
     
     if total_hint_files > 100:  # Very large dataset
         merge_memory = '48G'
-        merge_cores = 16
+        merge_cores = _cap_cores(16)
         merge_disk_multiplier = 6
     elif total_hint_files > 50:  # Large dataset
         merge_memory = '32G'
-        merge_cores = 12
+        merge_cores = _cap_cores(12)
         merge_disk_multiplier = 4
     elif total_hint_files > 20:  # Medium dataset
         merge_memory = '24G'
-        merge_cores = 8
+        merge_cores = _cap_cores(8)
         merge_disk_multiplier = 3
     else:  # Small dataset
         merge_memory = '16G'
-        merge_cores = 6
+        merge_cores = _cap_cores(6)
         merge_disk_multiplier = 2
     
     # Calculate disk usage for final merge
@@ -3611,7 +3633,7 @@ def main():
     parser.add_argument("--slurm_memory", type=int, default=256, help="Memory per job in GB")
     parser.add_argument("--slurm_cpus", type=int, default=128, help="CPUs per job")
     parser.add_argument("--slurm_time", default="12:00:00", help="Time limit per job (HH:MM:SS)")
-    parser.add_argument("--slurm_partition", default="medium", help="SLURM partition / SGE queue")
+    parser.add_argument("--slurm_partition", default="", help="SLURM partition / SGE queue")
     parser.add_argument("--slurm_max_jobs", type=int, default=20, help="Maximum concurrent jobs")
     
     # Parse arguments
