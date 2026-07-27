@@ -497,8 +497,8 @@ class ParallelAugustus:
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augustus_setup_%j.out",
             log_err=f"{self.temp_dir}/augustus_setup_%j.err",
-            partition=getattr(self.args, 'slurm_partition', 'medium'),
-            queue=getattr(self.args, 'slurm_partition', 'medium'),
+            partition=getattr(self.args, 'slurm_partition', ''),
+            queue=getattr(self.args, 'slurm_partition', ''),
         )
         slurm_script = header + rf"""
 # Enable strict error handling
@@ -594,8 +594,8 @@ echo "Initial setup completed successfully!"
             walltime=getattr(self.args, 'slurm_hints_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augustus_hints_%A_%a.out",
             log_err=f"{self.temp_dir}/augustus_hints_%A_%a.err",
-            partition=getattr(self.args, 'slurm_partition', 'medium'),
-            queue=getattr(self.args, 'slurm_partition', 'medium'),
+            partition=getattr(self.args, 'slurm_partition', ''),
+            queue=getattr(self.args, 'slurm_partition', ''),
             array=(1, num_chromosomes),
             max_concurrent=getattr(self.args, 'slurm_hints_concurrency', 10),
             dependency=dependency,
@@ -732,8 +732,8 @@ echo "Completed hints generation for chromosome: $CHROM"
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augustus_joblist_%j.out",
             log_err=f"{self.temp_dir}/augustus_joblist_%j.err",
-            partition=getattr(self.args, 'slurm_partition', 'medium'),
-            queue=getattr(self.args, 'slurm_partition', 'medium'),
+            partition=getattr(self.args, 'slurm_partition', ''),
+            queue=getattr(self.args, 'slurm_partition', ''),
             dependency=dependency,
         )
         slurm_script = header + rf"""
@@ -835,8 +835,8 @@ echo "Job list generation completed successfully!"
             walltime=getattr(self.args, 'slurm_jobs_time', '01:00:00'),
             log_out=f"{self.temp_dir}/augustus_{mode}_%A_%a.out",
             log_err=f"{self.temp_dir}/augustus_{mode}_%A_%a.err",
-            partition=getattr(self.args, 'slurm_jobs_partition', 'short'),
-            queue=getattr(self.args, 'slurm_jobs_partition', 'short'),
+            partition=getattr(self.args, 'slurm_jobs_partition', ''),
+            queue=getattr(self.args, 'slurm_jobs_partition', ''),
             array=(1, num_jobs),
             max_concurrent=getattr(self.args, 'slurm_jobs_concurrency', 100),
             dependency=dependency,
@@ -1349,8 +1349,14 @@ fi
         from concurrent.futures import ProcessPoolExecutor
         import time
         
-        # Determine optimal number of processes
-        num_processes = min(mp.cpu_count(), 32)  # Cap at 32 to avoid overwhelming system
+        # Honour --num_cpus (Snakemake threads in local mode); fall back to a
+        # capped cpu_count when the flag is unset (standalone runs).
+        requested = getattr(self.args, "num_cpus", None)
+        if requested is not None and int(requested) > 0:
+            num_processes = int(requested)
+        else:
+            num_processes = min(mp.cpu_count(), 32)
+        num_processes = max(1, num_processes)
         logger.info(f"Processing {len(tm_tx_dict)} transcripts using local multiprocessing with {num_processes} processes")
         
         # Split transcripts into batches for parallel processing
@@ -1470,8 +1476,8 @@ fi
             walltime=getattr(self.args, 'slurm_transcripts_time', '05:00:00'),
             log_out=f"{logs_dir}/tx_%A_%a.out",
             log_err=f"{logs_dir}/tx_%A_%a.err",
-            partition=getattr(self.args, 'slurm_transcripts_partition', 'medium'),
-            queue=getattr(self.args, 'slurm_transcripts_partition', 'medium'),
+            partition=getattr(self.args, 'slurm_transcripts_partition', ''),
+            queue=getattr(self.args, 'slurm_transcripts_partition', ''),
             array=(1, array_count),
             max_concurrent=max_concurrent,
         )
@@ -1990,12 +1996,12 @@ def main():
     parser.add_argument("--array_concurrency", type=int, default=500,
                        help="Max concurrent SLURM array tasks (default: 500).")
     # SLURM resource configuration (applied when using SLURM mode)
-    parser.add_argument("--slurm_partition", default="medium",
-                       help="SLURM partition for preprocessing steps (setup/hints/joblist). Default: medium.")
-    parser.add_argument("--slurm_jobs_partition", default="short",
-                       help="SLURM partition for Augustus execution array jobs. Default: short.")
-    parser.add_argument("--slurm_transcripts_partition", default="medium",
-                       help="SLURM partition for transcript processing array jobs. Default: medium.")
+    parser.add_argument("--slurm_partition", default="",
+                       help="SLURM partition for preprocessing steps (setup/hints/joblist). Empty = cluster default.")
+    parser.add_argument("--slurm_jobs_partition", default="",
+                       help="SLURM partition for Augustus execution array jobs. Empty = cluster default.")
+    parser.add_argument("--slurm_transcripts_partition", default="",
+                       help="SLURM partition for transcript processing array jobs. Empty = cluster default.")
     parser.add_argument("--slurm_hints_mem", default="64G",
                        help="Memory per hints generation SLURM task. Default: 64G.")
     parser.add_argument("--slurm_jobs_mem", default="16G",
@@ -2029,6 +2035,9 @@ def main():
                        help="SGE parallel environment name (site-specific; ignored on SLURM).")
     parser.add_argument("--sge_memory_flag", default="h_vmem",
                        help="SGE memory resource flag (h_vmem / mem_free / s_vmem).")
+    parser.add_argument("--num_cpus", type=int, default=None,
+                       help="Max local worker threads (Snakemake threads in local mode). "
+                            "Defaults to min(cpu_count, 32) when unset.")
     # Worker mode (internal; used by SLURM array)
     # Worker mode (internal; use unique flag names to avoid conflicts)
     parser.add_argument("--worker_mode", action="store_true",
