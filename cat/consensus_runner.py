@@ -1998,7 +1998,8 @@ def generate_consensus(args):
         denovo_tx_modes=args.denovo_tx_modes,
         bam_files=args.bam_files,
         isoseq_bam_files=args.isoseq_bam_files,
-        ref_gp_path=args.ref_gp
+        ref_gp_path=args.ref_gp,
+        max_workers=args.num_workers,
     )
     
     # Process by chromosome
@@ -2816,7 +2817,8 @@ def exon_overlaps_reference(chrom, start, end, ref_exons, min_overlap_frac=0.1):
     return False
 
 
-def compute_real_support(tx_dict, support_df, bam_files, isoseq_bam_files, ref_gp_path, alignment_source_map):
+def compute_real_support(tx_dict, support_df, bam_files, isoseq_bam_files, ref_gp_path,
+                         alignment_source_map, max_workers=None):
     """Compute real RNA-seq and annotation support from BAM files and reference.
     
     For annotation support, we use the non-denovo transcripts already in tx_dict
@@ -2825,6 +2827,7 @@ def compute_real_support(tx_dict, support_df, bam_files, isoseq_bam_files, ref_g
     genome chromosomes.
     
     Updates support_df in-place with computed support vectors and percentages.
+    ``max_workers`` caps BAM process pools (honours ``--num-workers`` in local mode).
     """
     all_bams = list(bam_files or []) + list(isoseq_bam_files or [])
     has_bams = any(os.path.exists(b) for b in all_bams)
@@ -2844,7 +2847,8 @@ def compute_real_support(tx_dict, support_df, bam_files, isoseq_bam_files, ref_g
         if tx:
             chromosomes.add(tx.chromosome)
     
-    splice_junctions = extract_splice_junctions_from_bams(all_bams, chromosomes)
+    splice_junctions = extract_splice_junctions_from_bams(
+        all_bams, chromosomes, max_workers=max_workers)
     logger.info(f"    ✓ Found {len(splice_junctions)} unique splice junctions in {time.time() - extract_start:.1f}s")
     
     # Step 2: Build annotation intron/exon sets from non-denovo transcripts in tx_dict
@@ -2942,7 +2946,8 @@ def compute_real_support(tx_dict, support_df, bam_files, isoseq_bam_files, ref_g
     # Step 4: Batch compute exon coverage from BAMs
     if has_bams and exon_intervals_for_coverage:
         logger.info(f"    Computing exon coverage for {len(exon_intervals_for_coverage)} exons...")
-        coverage_results = compute_exon_coverage_from_bams(all_bams, exon_intervals_for_coverage)
+        coverage_results = compute_exon_coverage_from_bams(
+            all_bams, exon_intervals_for_coverage, max_workers=max_workers)
         
         for result_idx, (tx_idx, exon_idx) in enumerate(exon_interval_map):
             new_exon_rna[tx_idx][exon_idx] = coverage_results[result_idx]
@@ -2993,7 +2998,8 @@ def compute_real_support(tx_dict, support_df, bam_files, isoseq_bam_files, ref_g
 
 
 def create_support_dataframe(tx_dict, db_path, ref_df, alignment_source_map, denovo_tx_modes=None,
-                             bam_files=None, isoseq_bam_files=None, ref_gp_path=None):
+                             bam_files=None, isoseq_bam_files=None, ref_gp_path=None,
+                             max_workers=None):
     """Create support dataframe with RNA-seq and annotation support"""
     logger.info("  Loading alignment evaluation data...")
     
@@ -3275,7 +3281,9 @@ def create_support_dataframe(tx_dict, db_path, ref_df, alignment_source_map, den
     # Compute real RNA-seq and annotation support from BAM files
     if bam_files or isoseq_bam_files or ref_gp_path:
         logger.info("\nComputing real support from BAM files and reference annotation...")
-        compute_real_support(tx_dict, support_df, bam_files, isoseq_bam_files, ref_gp_path, alignment_source_map)
+        compute_real_support(
+            tx_dict, support_df, bam_files, isoseq_bam_files, ref_gp_path,
+            alignment_source_map, max_workers=max_workers)
     
     return support_df
 
