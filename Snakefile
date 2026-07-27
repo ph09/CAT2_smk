@@ -382,6 +382,17 @@ def get_local_res(rule_name, key):
         return cfg[key]
     return _LOCAL_DEFAULTS.get(rule_name, {}).get(key, 1)
 
+def job_cpus(rule_name, threads):
+    """Thread count for tool flags inside scripts run via run_or_submit.
+
+    Cluster jobs use the SLURM/SGE ``cpus`` request (matches the job header).
+    Local jobs use the Snakemake-allocated ``threads`` (already capped by
+    ``--cores``), not the cluster default (often 32/64).
+    """
+    if IS_CLUSTER:
+        return int(get_res(rule_name, "cpus"))
+    return max(1, int(threads))
+
 # ─── miniprot mapping sensitivity ─────────────────────────────────────────────
 # Defaults are deliberately more permissive than miniprot's own defaults so the
 # augMP path recovers more paralogous / divergent gene copies. Every knob can be
@@ -542,12 +553,13 @@ def _slurm_module():
     return config.get("slurm", {}).get("module_load", "")
 
 def run_augustus_parallel(*, input, output, params, wildcards, log_path,
-                          genome_work_dir, with_tmr):
+                          genome_work_dir, with_tmr, threads=1):
     """Shared driver for the augTM / augTMR (and their pairwise) ``run:`` blocks.
 
     Builds and executes the ``augustus_parallel.py`` command, cleans up the
     per-genome temp dir, and touches the done markers. ``with_tmr`` toggles the
-    RNA-seq (TMR) arguments and the extra done file.
+    RNA-seq (TMR) arguments and the extra done file. ``threads`` caps local
+    multiprocessing to the Snakemake allocation.
     """
     os.makedirs(genome_work_dir, exist_ok=True)
 
@@ -563,6 +575,7 @@ def run_augustus_parallel(*, input, output, params, wildcards, log_path,
         "--augustus_species", params.species,
         "--utr", str(params.utr),
         "--augustus_tm_gtf", output.tm_gtf,
+        "--num_cpus", str(max(1, int(threads))),
     ]
     if with_tmr:
         cmd += [
@@ -623,13 +636,20 @@ def build_minisplice_step(
     splice_scores_out,
     log_path,
     use_slurm_array,
+    cpus,
 ):
-    """Return bash for minisplice predict, optionally one SLURM task per chromosome."""
+    """Return bash for minisplice predict, optionally one SLURM task per chromosome.
+
+    ``cpus`` is the parent rule's allocated cores (cluster request or local
+    Snakemake threads). Local parallel mode keeps concurrent chrom jobs within
+    that budget.
+    """
     parallel = get_res("run_miniprot", "minisplice_parallel")
     chrom_list = f"{work_dir}/miniprot/{genome}_minisplice_chroms.txt"
     chrom_fa_dir = f"{work_dir}/miniprot/{genome}_minisplice_chrom_fasta"
     chrom_scores_dir = f"{work_dir}/miniprot/{genome}_minisplice_by_chrom"
     array_script = f"{work_dir}/miniprot/{genome}_minisplice_array.sh"
+    cpus = max(1, int(cpus))
 
     with open(chrom_sizes) as chrom_sizes_f:
         chroms = [line.split()[0] for line in chrom_sizes_f if line.strip()]
@@ -659,11 +679,11 @@ echo "minisplice predict completed ({num_chroms} chromosomes merged)" >> {log_pa
         return f"""
 # Step 0: Run minisplice on the full genome
 echo "Running minisplice predict..." >> {log_path}
-minisplice predict -t {get_res('run_miniprot', 'cpus')} -c {minisplice_calibration} {minisplice_model} {genome_fasta} > {splice_scores_out} 2>> {log_path}
+minisplice predict -t {cpus} -c {minisplice_calibration} {minisplice_model} {genome_fasta} > {splice_scores_out} 2>> {log_path}
 echo "minisplice predict completed" >> {log_path}
 """
 
-    minisplice_cpus = get_res("run_miniprot", "minisplice_cpus")
+    minisplice_cpus = int(get_res("run_miniprot", "minisplice_cpus"))
     per_chrom_body = f"""
 set -euo pipefail
 CHROM=$(sed -n "${{SLURM_ARRAY_TASK_ID:-$1}}p" {chrom_list})
@@ -705,10 +725,13 @@ done
 {merge_scores}
 """
 
-    local_jobs = get_local_res("run_miniprot", "minisplice_max_jobs")
+    # Local parallel: stay within the parent rule's thread budget.
+    minisplice_cpus = max(1, min(minisplice_cpus, cpus))
+    local_jobs = int(get_local_res("run_miniprot", "minisplice_max_jobs"))
+    local_jobs = max(1, min(local_jobs, max(1, cpus // minisplice_cpus)))
     return f"""
 # Step 0: Run minisplice predict per chromosome (local parallel)
-echo "Running minisplice predict on {num_chroms} chromosomes..." >> {log_path}
+echo "Running minisplice predict on {num_chroms} chromosomes ({local_jobs} jobs x {minisplice_cpus} threads)..." >> {log_path}
 mkdir -p {chrom_fa_dir} {chrom_scores_dir}
 run_minisplice_chrom() {{
     local chrom="$1"
@@ -888,7 +911,7 @@ rule prepare_genome_files:
         if config.get("augustus", False):
             miniprot_index_cmd = (
                 "\n# Create miniprot index (augMP path only)\n"
-                f"miniprot -t{get_res('prepare_genome_files', 'cpus')} "
+                f"miniprot -t{job_cpus('prepare_genome_files', threads)} "
                 f"-d {output.protein_index} {output.fasta} 2>> {log[0]}\n"
             )
         else:
@@ -1126,9 +1149,9 @@ echo "Start time: $(date)"
 (pslMap -chainMapFile {input.ref_psl} {input.chain_file} stdout || \\
  pslMap -swapMap -chainMapFile {input.ref_psl} {input.chain_file} stdout) | \\
 pslMapPostChain stdin stdout | \\
-sort --parallel={get_res('transmap_map_psl', 'cpus')} -k14,14 -k16,16n | \\
+sort --parallel={job_cpus('transmap_map_psl', threads)} -k14,14 -k16,16n | \\
 pslRecalcMatch stdin {input.target_2bit} {input.ref_fa} stdout | \\
-sort --parallel={get_res('transmap_map_psl', 'cpus')} -k10,10 > {output.tm_psl} 2> {log[0]}
+sort --parallel={job_cpus('transmap_map_psl', threads)} -k10,10 > {output.tm_psl} 2> {log[0]}
 
 # Convert the raw PSL to GenePred
 transMapPslToGenePred -nonCodingGapFillMax=80 -codingGapFillMax=50 \\
@@ -1372,7 +1395,7 @@ echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Start time: $(date)"
 
 # Run minimap2 to align query (reference) to target genome
-minimap2 -ax asm5 -t {get_res('minimap2_bam', 'cpus')} \\
+minimap2 -ax asm5 -t {job_cpus('minimap2_bam', threads)} \\
     {input.target_fa} {input.query_fa} | \\
 samtools view -bS - | \\
 samtools sort -o {output.bam} -
@@ -1531,9 +1554,9 @@ echo "Start time: $(date)"
 (pslMap -chainMapFile {input.ref_psl} {input.chain_file} stdout || \\
  pslMap -swapMap -chainMapFile {input.ref_psl} {input.chain_file} stdout) | \\
 pslMapPostChain stdin stdout | \\
-sort --parallel={get_res('transmap_pairwise_map_psl', 'cpus')} -k14,14 -k16,16n | \\
+sort --parallel={job_cpus('transmap_pairwise_map_psl', threads)} -k14,14 -k16,16n | \\
 pslRecalcMatch stdin {input.target_2bit} {input.ref_fa} stdout | \\
-sort --parallel={get_res('transmap_pairwise_map_psl', 'cpus')} -k10,10 > {output.tm_psl} 2> {log[0]}
+sort --parallel={job_cpus('transmap_pairwise_map_psl', threads)} -k10,10 > {output.tm_psl} 2> {log[0]}
 
 # Convert the raw PSL to GenePred
 transMapPslToGenePred -nonCodingGapFillMax=80 -codingGapFillMax=50 \\
@@ -2011,10 +2034,12 @@ rule stringtie_merge_bams:
         genome = wildcards.genome
         job_script = f"{work_dir}/stringtie/{genome}_merge_job.sh"
 
+        merge_cpus = job_cpus("stringtie_merge", threads)
+
         def _merge_cmd(bams, out):
             bams = list(bams)
             if len(bams) > 1:
-                return f"samtools merge -f -@ {get_res('stringtie_merge', 'cpus')} {out} {' '.join(bams)} >> {log[0]} 2>&1"
+                return f"samtools merge -f -@ {merge_cpus} {out} {' '.join(bams)} >> {log[0]} 2>&1"
             elif len(bams) == 1:
                 return f"cp {bams[0]} {out} >> {log[0]} 2>&1"
             return f"touch {out}"
@@ -2061,7 +2086,7 @@ rule stringtie_sort_bams:
         genome = wildcards.genome
         rtype = wildcards.type
         job_script = f"{work_dir}/stringtie/{genome}_{rtype}_sort_job.sh"
-        cpus = get_res("stringtie_sort", "cpus")
+        cpus = job_cpus("stringtie_sort", threads)
 
         script_content = build_sbatch_header(
             "stringtie_sort",
@@ -2110,7 +2135,7 @@ rule stringtie_run:
         work_dir = config['work_dir']
         genome = wildcards.genome
         job_script = f"{work_dir}/stringtie/{genome}_run_job.sh"
-        cpus = get_res("stringtie_run", "cpus")
+        cpus = job_cpus("stringtie_run", threads)
 
         sr_exists = os.path.getsize(input.sr_sorted) > 0
         lr_exists = os.path.getsize(input.lr_sorted) > 0
@@ -2234,6 +2259,7 @@ rule run_miniprot:
         work_dir = config['work_dir']
         genome = wildcards.genome
         job_script = f"{work_dir}/miniprot/{genome}_miniprot_job.sh"
+        miniprot_cpus = job_cpus("run_miniprot", threads)
         minisplice_step = build_minisplice_step(
             work_dir=work_dir,
             genome=genome,
@@ -2244,9 +2270,10 @@ rule run_miniprot:
             splice_scores_out=output.splice_scores,
             log_path=log[0],
             use_slurm_array=IS_CLUSTER,
+            cpus=miniprot_cpus,
         )
         timeout_s = int(get_res("run_miniprot", "timeout_hours") * 3600)
-        map_flags = build_miniprot_map_flags(get_res('run_miniprot', 'cpus'))
+        map_flags = build_miniprot_map_flags(miniprot_cpus)
 
         script_content = build_sbatch_header(
             "run_miniprot",
@@ -2333,7 +2360,7 @@ rule run_transcript_map:
         # In run: blocks, `threads` is provided by Snakemake (smk 8+/9); there is
         # no snakemake.threads attribute. Cluster mode uses the rule's cpus
         # request for the submitted job body.
-        job_threads = get_res('run_txTM', 'cpus') if IS_CLUSTER else threads
+        job_threads = job_cpus("run_txTM", threads)
         job_script = f"{work_dir}/txTM/{genome}_txTM_job.sh"
 
         Path(f"{work_dir}/txTM").mkdir(parents=True, exist_ok=True)
@@ -2435,6 +2462,7 @@ rule augustus_run_tm_and_tmr:
             log_path=log[0],
             genome_work_dir=f"{params.work_dir}/augustus_parallel_temp_{wildcards.genome}",
             with_tmr=True,
+            threads=threads,
         )
 
 rule augustus_run_tm_only:
@@ -2473,6 +2501,7 @@ rule augustus_run_tm_only:
             log_path=log[0],
             genome_work_dir=f"{params.work_dir}/augustus_parallel_temp_{wildcards.genome}",
             with_tmr=False,
+            threads=threads,
         )
 
 rule augustus_convert_tm_gtf_to_gp:
@@ -2597,6 +2626,7 @@ rule augustus_run_tm_pairwise_and_tmr_pairwise:
             log_path=log[0],
             genome_work_dir=f"{params.work_dir}/augustus_parallel_temp_{wildcards.genome}_pairwise",
             with_tmr=True,
+            threads=threads,
         )
 
 rule augustus_run_tm_pairwise_only:
@@ -2636,6 +2666,7 @@ rule augustus_run_tm_pairwise_only:
             log_path=log[0],
             genome_work_dir=f"{params.work_dir}/augustus_parallel_temp_{wildcards.genome}_pairwise",
             with_tmr=False,
+            threads=threads,
         )
 
 rule augustus_convert_tm_pairwise_gtf_to_gp:
@@ -2819,7 +2850,8 @@ rule augustus_run_mp:
                     "--utr", str(params.utr),
                     "--augustus_tm_gtf", output.mp_gtf,
                     "--miniprot_hints_gff", input.miniprot_hints,
-                    "--work_dir", genome_work_dir
+                    "--work_dir", genome_work_dir,
+                    "--num_cpus", str(max(1, int(threads))),
                 ] + (["--no_slurm_preprocessing", "--no_slurm_transcripts"] if not IS_CLUSTER else _aug_slurm_args("augustus_tm"))
 
                 result = subprocess.run(cmd, capture_output=True, text=True)
@@ -2977,7 +3009,8 @@ rule run_augustus_pb:
             "--utr", str(params.utr),
             "--chunksize", str(params.chunksize),
             "--overlap", str(params.overlap),
-            "--work_dir", genome_work_dir
+            "--work_dir", genome_work_dir,
+            "--num_cpus", str(max(1, int(threads))),
         ] + (["--no_slurm_preprocessing", "--no_slurm_jobs"] if not IS_CLUSTER else _aug_slurm_args("augustus_pb"))
 
         # try/finally so the per-genome temp dir is always cleaned up, even on
@@ -3742,7 +3775,7 @@ rule generate_consensus:
         genome = wildcards.genome
         job_script = f"{work_dir}/consensus_gene_set/{genome}_consensus_job.sh"
 
-        cpus = get_res('generate_consensus', 'cpus')
+        cpus = job_cpus("generate_consensus", threads)
 
         # Get active modes and build denovo_tx_modes argument
         active_modes = get_active_modes_for_wildcards(wildcards)
@@ -3936,7 +3969,7 @@ rule annotate_novel_genes:
         work_dir = config['work_dir']
         genome   = wildcards.genome
         job_script = f"{work_dir}/consensus_gene_set/{genome}_novel_annotation_job.sh"
-        cpus = get_res('annotate_novel_genes', 'cpus')
+        cpus = job_cpus("annotate_novel_genes", threads)
 
         novel_evalue     = config.get('novel_annotation_evalue', 1e-3)
         novel_min_id     = config.get('novel_annotation_min_identity', 20.0)
