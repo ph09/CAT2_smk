@@ -43,6 +43,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _run_augustus_pb_job(job_cmd: str) -> tuple:
+    """Run one Augustus PB shell command (module-level for multiprocessing pickling)."""
+    try:
+        subprocess.run(job_cmd, shell=True, capture_output=True, text=True, check=True)
+        return (True, job_cmd, "")
+    except subprocess.CalledProcessError as e:
+        error_msg = f"STDOUT: {e.stdout}\nSTDERR: {e.stderr}"
+        return (False, job_cmd, error_msg)
+
+
 class ParallelAugustusPB:
     """Main class for running parallel Augustus PB pipeline."""
     
@@ -260,8 +270,8 @@ class ParallelAugustusPB:
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augPB_setup_%j.out",
             log_err=f"{self.temp_dir}/augPB_setup_%j.err",
-            partition=getattr(self.args, 'slurm_partition', 'medium'),
-            queue=getattr(self.args, 'slurm_partition', 'medium'),
+            partition=getattr(self.args, 'slurm_partition', ''),
+            queue=getattr(self.args, 'slurm_partition', ''),
         )
         slurm_script = header + rf"""
 set -euo pipefail
@@ -342,8 +352,8 @@ echo "PB initial setup completed successfully!"
             walltime=getattr(self.args, 'slurm_hints_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augPB_hints_%A_%a.out",
             log_err=f"{self.temp_dir}/augPB_hints_%A_%a.err",
-            partition=getattr(self.args, 'slurm_partition', 'medium'),
-            queue=getattr(self.args, 'slurm_partition', 'medium'),
+            partition=getattr(self.args, 'slurm_partition', ''),
+            queue=getattr(self.args, 'slurm_partition', ''),
             array=(1, num_chromosomes),
             max_concurrent=getattr(self.args, 'slurm_hints_concurrency', 10),
             dependency=dependency,
@@ -378,8 +388,8 @@ echo "Wrote hints: {self.temp_dir}/${{CHROM}}_hints.gff"
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augPB_joblist_%j.out",
             log_err=f"{self.temp_dir}/augPB_joblist_%j.err",
-            partition=getattr(self.args, 'slurm_partition', 'medium'),
-            queue=getattr(self.args, 'slurm_partition', 'medium'),
+            partition=getattr(self.args, 'slurm_partition', ''),
+            queue=getattr(self.args, 'slurm_partition', ''),
             dependency=dependency,
         )
         slurm_script = header + rf"""
@@ -415,8 +425,8 @@ echo "Created PB job list: {self.temp_dir}/jobs_PB.lst"
             walltime=getattr(self.args, 'slurm_jobs_time', '24:00:00'),
             log_out=f"{self.temp_dir}/augustus_PB_%A_%a.out",
             log_err=f"{self.temp_dir}/augustus_PB_%A_%a.err",
-            partition=getattr(self.args, 'slurm_jobs_partition', 'long'),
-            queue=getattr(self.args, 'slurm_jobs_partition', 'long'),
+            partition=getattr(self.args, 'slurm_jobs_partition', ''),
+            queue=getattr(self.args, 'slurm_jobs_partition', ''),
             array=(1, num_jobs),
             max_concurrent=getattr(self.args, 'slurm_jobs_concurrency', 10),
             dependency=dependency,
@@ -539,18 +549,9 @@ fi
             
             logger.info(f"Using {num_cpus} CPUs for parallel execution")
             
-            # Function to run a single job
-            def run_job(job_cmd: str) -> tuple:
-                try:
-                    result = subprocess.run(job_cmd, shell=True, capture_output=True, text=True, check=True)
-                    return (True, job_cmd, "")
-                except subprocess.CalledProcessError as e:
-                    error_msg = f"STDOUT: {e.stdout}\nSTDERR: {e.stderr}"
-                    return (False, job_cmd, error_msg)
-            
             # Run jobs in parallel using multiprocessing
             with multiprocessing.Pool(processes=num_cpus) as pool:
-                results = pool.map(run_job, jobs)
+                results = pool.map(_run_augustus_pb_job, jobs)
             
             # Check results
             failed_jobs = [(job, error) for success, job, error in results if not success]
@@ -986,10 +987,10 @@ def main():
     parser.add_argument("--num_cpus", type=int, default=None,
                        help="Number of CPUs to use for local job execution (default: all available CPUs).")
     # SLURM resource configuration (applied when using SLURM mode)
-    parser.add_argument("--slurm_partition", default="medium",
-                       help="SLURM partition for preprocessing steps (setup/hints/joblist). Default: medium.")
-    parser.add_argument("--slurm_jobs_partition", default="long",
-                       help="SLURM partition for Augustus PB execution array jobs. Default: long.")
+    parser.add_argument("--slurm_partition", default="",
+                       help="SLURM partition for preprocessing steps (setup/hints/joblist). Empty = cluster default.")
+    parser.add_argument("--slurm_jobs_partition", default="",
+                       help="SLURM partition for Augustus PB execution array jobs. Empty = cluster default.")
     parser.add_argument("--slurm_hints_mem", default="8G",
                        help="Memory per hints generation SLURM task. Default: 8G.")
     parser.add_argument("--slurm_jobs_mem", default="32G",
