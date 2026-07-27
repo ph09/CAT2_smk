@@ -2468,9 +2468,12 @@ def namesort_bam_dynamic(job: Job, bam_fid, bai_fid, ref_group, num_reads=50_000
         
     except Exception as e:
         logger.warning(f'Dynamic sort failed for {ref_group}, falling back to standard approach: {str(e)}')
-        # Fallback to original approach
-        cmd = [['samtools', 'view', '-t', '32', '-b', bam_path] + list(ref_group),
-               ['sambamba', 'sort', '-t', '32', '-m', '64G', '-o', '/dev/stdout', '-n', '/dev/stdin']]
+        # Fallback: still honour allocated cores / memory, not hardcoded 32/64G
+        fb_cores = max(1, _cap_cores(job.cores))
+        fb_mem_gb = max(1, int((job.memory or (4 * 1024**3)) // (1024**3)))
+        cmd = [['samtools', 'view', '-@', str(fb_cores), '-b', bam_path] + list(ref_group),
+               ['sambamba', 'sort', '-t', str(fb_cores), '-m', f'{fb_mem_gb}G',
+                '-o', '/dev/stdout', '-n', '/dev/stdin']]
         tools.procOps.run_proc(cmd, stdout=tmp)
 
     # Process chunks with parallel filtering
