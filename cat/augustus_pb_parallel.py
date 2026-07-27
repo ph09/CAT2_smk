@@ -43,14 +43,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def _run_augustus_pb_job(job_cmd: str) -> tuple:
-    """Run one Augustus PB shell command (module-level for multiprocessing pickling)."""
+def _run_augustus_pb_job(job_path: str) -> tuple:
+    """Run one Augustus PB job script (module-level for multiprocessing pickling).
+
+    jobs_*.lst entries are script paths/basenames from createAugustusJoblist.pl,
+    not shell commands — same as the SLURM array path (cd temp_dir; bash $JOB_FILE).
+    """
     try:
-        subprocess.run(job_cmd, shell=True, capture_output=True, text=True, check=True)
-        return (True, job_cmd, "")
+        subprocess.run(['bash', job_path], capture_output=True, text=True, check=True)
+        return (True, job_path, "")
     except subprocess.CalledProcessError as e:
         error_msg = f"STDOUT: {e.stdout}\nSTDERR: {e.stderr}"
-        return (False, job_cmd, error_msg)
+        return (False, job_path, error_msg)
 
 
 class ParallelAugustusPB:
@@ -537,9 +541,29 @@ fi
         logger.info("Running Augustus jobs locally...")
         
         try:
-            # Read job commands from file
+            # jobs_PB.lst lists script basenames/paths relative to temp_dir (same as SLURM).
+            list_dir = os.path.dirname(os.path.abspath(jobs_file))
             with open(jobs_file, 'r') as f:
-                jobs = [line.strip() for line in f if line.strip()]
+                job_entries = [line.strip() for line in f if line.strip()]
+
+            jobs = []
+            for entry in job_entries:
+                if os.path.isabs(entry) and os.path.isfile(entry):
+                    jobs.append(entry)
+                    continue
+                candidates = [
+                    os.path.join(list_dir, entry),
+                    os.path.join(str(self.jobs_dir), entry),
+                    os.path.join(str(self.jobs_dir), os.path.basename(entry)),
+                    os.path.join(list_dir, os.path.basename(entry)),
+                ]
+                resolved = next((p for p in candidates if os.path.isfile(p)), None)
+                if resolved is None:
+                    logger.error(
+                        f"Job script not found for list entry {entry!r}; tried: {candidates}"
+                    )
+                    return False
+                jobs.append(resolved)
             
             logger.info(f"Total jobs to run: {len(jobs)}")
             
@@ -568,6 +592,7 @@ fi
         except Exception as e:
             logger.error(f"Error running local jobs: {e}")
             return False
+
     
     def merge_augustus_output(self) -> str:
         """Step 5: Merge Augustus output by globbing produced GFFs from jobs directory."""
