@@ -911,13 +911,20 @@ fi
             with open(jobs_file, 'r') as f:
                 num_jobs = len([line for line in f if line.strip()])
             
-            # Execute Augustus jobs
-            if getattr(self.args, 'no_slurm_jobs', False):
+            # Execute Augustus jobs. Treat local Snakemake the same as TM:
+            # --no_slurm_jobs, execution_mode=local, or --no_slurm_preprocessing
+            # must not fall through to auto→sge/qsub.
+            run_locally = (
+                getattr(self.args, "no_slurm_jobs", False)
+                or getattr(self.args, "execution_mode", "auto") == "local"
+                or not getattr(self.args, "use_slurm_preprocessing", True)
+            )
+            if run_locally:
                 logger.info(f"Running {num_jobs} Augustus PB jobs locally...")
                 if not self.run_local_jobs(str(jobs_file), getattr(self.args, 'num_cpus', None)):
                     return False
             else:
-                logger.info(f"Running {num_jobs} Augustus PB jobs on SLURM...")
+                logger.info(f"Running {num_jobs} Augustus PB jobs on cluster...")
                 # Use the last preprocessing job ID as dependency (joblist_job_id if SLURM, None if local)
                 last_preprocessing_job_id = joblist_job_id if getattr(self.args, 'use_slurm_preprocessing', True) else None
                 slurm_script = self.create_slurm_script(num_jobs, last_preprocessing_job_id)
@@ -1047,6 +1054,9 @@ def main():
     # Handle SLURM preprocessing options
     if args.no_slurm_preprocessing:
         args.use_slurm_preprocessing = False
+
+    from cat.scheduler import resolve_execution_mode
+    args.execution_mode = resolve_execution_mode(args.execution_mode)
     
     # Handle intermediate output saving options
     if args.no_save_intermediate:
