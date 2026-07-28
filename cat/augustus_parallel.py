@@ -62,7 +62,29 @@ def _run_augustus_job_script(job_path: str) -> tuple:
         subprocess.run(['bash', job_path], capture_output=True, text=True, check=True)
         return (True, job_path, "")
     except subprocess.CalledProcessError as e:
-        error_msg = f"STDOUT: {e.stdout}\nSTDERR: {e.stderr}"
+        # Augustus usually logs to --errfile, not process stderr — surface that too.
+        errfile_notes = []
+        try:
+            with open(job_path, 'r') as jf:
+                for line in jf:
+                    if '--errfile=' in line:
+                        for part in line.split():
+                            if part.startswith('--errfile='):
+                                err_path = part.split('=', 1)[1]
+                                if os.path.isfile(err_path) and os.path.getsize(err_path) > 0:
+                                    with open(err_path, 'r') as ef:
+                                        tail = ef.read()[-4000:]
+                                    errfile_notes.append(f"ERRFILE ({err_path}):\n{tail}")
+                                elif os.path.isfile(err_path):
+                                    errfile_notes.append(f"ERRFILE ({err_path}): <empty>")
+                                else:
+                                    errfile_notes.append(f"ERRFILE missing: {err_path}")
+        except OSError:
+            pass
+        error_msg = (
+            f"exit={e.returncode}\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}\n"
+            + ("\n".join(errfile_notes) if errfile_notes else "(no --errfile found in job script)")
+        )
         return (False, job_path, error_msg)
 
 
@@ -379,6 +401,21 @@ class ParallelAugustus:
                         outf.write(rnaseq_hints + '\n')
                 
                 logger.info(f"Created hints file for chromosome {chrom}: {hints_file}")
+
+            # chr.lst lists a hints path for every genome chromosome; coding_gp may
+            # only cover a subset (or be empty in sparse pairwise modes). Touch any
+            # missing hints files so Augustus --hintsfile= does not fail open().
+            chr_lst_file = self.temp_dir / "chr.lst"
+            if chr_lst_file.exists():
+                with open(chr_lst_file) as f:
+                    for line in f:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 2:
+                            hints_path = Path(parts[1])
+                            if not hints_path.exists():
+                                hints_path.parent.mkdir(parents=True, exist_ok=True)
+                                hints_path.touch()
+                                logger.info(f"Created empty hints file (no transcripts): {hints_path}")
             
             if tmr_hints_data:
                 session.close()
@@ -1794,6 +1831,27 @@ RES_FILE=$(printf "{results_dir}/results_%04d.gtf" "$IDX")
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")
     
+    def _coding_gp_empty(self) -> bool:
+        gp = self.args.coding_gp
+        if not gp or not os.path.exists(gp) or os.path.getsize(gp) == 0:
+            return True
+        with open(gp) as f:
+            return not any(line.strip() for line in f)
+
+    def _write_empty_gtf_outputs(self) -> bool:
+        """Succeed with empty GTFs when there are no transcripts to annotate."""
+        try:
+            for path in (self.args.augustus_tm_gtf, getattr(self.args, "augustus_tmr_gtf", None)):
+                if not path:
+                    continue
+                os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+                Path(path).touch()
+                logger.info(f"Wrote empty Augustus output (no input transcripts): {path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write empty Augustus outputs: {e}")
+            return False
+
     def run_pipeline(self) -> bool:
         """Run the complete parallel Augustus pipeline."""
         logger.info("Starting parallel Augustus pipeline...")
@@ -1802,6 +1860,15 @@ RES_FILE=$(printf "{results_dir}/results_%04d.gtf" "$IDX")
             # Validate inputs
             if not self.validate_inputs():
                 return False
+
+            # Empty coding GP is common for sparse pairwise / ancestor modes — do
+            # not run Augustus against missing hints files; emit empty GTFs.
+            if self._coding_gp_empty():
+                logger.warning(
+                    f"No transcripts in coding_gp ({self.args.coding_gp}); "
+                    "writing empty Augustus outputs and skipping prediction."
+                )
+                return self._write_empty_gtf_outputs()
             
             # Step 1: Run preprocessing (either on SLURM or locally)
             joblist_job_id = None  # Will be set if using SLURM preprocessing
