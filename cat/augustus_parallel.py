@@ -56,6 +56,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _run_augustus_job_script(job_path: str) -> tuple:
+    """Run one Augustus job script (module-level for multiprocessing pickling)."""
+    try:
+        subprocess.run(['bash', job_path], capture_output=True, text=True, check=True)
+        return (True, job_path, "")
+    except subprocess.CalledProcessError as e:
+        error_msg = f"STDOUT: {e.stdout}\nSTDERR: {e.stderr}"
+        return (False, job_path, error_msg)
+
+
 class ParallelAugustus:
     """Main class for running parallel Augustus pipeline."""
     
@@ -930,6 +940,68 @@ fi
         if result.detail:
             logger.info(f"Cluster {job_name} {job_id} verified: {result.detail}")
         return True
+
+    def _should_run_jobs_locally(self) -> bool:
+        """True when Augustus chunk jobs must run in-process (not via sbatch/qsub)."""
+        mode = getattr(self.args, "execution_mode", "auto")
+        if mode == "local" or getattr(self.args, "no_slurm_jobs", False):
+            return True
+        # Snakemake local path sets --no_slurm_preprocessing; keep jobs local too
+        # so auto→sge detection cannot qsub orphan arrays without PATH/env.
+        if not getattr(self.args, "use_slurm_preprocessing", True):
+            return True
+        return False
+
+    def run_local_jobs(self, jobs_file: str, num_cpus: int = None) -> bool:
+        """Run Augustus job scripts locally (same semantics as SLURM array body)."""
+        import multiprocessing
+
+        logger.info("Running Augustus jobs locally...")
+        try:
+            list_dir = os.path.dirname(os.path.abspath(jobs_file))
+            with open(jobs_file, 'r') as f:
+                job_entries = [line.strip() for line in f if line.strip()]
+
+            jobs = []
+            for entry in job_entries:
+                if os.path.isabs(entry) and os.path.isfile(entry):
+                    jobs.append(entry)
+                    continue
+                candidates = [
+                    os.path.join(list_dir, entry),
+                    os.path.join(str(self.temp_dir), entry),
+                    os.path.join(str(self.jobs_dir), entry),
+                    os.path.join(str(self.temp_dir), os.path.basename(entry)),
+                    os.path.join(str(self.jobs_dir), os.path.basename(entry)),
+                ]
+                resolved = next((p for p in candidates if os.path.isfile(p)), None)
+                if resolved is None:
+                    logger.error(
+                        f"Job script not found for list entry {entry!r}; tried: {candidates}"
+                    )
+                    return False
+                jobs.append(resolved)
+
+            if num_cpus is None:
+                num_cpus = getattr(self.args, "num_cpus", None) or multiprocessing.cpu_count()
+            num_cpus = max(1, int(num_cpus))
+            logger.info(f"Total jobs to run: {len(jobs)}")
+            logger.info(f"Using {num_cpus} CPUs for parallel execution")
+
+            with multiprocessing.Pool(processes=num_cpus) as pool:
+                results = pool.map(_run_augustus_job_script, jobs)
+
+            failed = [(job, err) for ok, job, err in results if not ok]
+            if failed:
+                logger.error(f"{len(failed)} jobs failed:")
+                for job, err in failed[:5]:
+                    logger.error(f"Job: {job}\nError: {err}")
+                return False
+            logger.info(f"All {len(jobs)} jobs completed successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error running local jobs: {e}")
+            return False
 
     def run_slurm_jobs(self, slurm_script_path: str) -> bool:
         """Submit and wait for SLURM jobs to complete and verify success."""
@@ -1888,10 +1960,14 @@ RES_FILE=$(printf "{results_dir}/results_%04d.gtf" "$IDX")
             
             # Use the last preprocessing job ID as dependency (joblist_job_id if SLURM, None if local)
             last_preprocessing_job_id = joblist_job_id if self.args.use_slurm_preprocessing else None
-            tm_slurm_script = self.create_slurm_script("TM", num_tm_jobs, last_preprocessing_job_id)
-            
-            if not self.run_slurm_jobs(tm_slurm_script):
-                return False
+            if self._should_run_jobs_locally():
+                logger.info(f"Running {num_tm_jobs} TM Augustus jobs locally...")
+                if not self.run_local_jobs(str(jobs_file), getattr(self.args, "num_cpus", None)):
+                    return False
+            else:
+                tm_slurm_script = self.create_slurm_script("TM", num_tm_jobs, last_preprocessing_job_id)
+                if not self.run_slurm_jobs(tm_slurm_script):
+                    return False
             
             # Save intermediate outputs for debugging
             if self.args.save_intermediate:
@@ -1920,10 +1996,14 @@ RES_FILE=$(printf "{results_dir}/results_%04d.gtf" "$IDX")
                 with open(tmr_jobs_file, 'r') as f:
                     num_tmr_jobs = len([line for line in f if line.strip()])
                 
-                tmr_slurm_script = self.create_slurm_script("TMR", num_tmr_jobs, last_preprocessing_job_id)
-                
-                if not self.run_slurm_jobs(tmr_slurm_script):
-                    return False
+                if self._should_run_jobs_locally():
+                    logger.info(f"Running {num_tmr_jobs} TMR Augustus jobs locally...")
+                    if not self.run_local_jobs(str(tmr_jobs_file), getattr(self.args, "num_cpus", None)):
+                        return False
+                else:
+                    tmr_slurm_script = self.create_slurm_script("TMR", num_tmr_jobs, last_preprocessing_job_id)
+                    if not self.run_slurm_jobs(tmr_slurm_script):
+                        return False
                 
                 # Save intermediate outputs for debugging
                 if self.args.save_intermediate:
@@ -2013,6 +2093,8 @@ def main():
                        help="Use SLURM array for transcript processing (default: enabled).")
     parser.add_argument("--no_slurm_transcripts", action="store_true",
                        help="Disable SLURM transcript processing and run transcripts locally.")
+    parser.add_argument("--no_slurm_jobs", action="store_true",
+                       help="Run Augustus chunk job scripts locally instead of a cluster array.")
     parser.add_argument("--transcripts_per_task", type=int, default=1000,
                        help="Number of transcripts to process per SLURM task (default: 1000, optimized for faster collection).")
     parser.add_argument("--array_concurrency", type=int, default=500,
@@ -2079,6 +2161,10 @@ def main():
     # Handle SLURM transcript options
     if args.no_slurm_transcripts:
         args.use_slurm_transcripts = False
+
+    # Resolve auto → slurm/sge/local so local Snakemake runs don't qsub via auto-detect.
+    from cat.scheduler import resolve_execution_mode
+    args.execution_mode = resolve_execution_mode(args.execution_mode)
     
     # Handle intermediate output saving options
     if args.no_save_intermediate:
