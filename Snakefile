@@ -584,7 +584,8 @@ def run_augustus_parallel(*, input, output, params, wildcards, log_path,
             "--tmr_cfg", params.tmr_cfg,
         ]
     cmd += ["--work_dir", genome_work_dir]
-    cmd += (["--no_slurm_preprocessing", "--no_slurm_transcripts"]
+    cmd += (["--no_slurm_preprocessing", "--no_slurm_transcripts", "--no_slurm_jobs",
+             "--execution_mode", "local"]
             if not IS_CLUSTER else _aug_slurm_args("augustus_tm"))
 
     # try/finally so the (potentially large) per-genome temp dir is always removed,
@@ -2852,7 +2853,9 @@ rule augustus_run_mp:
                     "--miniprot_hints_gff", input.miniprot_hints,
                     "--work_dir", genome_work_dir,
                     "--num_cpus", str(max(1, int(threads))),
-                ] + (["--no_slurm_preprocessing", "--no_slurm_transcripts"] if not IS_CLUSTER else _aug_slurm_args("augustus_tm"))
+                ] + (["--no_slurm_preprocessing", "--no_slurm_transcripts", "--no_slurm_jobs",
+                      "--execution_mode", "local"]
+                     if not IS_CLUSTER else _aug_slurm_args("augustus_tm"))
 
                 result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -3011,7 +3014,8 @@ rule run_augustus_pb:
             "--overlap", str(params.overlap),
             "--work_dir", genome_work_dir,
             "--num_cpus", str(max(1, int(threads))),
-        ] + (["--no_slurm_preprocessing", "--no_slurm_jobs"] if not IS_CLUSTER else _aug_slurm_args("augustus_pb"))
+        ] + (["--no_slurm_preprocessing", "--no_slurm_jobs", "--execution_mode", "local"]
+             if not IS_CLUSTER else _aug_slurm_args("augustus_pb"))
 
         # try/finally so the per-genome temp dir is always cleaned up, even on
         # failure — otherwise failed/retried jobs leak (large) temp dirs.
