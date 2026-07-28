@@ -444,7 +444,16 @@ class ParallelAugustus:
             ]
             
             logger.info(f"Running: {' '.join(create_jobs_cmd)}")
-            result = subprocess.run(create_jobs_cmd, capture_output=True, text=True, check=True)
+            # createAugustusJoblist.pl --wrap writes job scripts into CWD (basenames
+            # in the joblist). Run from temp_dir so SLURM/SGE (cd temp_dir; bash $JOB)
+            # and local execution find the same files. --outputdir is only for .gff/.err.
+            result = subprocess.run(
+                create_jobs_cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=str(self.temp_dir),
+            )
             
             # Debug: Log createAugustusJoblist.pl output
             logger.info(f"createAugustusJoblist.pl stdout: {result.stdout}")
@@ -465,12 +474,18 @@ class ParallelAugustus:
                 logger.error("Job list file was not created!")
                 return False
             
-            # Debug: Check if actual job files were created
-            job_files_created = list(self.jobs_dir.glob(f"{self.args.genome}_aug_{mode}_*"))
-            logger.info(f"Created {len(job_files_created)} job files in {self.jobs_dir}")
+            # Job scripts land in temp_dir (CWD), not jobs_dir
+            job_files_created = list(self.temp_dir.glob(f"{self.args.genome}_aug_{mode}_*"))
+            logger.info(f"Created {len(job_files_created)} job files in {self.temp_dir}")
             for job_file in job_files_created:
                 file_size = os.path.getsize(job_file)
                 logger.info(f"  {job_file.name}: {file_size} bytes")
+            if not job_files_created:
+                logger.error(
+                    f"createAugustusJoblist.pl wrote jobs_{mode}.lst but no job scripts "
+                    f"under {self.temp_dir}. Refusing to submit empty Augustus array."
+                )
+                return False
             
             logger.info(f"Created job list: {jobs_lst_file}")
             return True
@@ -1005,7 +1020,9 @@ fi
                 logger.info(f"Saved job list: {intermediate_jobs_lst}")
             
             # Save actual job files
-            job_files = list(self.jobs_dir.glob(f"{self.args.genome}_aug_{mode}_*"))
+            job_files = list(self.temp_dir.glob(f"{self.args.genome}_aug_{mode}_*"))
+            if not job_files:
+                job_files = list(self.jobs_dir.glob(f"{self.args.genome}_aug_{mode}_*"))
             logger.info(f"Found {len(job_files)} job files to save")
             
             for job_file in job_files:
@@ -1070,11 +1087,16 @@ fi
                 logger.info(f"Job files from list: {job_files}")
                 
                 for job_file_name in job_files:
-                    # Resolve job file path - it could be absolute or relative to jobs_dir
+                    # Job scripts are written to temp_dir (createAugustusJoblist.pl CWD);
+                    # fall back to jobs_dir for older layouts.
                     if os.path.isabs(job_file_name):
                         job_file = job_file_name
                     else:
-                        job_file = str(self.jobs_dir / job_file_name)
+                        candidates = [
+                            str(self.temp_dir / job_file_name),
+                            str(self.jobs_dir / job_file_name),
+                        ]
+                        job_file = next((p for p in candidates if os.path.isfile(p)), candidates[0])
                     
                     logger.info(f"Parsing job file: {job_file_name} -> {job_file}")
                     try:
