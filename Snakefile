@@ -5,6 +5,7 @@ A comprehensive pipeline for comparative genomic annotation using multiple appro
 """
 
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -500,17 +501,32 @@ def build_miniprot_map_flags(cpus):
     return " ".join(flags)
 
 def _slurm_partition(rule_name=None):
+    """Return queue/partition for cluster jobs.
+
+    Prefer per-rule / global ``slurm.partition``. On SGE, when that is empty,
+    fall back to ``cluster.sge.queue`` so ``--slurm_partition`` / ``--partition``
+    still get a real queue name (and a non-empty CLI value).
+    """
     if rule_name:
         r = config.get("slurm", {}).get("rules", {}).get(rule_name, {})
-        if "partition" in r:
+        if "partition" in r and r["partition"] not in (None, ""):
             return r["partition"]
-    return config.get("slurm", {}).get("partition", "")
+    part = config.get("slurm", {}).get("partition", "") or ""
+    if part:
+        return part
+    if EXECUTION_MODE == "sge":
+        return (config.get("cluster", {}) or {}).get("sge", {}).get("queue", "") or ""
+    return ""
 
 def _slurm_exclude():
     return config.get("slurm", {}).get("exclude_nodes", "")
 
 def _aug_slurm_args(rule_key):
     """Build cluster CLI args for augustus_parallel.py / augustus_pb_parallel.py.
+
+    Empty optional string values are omitted (not emitted as bare flags). That
+    matters when these args are later shell-joined: ``--foo `` with an empty
+    expansion becomes ``--foo`` and argparse raises "expected one argument".
     """
     cfg = config.get("slurm", {}).get("rules", {}).get(rule_key, {})
     exclude = _slurm_exclude()
@@ -532,10 +548,23 @@ def _aug_slurm_args(rule_key):
     # augustus_pb_parallel.py doesn't have a transcripts stage; strip those keys.
     if rule_key == "augustus_pb":
         arg_map = {k: v for k, v in arg_map.items() if not k.startswith("transcripts_")}
+    partition_keys = {
+        "preprocessing_partition", "jobs_partition", "transcripts_partition",
+    }
+    sge_queue = ""
+    if EXECUTION_MODE == "sge":
+        sge_queue = (config.get("cluster", {}) or {}).get("sge", {}).get("queue", "") or ""
     args = []
     for cfg_key, arg_name in arg_map.items():
-        if cfg_key in cfg:
-            args += [arg_name, str(cfg[cfg_key])]
+        if cfg_key not in cfg:
+            continue
+        val = str(cfg[cfg_key])
+        if cfg_key in partition_keys:
+            if not val:
+                val = sge_queue
+            if not val:
+                continue  # omit; CLI default is ""
+        args += [arg_name, val]
     if exclude:
         args += ["--slurm_exclude_nodes", exclude]
     args += ["--execution_mode", EXECUTION_MODE]
@@ -548,6 +577,10 @@ def _aug_slurm_args(rule_key):
     if sge_cfg.get("memory_flag"):
         args += ["--sge_memory_flag", str(sge_cfg["memory_flag"])]
     return args
+
+def _shell_join(cmd):
+    """Shell-safe argv join (keeps empty values as '' so argparse never sees bare flags)."""
+    return shlex.join(str(x) for x in cmd)
 
 def _slurm_module():
     return config.get("slurm", {}).get("module_load", "")
@@ -591,7 +624,7 @@ def run_augustus_parallel(*, input, output, params, wildcards, log_path,
     # try/finally so the (potentially large) per-genome temp dir is always removed,
     # even when Augustus fails — otherwise failed/retried jobs leak temp dirs.
     try:
-        shell(" ".join(cmd) + f" > {log_path} 2>&1")
+        shell(_shell_join(cmd) + f" > {log_path} 2>&1")
     finally:
         if os.path.exists(genome_work_dir):
             shell(f"rm -rf {genome_work_dir}")
@@ -1703,7 +1736,7 @@ rule generate_hints:
               --slurm_memory {params.slurm_memory} \
               --slurm_cpus {params.slurm_cpus} \
               --slurm_time {params.slurm_time} \
-              --slurm_partition {params.slurm_partition} \
+              --slurm_partition "{params.slurm_partition}" \
               --slurm_max_jobs {params.slurm_max_jobs} >> {log} 2>&1
         else
             echo "Using local hints generation for {wildcards.genome}" > {log}
@@ -3020,7 +3053,7 @@ rule run_augustus_pb:
         # try/finally so the per-genome temp dir is always cleaned up, even on
         # failure — otherwise failed/retried jobs leak (large) temp dirs.
         try:
-            shell(" ".join(cmd) + f" > {log} 2>&1")
+            shell(_shell_join(cmd) + f" > {log} 2>&1")
         finally:
             if os.path.exists(genome_work_dir):
                 shell(f"rm -rf {genome_work_dir}")
@@ -3153,7 +3186,7 @@ rule find_denovo_parents:
         table_name=get_denovo_parent_tablename,
         cluster_args=(
             f"--execution-mode {EXECUTION_MODE} "
-            f"--partition {_slurm_partition('find_denovo_parents')} "
+            f"--partition \"{_slurm_partition('find_denovo_parents')}\" "
             f"--exclude-nodes \"{_slurm_exclude()}\" "
             f"--module-load \"{_slurm_module()}\" "
             f"--sge-parallel-env {config.get('cluster', {}).get('sge', {}).get('parallel_env', 'smp')} "
@@ -3313,7 +3346,7 @@ rule align_transcripts:
               --annotation-gp {input.ref_gp} \
               --ref-db-path {input.ref_db} \
               {params.mode_file_args} \
-              --partition {params.partition} \
+              --partition "{params.partition}" \
               --exclude-nodes "{params.exclude_nodes}" \
               --module-load "{params.module_load}" \
               --sge-parallel-env {params.sge_parallel_env} \
@@ -3374,7 +3407,7 @@ rule evaluate_transcripts:
         mode_file_args=lambda w, input: f"{w.alignment_mode} {input.gp} {input.mrna_psl} {input.cds_psl}",
         cluster_args=(
             f"--execution-mode {EXECUTION_MODE} "
-            f"--partition {_slurm_partition('evaluate_transcripts')} "
+            f"--partition \"{_slurm_partition('evaluate_transcripts')}\" "
             f"--exclude-nodes \"{_slurm_exclude()}\" "
             f"--module-load \"{_slurm_module()}\" "
             f"--sge-parallel-env {config.get('cluster', {}).get('sge', {}).get('parallel_env', 'smp')} "
