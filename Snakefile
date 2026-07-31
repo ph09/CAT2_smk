@@ -313,29 +313,68 @@ SCHEDULER = get_scheduler(EXECUTION_MODE, config)
 # ─── Resource resolution ──────────────────────────────────────────────────────
 # Fallback defaults when a key is absent from config['slurm']['rules'][rule].
 _RULE_DEFAULTS = {
-    "prepare_genome_files":      {"mem": "128G", "cpus": 64,  "time": "01:00:00"},
-    "prepare_reference_files":   {"mem": "64G",  "cpus": 2,   "time": "01:00:00"},
-    "transmap_map_psl":          {"mem": "16G",  "cpus": 4,   "time": "01:00:00"},
-    "transmap_unfiltered_gtf":   {"mem": "16G",  "cpus": 1,   "time": "01:00:00"},
-    "minimap2_bam":              {"mem": "64G",  "cpus": 32,  "time": "12:00:00"},
-    "bam_to_chain":              {"mem": "16G",  "cpus": 4,   "time": "01:00:00"},
-    "transmap_pairwise_map_psl": {"mem": "16G",  "cpus": 4,   "time": "01:00:00"},
-    "run_chaining_per_genome":   {"mem": "128G", "cpus": 64,  "time": "12:00:00",  "timeout_hours": 24},
-    "run_miniprot":              {"mem": "128G", "cpus": 64,  "time": "04:00:00",  "timeout_hours": 12,
+    # mem/cpus/time: cluster job request (sbatch/qsub).
+    # timeout_hours: controller poll timeout for run_or_submit (must be >= time).
+    # controller_mem_gb / controller_time_h: Snakemake resources for the waiting
+    # localrule on the controller (override when the waiter needs more headroom).
+    "prepare_genome_files":      {"mem": "128G", "cpus": 64,  "time": "01:00:00", "timeout_hours": 4},
+    "prepare_reference_files":   {"mem": "64G",  "cpus": 2,   "time": "01:00:00", "timeout_hours": 3},
+    "transmap_map_psl":          {"mem": "16G",  "cpus": 4,   "time": "01:00:00", "timeout_hours": 2},
+    "transmap_unfiltered_gtf":   {"mem": "16G",  "cpus": 1,   "time": "01:00:00", "timeout_hours": 2},
+    "minimap2_bam":              {"mem": "64G",  "cpus": 32,  "time": "12:00:00", "timeout_hours": 12},
+    "bam_to_chain":              {"mem": "16G",  "cpus": 4,   "time": "01:00:00", "timeout_hours": 6},
+    "transmap_pairwise_map_psl": {"mem": "16G",  "cpus": 4,   "time": "01:00:00", "timeout_hours": 2},
+    "run_chaining_per_genome":   {"mem": "128G", "cpus": 64,  "time": "12:00:00", "timeout_hours": 24},
+    "run_miniprot":              {"mem": "128G", "cpus": 64,  "time": "04:00:00", "timeout_hours": 12,
                                  "minisplice_parallel": True, "minisplice_cpus": 4, "minisplice_mem": "8G",
                                  "minisplice_time": "01:00:00", "minisplice_max_concurrent": 25},
-    "run_txTM":               {"mem": "128G", "cpus": 64,  "time": "04:00:00", "timeout_hours": 12},
-    "stringtie_merge":           {"mem": "16G",  "cpus": 8,   "time": "04:00:00"},
-    "stringtie_sort":            {"mem": "128G", "cpus": 64,  "time": "06:00:00"},
-    "stringtie_run":             {"mem": "128G", "cpus": 64,  "time": "12:00:00"},
-    "stringtie_convert":         {"mem": "8G",   "cpus": 2,   "time": "02:00:00"},
-    "stringtie_gp":              {"mem": "8G",   "cpus": 2,   "time": "02:00:00"},
-    "generate_consensus":        {"mem": "256G", "cpus": 32,  "time": "12:00:00"},
-    "annotate_novel_genes":      {"mem": "32G",  "cpus": 16,  "time": "02:00:00"},
-    "generate_hints":            {"mem": "256G", "cpus": 128, "time": "12:00:00",  "max_concurrent_jobs": 50},
-    "align_transcripts":         {"mem": "64G",  "cpus": 64,  "time": "02:00:00",  "max_concurrent_jobs": 200, "timeout_hours": 12, "chunk_size": 500},
-    "evaluate_transcripts":      {"mem": "16G",  "cpus": 1,   "time": "01:00:00",  "max_concurrent_jobs": 20,  "chunk_size": 500},
-    "find_denovo_parents":       {"mem": "32G",  "cpus": 1,   "time": "01:00:00",  "max_concurrent_jobs": 20},
+    "run_txTM":                  {"mem": "128G", "cpus": 64,  "time": "04:00:00", "timeout_hours": 12},
+    "stringtie_merge":           {"mem": "16G",  "cpus": 8,   "time": "04:00:00", "timeout_hours": 6},
+    "stringtie_sort":            {"mem": "64G",  "cpus": 16,  "time": "06:00:00", "timeout_hours": 8},
+    "stringtie_run":             {"mem": "64G",  "cpus": 16,  "time": "12:00:00", "timeout_hours": 14},
+    "stringtie_convert":         {"mem": "8G",   "cpus": 2,   "time": "02:00:00", "timeout_hours": 3},
+    "stringtie_gp":              {"mem": "8G",   "cpus": 2,   "time": "02:00:00", "timeout_hours": 3},
+    "generate_consensus":        {"mem": "256G", "cpus": 32,  "time": "12:00:00", "timeout_hours": 12},
+    "annotate_novel_genes":      {"mem": "32G",  "cpus": 16,  "time": "02:00:00", "timeout_hours": 2},
+    "generate_hints":            {"mem": "256G", "cpus": 128, "time": "12:00:00", "max_concurrent_jobs": 50,
+                                 "controller_time_h": 4, "timeout_hours": 24},
+    "align_transcripts":         {"mem": "64G",  "cpus": 64,  "time": "02:00:00", "max_concurrent_jobs": 200,
+                                 "timeout_hours": 12, "chunk_size": 500, "controller_time_h": 24},
+    "evaluate_transcripts":      {"mem": "16G",  "cpus": 1,   "time": "01:00:00", "max_concurrent_jobs": 20,
+                                 "chunk_size": 500, "controller_mem_gb": 16, "controller_time_h": 24,
+                                 "timeout_hours": 24},
+    "find_denovo_parents":       {"mem": "32G",  "cpus": 1,   "time": "01:00:00", "max_concurrent_jobs": 20,
+                                 "controller_time_h": 24, "timeout_hours": 24},
+    # Augustus / PB wrappers wait on nested array jobs; tune worker resources via
+    # slurm.rules.augustus_tm / augustus_pb. These keys are the controller waiter.
+    "augustus_run_tm_and_tmr": {"controller_mem_gb": 4, "controller_time_h": 24, "timeout_hours": 48},
+    "augustus_run_tm_only": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
+    "augustus_run_tm_pairwise_and_tmr_pairwise": {"controller_mem_gb": 4, "controller_time_h": 24, "timeout_hours": 48},
+    "augustus_run_tm_pairwise_only": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
+    "augustus_run_mp": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
+    "run_augustus_pb": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
+    "build_protein_db": {"controller_mem_gb": 4, "controller_time_h": 6, "timeout_hours": 6},
+    "fix_augmp_gene_names": {"controller_mem_gb": 4, "controller_time_h": 1, "timeout_hours": 1},
+    # Localrules / light steps (cpus unused unless the rule calls job_cpus).
+    "setup_pipeline_directories": {"mem": "2G", "cpus": 1, "controller_mem_gb": 2},
+    "init_target_genome_database": {"mem": "1G", "cpus": 1, "controller_mem_gb": 1},
+    "transmap_filter": {"mem": "8G", "cpus": 1, "controller_mem_gb": 8},
+    "transmap_evaluate": {"mem": "8G", "cpus": 1, "controller_mem_gb": 8},
+    "transmap_pairwise_filter": {"mem": "8G", "cpus": 1, "controller_mem_gb": 8},
+    "build_db": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "augustus_extract_coding_gp": {"mem": "2G", "cpus": 1, "controller_mem_gb": 2},
+    "augustus_extract_coding_gp_pairwise": {"mem": "2G", "cpus": 1, "controller_mem_gb": 2},
+    "augustus_convert_tm_gtf_to_gp": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "augustus_convert_tmr_gtf_to_gp": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "augustus_convert_tm_pairwise_gtf_to_gp": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "augustus_convert_tmr_pairwise_gtf_to_gp": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "augustus_convert_mp_gtf_to_gp": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "miniprot_paf_to_genepred": {"mem": "8G", "cpus": 1, "controller_mem_gb": 8},
+    "aggregate_evaluations": {"mem": "128G", "cpus": 1, "controller_mem_gb": 128},
+    "generate_plots": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "gene_family_report": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
+    "finish_pipeline": {"mem": "1G", "cpus": 1, "controller_mem_gb": 1},
+    "cleanup_logs_and_done_files": {"mem": "1G", "cpus": 1, "controller_mem_gb": 1},
 }
 
 _LOCAL_DEFAULTS = {
@@ -351,8 +390,8 @@ _LOCAL_DEFAULTS = {
                                  "minisplice_parallel": True, "minisplice_cpus": 4, "minisplice_max_jobs": 8},
     "run_txTM":             {"threads": 64,  "mem_gb": 128, "time_h": 8},
     "stringtie_merge":         {"threads": 8,   "mem_gb": 16,  "time_h": 4},
-    "stringtie_sort":          {"threads": 64,  "mem_gb": 128, "time_h": 6},
-    "stringtie_run":           {"threads": 64,  "mem_gb": 128, "time_h": 12},
+    "stringtie_sort":          {"threads": 16,  "mem_gb": 64,  "time_h": 6},
+    "stringtie_run":           {"threads": 16,  "mem_gb": 64,  "time_h": 12},
     "stringtie_convert":       {"threads": 2,   "mem_gb": 8,   "time_h": 2},
     "stringtie_gp":            {"threads": 2,   "mem_gb": 8,   "time_h": 2},
     "generate_consensus":      {"threads": 32,  "mem_gb": 128, "time_h": 12},
@@ -369,12 +408,21 @@ _LOCAL_DEFAULTS = {
     "run_augustus_pb":                   {"threads": 64, "mem_gb": 128, "time_h": 24},
 }
 
-def get_res(rule_name, key):
-    """Return a resource value for a rule. Config overrides built-in defaults."""
+def get_res(rule_name, key, default=None):
+    """Return a resource value for a rule. Config overrides built-in defaults.
+
+    If *default* is provided and the key is absent from both config and
+    ``_RULE_DEFAULTS``, return *default* instead of raising.
+    """
     cfg = config.get("slurm", {}).get("rules", {}).get(rule_name, {})
     if key in cfg:
         return cfg[key]
-    return _RULE_DEFAULTS[rule_name][key]
+    rule_defs = _RULE_DEFAULTS.get(rule_name, {})
+    if key in rule_defs:
+        return rule_defs[key]
+    if default is not None:
+        return default
+    raise KeyError(f"No resource '{key}' configured for rule '{rule_name}'")
 
 def get_local_res(rule_name, key):
     """Return local-mode resource for Snakemake scheduling (threads/mem_gb/time_h)."""
@@ -393,6 +441,54 @@ def job_cpus(rule_name, threads):
     if IS_CLUSTER:
         return int(get_res(rule_name, "cpus"))
     return max(1, int(threads))
+
+def timeout_s(rule_name):
+    """Controller poll timeout (seconds) for run_or_submit / wait loops."""
+    return int(float(get_res(rule_name, "timeout_hours", 1)) * 3600)
+
+def _mem_to_gb(mem):
+    """Parse a mem string like '16G' / '512M' / 16 into integer GB (ceil)."""
+    if mem is None:
+        return None
+    if isinstance(mem, (int, float)):
+        return max(1, int(mem))
+    s = str(mem).strip().upper()
+    if s.endswith("G"):
+        return max(1, int(float(s[:-1])))
+    if s.endswith("M"):
+        return max(1, int((float(s[:-1]) + 1023) // 1024))
+    return max(1, int(float(s)))
+
+def snk_mem_gb(rule_name):
+    """Snakemake resources.mem_gb for local work or the cluster controller waiter.
+
+    Tunable via ``slurm.rules.<rule>.controller_mem_gb``, else
+    ``slurm.rules.<rule>.mem``, else ``local.rules.<rule>.mem_gb``.
+    """
+    if not IS_CLUSTER:
+        cfg = config.get("local", {}).get("rules", {}).get(rule_name, {})
+        if "mem_gb" in cfg:
+            return int(cfg["mem_gb"])
+        mem = get_res(rule_name, "mem", None)
+        gb = _mem_to_gb(mem)
+        if gb is not None:
+            return gb
+        return int(get_local_res(rule_name, "mem_gb"))
+    cfg = config.get("slurm", {}).get("rules", {}).get(rule_name, {})
+    if "controller_mem_gb" in cfg or "controller_mem_gb" in _RULE_DEFAULTS.get(rule_name, {}):
+        return int(get_res(rule_name, "controller_mem_gb"))
+    gb = _mem_to_gb(get_res(rule_name, "mem", None))
+    return gb if gb is not None else 1
+
+def snk_time_h(rule_name):
+    """Snakemake resources.time_h for local work or the cluster controller waiter."""
+    if not IS_CLUSTER:
+        return get_local_res(rule_name, "time_h")
+    # Prefer explicit controller_time_h; else mirror timeout_hours; else 1.
+    cfg = config.get("slurm", {}).get("rules", {}).get(rule_name, {})
+    if "controller_time_h" in cfg or "controller_time_h" in _RULE_DEFAULTS.get(rule_name, {}):
+        return int(get_res(rule_name, "controller_time_h"))
+    return int(get_res(rule_name, "timeout_hours", 1))
 
 # ─── miniprot mapping sensitivity ─────────────────────────────────────────────
 # Defaults are deliberately more permissive than miniprot's own defaults so the
@@ -849,7 +945,8 @@ rule setup_pipeline_directories:
         work_dir = WORK_DIR,
         toil_dir = TOIL_BASE_JOB_STORE_DIR
     resources:
-        mem_gb=2,
+        mem_gb=snk_mem_gb("setup_pipeline_directories"),
+
         time_h=1,
         job_id=lambda wildcards, attempt: f"setup-{attempt}"
     run:
@@ -926,8 +1023,8 @@ rule prepare_genome_files:
         genome = f"({'|'.join(ALL_GENOMES)})"
     threads: 1 if IS_CLUSTER else get_local_res("prepare_genome_files", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("prepare_genome_files", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("prepare_genome_files", "time_h"),
+        mem_gb=snk_mem_gb("prepare_genome_files"),
+        time_h=snk_time_h("prepare_genome_files"),
         job_id=lambda wildcards, attempt: f"prep-genome-submit-{wildcards.genome}-{attempt}"
     log:
         WORK_DIR / "logs/prepare_genome_files/{genome}.log"
@@ -989,7 +1086,7 @@ echo "End time: $(date)"
                 + ([output.protein_index] if config.get("augustus", False) else []),
                 log_file,
                 "prepare_genome_files",
-                max_wait_s=14400
+                max_wait_s=timeout_s("prepare_genome_files")
             )
 
 rule init_target_genome_database:
@@ -1001,7 +1098,8 @@ rule init_target_genome_database:
     wildcard_constraints:
         genome=f"({ANNOTATION_GENOME_WC})",
     resources:
-        mem_gb=1,
+        mem_gb=snk_mem_gb("init_target_genome_database"),
+
         time_h=1,
         job_id=lambda wildcards, attempt: f"init-db-{wildcards.genome}-{attempt}",
     shell:
@@ -1030,8 +1128,8 @@ rule prepare_reference_files:
         db_ready = WORK_DIR / f"databases/{REF_GENOME}.db.ready"
     threads: 1 if IS_CLUSTER else get_local_res("prepare_reference_files", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("prepare_reference_files", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("prepare_reference_files", "time_h"),
+        mem_gb=snk_mem_gb("prepare_reference_files"),
+        time_h=snk_time_h("prepare_reference_files"),
         job_id=lambda wildcards, attempt: f"prep-ref-submit-{attempt}"
     log:
         WORK_DIR / f"logs/prepare_reference_files/{REF_GENOME}.log"
@@ -1131,7 +1229,7 @@ echo "End time: $(date)"
                  output.gff3_db, output.db_ready],
                 log_file,
                 "prepare_reference_files",
-                max_wait_s=10800
+                max_wait_s=timeout_s("prepare_reference_files")
             )
 
 rule transmap_map_psl:
@@ -1152,8 +1250,8 @@ rule transmap_map_psl:
         tm_gp=f"{config['work_dir']}/transMap/{{genome}}.gp"
     threads: 1 if IS_CLUSTER else get_local_res("transmap_map_psl", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("transmap_map_psl", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("transmap_map_psl", "time_h"),
+        mem_gb=snk_mem_gb("transmap_map_psl"),
+        time_h=snk_time_h("transmap_map_psl"),
         job_id=lambda wildcards, attempt: f"transmap-map-submit-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/transmap_map/{{genome}}.log"
@@ -1204,7 +1302,7 @@ echo "End time: $(date)"
                 [output.tm_psl, output.tm_gp],
                 log_file,
                 "transmap_map_psl",
-                max_wait_s=7200
+                max_wait_s=timeout_s("transmap_map_psl")
             )
 
 rule transmap_filter:
@@ -1235,7 +1333,8 @@ rule transmap_filter:
     log:
         f"{config['work_dir']}/logs/transmap_filter/{{genome}}.log"
     resources:
-        mem_gb=8,
+        mem_gb=snk_mem_gb("transmap_filter"),
+
         time_h=4,
         job_id=lambda wildcards, attempt: f"tm-filter-{wildcards.genome}-{attempt}"
     shell:
@@ -1294,7 +1393,8 @@ rule transmap_evaluate:
     log:
         f"{config['work_dir']}/logs/transmap_evaluate/{{genome}}.log"
     resources:
-        mem_gb=8,
+        mem_gb=snk_mem_gb("transmap_evaluate"),
+
         time_h=4,
         job_id=lambda wildcards, attempt: f"tm-eval-{wildcards.genome}-{attempt}"
     shell:
@@ -1334,8 +1434,8 @@ rule transmap_unfiltered_gtf:
         genome = ANNOTATION_GENOME_WC
     threads: 1 if IS_CLUSTER else get_local_res("transmap_unfiltered_gtf", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("transmap_unfiltered_gtf", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("transmap_unfiltered_gtf", "time_h"),
+        mem_gb=snk_mem_gb("transmap_unfiltered_gtf"),
+        time_h=snk_time_h("transmap_unfiltered_gtf"),
         job_id=lambda wildcards, attempt: f"tm-gtf-submit-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/transmap_gtf/{{genome}}.log"
@@ -1379,7 +1479,7 @@ echo "End time: $(date)"
                 [output.gtf],
                 log_file,
                 "transmap_unfiltered_gtf",
-                max_wait_s=7200
+                max_wait_s=timeout_s("transmap_unfiltered_gtf")
             )
 
 rule minimap2_bam:
@@ -1401,8 +1501,8 @@ rule minimap2_bam:
         ref_genome=config['ref_genome']
     threads: 1 if IS_CLUSTER else get_local_res("minimap2_bam", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("minimap2_bam", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("minimap2_bam", "time_h"),
+        mem_gb=snk_mem_gb("minimap2_bam"),
+        time_h=snk_time_h("minimap2_bam"),
         job_id=lambda wildcards, attempt: f"minimap2-bam-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/minimap2_bam/{{genome}}.log"
@@ -1449,7 +1549,7 @@ echo "End time: $(date)"
                 [output.bam, output.bam_bai],
                 log_file,
                 "minimap2_bam",
-                max_wait_s=43200
+                max_wait_s=timeout_s("minimap2_bam")
             )
 
 rule bam_to_chain:
@@ -1474,8 +1574,8 @@ rule bam_to_chain:
         ref_genome=config['ref_genome']
     threads: 1 if IS_CLUSTER else get_local_res("bam_to_chain", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("bam_to_chain", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("bam_to_chain", "time_h"),
+        mem_gb=snk_mem_gb("bam_to_chain"),
+        time_h=snk_time_h("bam_to_chain"),
         job_id=lambda wildcards, attempt: f"bam-to-chain-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/bam_to_chain/{{genome}}.log"
@@ -1536,7 +1636,7 @@ echo "End time: $(date)"
                 [output.chain, output.net],
                 log_file,
                 "bam_to_chain",
-                max_wait_s=21600
+                max_wait_s=timeout_s("bam_to_chain")
             )
 
 rule transmap_pairwise_map_psl:
@@ -1557,8 +1657,8 @@ rule transmap_pairwise_map_psl:
         tm_gp=f"{config['work_dir']}/transMap_pairwise/{{genome}}.gp"
     threads: 1 if IS_CLUSTER else get_local_res("transmap_pairwise_map_psl", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("transmap_pairwise_map_psl", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("transmap_pairwise_map_psl", "time_h"),
+        mem_gb=snk_mem_gb("transmap_pairwise_map_psl"),
+        time_h=snk_time_h("transmap_pairwise_map_psl"),
         job_id=lambda wildcards, attempt: f"transmap-bam-map-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/transmap_pairwise_map/{{genome}}.log"
@@ -1608,7 +1708,7 @@ echo "End time: $(date)"
                 [output.tm_psl, output.tm_gp],
                 log_file,
                 "transmap_pairwise_map_psl",
-                max_wait_s=7200
+                max_wait_s=timeout_s("transmap_pairwise_map_psl")
             )
 
 rule transmap_pairwise_filter:
@@ -1638,7 +1738,8 @@ rule transmap_pairwise_filter:
     log:
         f"{config['work_dir']}/logs/transmap_pairwise_filter/{{genome}}.log"
     resources:
-        mem_gb=8,
+        mem_gb=snk_mem_gb("transmap_pairwise_filter"),
+
         time_h=4,
         job_id=lambda wildcards, attempt: f"tm-bam-filter-{wildcards.genome}-{attempt}"
     shell:
@@ -1708,8 +1809,8 @@ rule generate_hints:
         sge_memory_flag = config.get('cluster', {}).get('sge', {}).get('memory_flag', 'h_vmem')
     threads: 1 if IS_CLUSTER else get_local_res("generate_hints", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("generate_hints", "mem_gb"),
-        time_h=4 if IS_CLUSTER else get_local_res("generate_hints", "time_h"),
+        mem_gb=snk_mem_gb("generate_hints"),
+        time_h=snk_time_h("generate_hints"),
         job_id=lambda wildcards, attempt: f"hints-{wildcards.genome}-{attempt}"
     log:
         f"{WORK_DIR}/logs/generate_hints/{{genome}}.log"
@@ -1772,7 +1873,8 @@ rule build_db:
         hints_db=f"{config['work_dir']}/hints_database/hints.db"
     priority: 100  # High priority to unblock augustus
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("build_db"),
+
         time_h=2,
         job_id="build-hints-db"
     log:
@@ -1826,8 +1928,8 @@ rule run_chaining_per_genome:
         f"{config['work_dir']}/logs/chaining_parallel.log"
     threads: 1 if IS_CLUSTER else get_local_res("run_chaining_per_genome", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("run_chaining_per_genome", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("run_chaining_per_genome", "time_h"),
+        mem_gb=snk_mem_gb("run_chaining_per_genome"),
+        time_h=snk_time_h("run_chaining_per_genome"),
         job_id=lambda wildcards, attempt: f"chaining-parallel-submit-{attempt}"
     run:
         import os
@@ -2060,8 +2162,8 @@ rule stringtie_merge_bams:
         f"{config['work_dir']}/logs/stringtie_merge/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_merge", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("stringtie_merge", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("stringtie_merge", "time_h"),
+        mem_gb=snk_mem_gb("stringtie_merge"),
+        time_h=snk_time_h("stringtie_merge"),
         job_id=lambda wildcards, attempt: f"stringtie-merge-{wildcards.genome}-{attempt}"
     run:
         work_dir = config['work_dir']
@@ -2098,7 +2200,7 @@ echo "Done merging BAMs for {genome}" >> {log[0]}
                 [output.sr_merged, output.lr_merged],
                 log_file,
                 "stringtie_merge",
-                max_wait_s=6 * 3600,
+                max_wait_s=timeout_s("stringtie_merge"),
             )
 
 rule stringtie_sort_bams:
@@ -2112,8 +2214,8 @@ rule stringtie_sort_bams:
         f"{config['work_dir']}/logs/stringtie_sort/{{genome}}_{{type}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_sort", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("stringtie_sort", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("stringtie_sort", "time_h"),
+        mem_gb=snk_mem_gb("stringtie_sort"),
+        time_h=snk_time_h("stringtie_sort"),
         job_id=lambda wildcards, attempt: f"stringtie-sort-{wildcards.genome}-{wildcards.type}-{attempt}"
     run:
         work_dir = config['work_dir']
@@ -2144,7 +2246,7 @@ fi
                 [output.bam],
                 log_file,
                 "stringtie_sort",
-                max_wait_s=8 * 3600,
+                max_wait_s=timeout_s("stringtie_sort"),
             )
 
 rule stringtie_run:
@@ -2162,8 +2264,8 @@ rule stringtie_run:
         f"{config['work_dir']}/logs/stringtie_run/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_run", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("stringtie_run", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("stringtie_run", "time_h"),
+        mem_gb=snk_mem_gb("stringtie_run"),
+        time_h=snk_time_h("stringtie_run"),
         job_id=lambda wildcards, attempt: f"stringtie-run-{wildcards.genome}-{attempt}"
     run:
         work_dir = config['work_dir']
@@ -2202,7 +2304,7 @@ echo "StringTie completed for {genome}" >> {log[0]}
                 [output.temp_gtf],
                 log_file,
                 "stringtie_run",
-                max_wait_s=14 * 3600,
+                max_wait_s=timeout_s("stringtie_run"),
             )
 
 if BUILD_PROTEIN_DB:
@@ -2231,8 +2333,8 @@ if BUILD_PROTEIN_DB:
         log:
             f"{config['work_dir']}/logs/build_protein_db.log"
         resources:
-            mem_gb=4,
-            time_h=6,
+            mem_gb=snk_mem_gb("build_protein_db"),
+            time_h=snk_time_h("build_protein_db"),
             job_id=lambda wildcards, attempt: f"build-protein-db-{attempt}"
         run:
             import shlex
@@ -2281,8 +2383,8 @@ rule run_miniprot:
         f"{config['work_dir']}/logs/miniprot/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("run_miniprot", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("run_miniprot", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("run_miniprot", "time_h"),
+        mem_gb=snk_mem_gb("run_miniprot"),
+        time_h=snk_time_h("run_miniprot"),
         job_id=lambda wildcards, attempt: f"miniprot-submit-{wildcards.genome}-{attempt}"
     run:
         import os
@@ -2306,7 +2408,7 @@ rule run_miniprot:
             use_slurm_array=IS_CLUSTER,
             cpus=miniprot_cpus,
         )
-        timeout_s = int(get_res("run_miniprot", "timeout_hours") * 3600)
+        timeout_s_val = timeout_s("run_miniprot")
         map_flags = build_miniprot_map_flags(miniprot_cpus)
 
         script_content = build_sbatch_header(
@@ -2345,7 +2447,7 @@ rm -f $TEMP_GTF
                 [output.hints, output.paf, output.splice_scores],
                 log_file,
                 "run_miniprot",
-                max_wait_s=timeout_s
+                max_wait_s=timeout_s_val
             )
 
 rule run_transcript_map:
@@ -2382,8 +2484,8 @@ rule run_transcript_map:
         f"{config['work_dir']}/logs/transcript_map/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("run_txTM", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("run_txTM", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("run_txTM", "time_h"),
+        mem_gb=snk_mem_gb("run_txTM"),
+        time_h=snk_time_h("run_txTM"),
         job_id=lambda wildcards, attempt: f"transcript-map-submit-{wildcards.genome}-{attempt}"
     run:
         import yaml
@@ -2433,7 +2535,7 @@ python -m cat.transcript_map_runner \\
                 [output.gp, output.psl, output.attrs],
                 log_file,
                 "run_txTM",
-                max_wait_s=int(get_res("run_txTM", "timeout_hours") * 3600),
+                max_wait_s=timeout_s("run_txTM"),
             )
 
 
@@ -2449,7 +2551,8 @@ rule augustus_extract_coding_gp:
     wildcard_constraints:
         genome = AUGUSTUS_GENOME_WC
     resources:
-        mem_gb=2,
+        mem_gb=snk_mem_gb("augustus_extract_coding_gp"),
+
         time_h=1,
         job_id=lambda wildcards, attempt: f"extract-coding-{wildcards.genome}-{attempt}"
     shell:
@@ -2485,8 +2588,8 @@ rule augustus_run_tm_and_tmr:
         utr=1 if config.get('predict_utr') else 0
     threads: 1 if IS_CLUSTER else get_local_res("augustus_run_tm_and_tmr", "threads")
     resources:
-        mem_gb=4 if IS_CLUSTER else get_local_res("augustus_run_tm_and_tmr", "mem_gb"),
-        time_h=24 if IS_CLUSTER else get_local_res("augustus_run_tm_and_tmr", "time_h"),
+        mem_gb=snk_mem_gb("augustus_run_tm_and_tmr"),
+        time_h=snk_time_h("augustus_run_tm_and_tmr"),
         job_id=lambda wildcards, attempt: f"augustus-parallel-tmr-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/augustus_run/{{genome}}.log"
@@ -2526,8 +2629,8 @@ rule augustus_run_tm_only:
         f"{config['work_dir']}/logs/augustus_run/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("augustus_run_tm_only", "threads")
     resources:
-        mem_gb=4 if IS_CLUSTER else get_local_res("augustus_run_tm_only", "mem_gb"),
-        time_h=12 if IS_CLUSTER else get_local_res("augustus_run_tm_only", "time_h"),
+        mem_gb=snk_mem_gb("augustus_run_tm_only"),
+        time_h=snk_time_h("augustus_run_tm_only"),
         job_id=lambda wildcards, attempt: f"augustus-parallel-tm-{wildcards.genome}-{attempt}"
     run:
         run_augustus_parallel(
@@ -2552,7 +2655,8 @@ rule augustus_convert_tm_gtf_to_gp:
         # Only run for genomes that have Augustus enabled
         genome = AUGUSTUS_GENOME_WC
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("augustus_convert_tm_gtf_to_gp"),
+
         time_h=2,
         job_id=lambda wildcards, attempt: f"aug-convert-tm-{wildcards.genome}-{attempt}"
     log:
@@ -2581,7 +2685,8 @@ rule augustus_convert_tmr_gtf_to_gp:
         # Only run for genomes that have RNA-seq data
         genome = RNASEQ_GENOME_WC
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("augustus_convert_tmr_gtf_to_gp"),
+
         time_h=2,
         job_id=lambda wildcards, attempt: f"aug-convert-tmr-{wildcards.genome}-{attempt}"
     log:
@@ -2612,7 +2717,8 @@ rule augustus_extract_coding_gp_pairwise:
     wildcard_constraints:
         genome = AUGUSTUS_GENOME_WC
     resources:
-        mem_gb=2,
+        mem_gb=snk_mem_gb("augustus_extract_coding_gp_pairwise"),
+
         time_h=1,
         job_id=lambda wildcards, attempt: f"extract-coding-pairwise-{wildcards.genome}-{attempt}"
     shell:
@@ -2649,8 +2755,8 @@ rule augustus_run_tm_pairwise_and_tmr_pairwise:
         utr=1 if config.get('predict_utr') else 0
     threads: 1 if IS_CLUSTER else get_local_res("augustus_run_tm_pairwise_and_tmr_pairwise", "threads")
     resources:
-        mem_gb=4 if IS_CLUSTER else get_local_res("augustus_run_tm_pairwise_and_tmr_pairwise", "mem_gb"),
-        time_h=24 if IS_CLUSTER else get_local_res("augustus_run_tm_pairwise_and_tmr_pairwise", "time_h"),
+        mem_gb=snk_mem_gb("augustus_run_tm_pairwise_and_tmr_pairwise"),
+        time_h=snk_time_h("augustus_run_tm_pairwise_and_tmr_pairwise"),
         job_id=lambda wildcards, attempt: f"augustus-parallel-tmr-pairwise-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/augustus_run/{{genome}}_pairwise.log"
@@ -2691,8 +2797,8 @@ rule augustus_run_tm_pairwise_only:
         f"{config['work_dir']}/logs/augustus_run/{{genome}}_pairwise.log"
     threads: 1 if IS_CLUSTER else get_local_res("augustus_run_tm_pairwise_only", "threads")
     resources:
-        mem_gb=4 if IS_CLUSTER else get_local_res("augustus_run_tm_pairwise_only", "mem_gb"),
-        time_h=12 if IS_CLUSTER else get_local_res("augustus_run_tm_pairwise_only", "time_h"),
+        mem_gb=snk_mem_gb("augustus_run_tm_pairwise_only"),
+        time_h=snk_time_h("augustus_run_tm_pairwise_only"),
         job_id=lambda wildcards, attempt: f"augustus-parallel-tm-pairwise-{wildcards.genome}-{attempt}"
     run:
         run_augustus_parallel(
@@ -2717,7 +2823,8 @@ rule augustus_convert_tm_pairwise_gtf_to_gp:
         # Only run for genomes that have Augustus enabled
         genome = AUGUSTUS_GENOME_WC
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("augustus_convert_tm_pairwise_gtf_to_gp"),
+
         time_h=2,
         job_id=lambda wildcards, attempt: f"aug-convert-tm-pairwise-{wildcards.genome}-{attempt}"
     log:
@@ -2746,7 +2853,8 @@ rule augustus_convert_tmr_pairwise_gtf_to_gp:
         # Only run for genomes that have RNA-seq data
         genome = RNASEQ_GENOME_WC
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("augustus_convert_tmr_pairwise_gtf_to_gp"),
+
         time_h=2,
         job_id=lambda wildcards, attempt: f"aug-convert-tmr-pairwise-{wildcards.genome}-{attempt}"
     log:
@@ -2793,7 +2901,8 @@ rule miniprot_paf_to_genepred:
     log:
         f"{config['work_dir']}/logs/miniprot_to_gp/{{genome}}.log"
     resources:
-        mem_gb=8,
+        mem_gb=snk_mem_gb("miniprot_paf_to_genepred"),
+
         time_h=2,
         job_id=lambda wildcards, attempt: f"mp-to-gp-{wildcards.genome}-{attempt}"
     params:
@@ -2837,8 +2946,8 @@ rule augustus_run_mp:
         utr=1 if config.get('predict_utr') else 0
     threads: 1 if IS_CLUSTER else get_local_res("augustus_run_mp", "threads")
     resources:
-        mem_gb=4 if IS_CLUSTER else get_local_res("augustus_run_mp", "mem_gb"),
-        time_h=12 if IS_CLUSTER else get_local_res("augustus_run_mp", "time_h"),
+        mem_gb=snk_mem_gb("augustus_run_mp"),
+        time_h=snk_time_h("augustus_run_mp"),
         job_id=lambda wildcards, attempt: f"augustus-mp-{wildcards.genome}-{attempt}"
     log:
         f"{config['work_dir']}/logs/augustus_mp/{{genome}}.log"
@@ -2959,7 +3068,8 @@ rule augustus_convert_mp_gtf_to_gp:
     log:
         f"{config['work_dir']}/logs/augustus_convert/{{genome}}_augMP.log"
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("augustus_convert_mp_gtf_to_gp"),
+
         time_h=2,
         job_id=lambda wildcards, attempt: f"aug-convert-mp-{wildcards.genome}-{attempt}"
     shell:
@@ -2987,8 +3097,8 @@ rule fix_augmp_gene_names:
     log:
         f"{config['work_dir']}/logs/fix_augmp_gene_names/{{genome}}.log"
     resources:
-        mem_gb=4,
-        time_h=1,
+        mem_gb=snk_mem_gb("fix_augmp_gene_names"),
+        time_h=snk_time_h("fix_augmp_gene_names"),
         job_id=lambda wildcards, attempt: f"fix-augmp-{wildcards.genome}-{attempt}"
     shell:
         """
@@ -3023,8 +3133,8 @@ rule run_augustus_pb:
         f"{config['work_dir']}/logs/augustus_pb/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("run_augustus_pb", "threads")
     resources:
-        mem_gb=4 if IS_CLUSTER else get_local_res("run_augustus_pb", "mem_gb"),
-        time_h=12 if IS_CLUSTER else get_local_res("run_augustus_pb", "time_h"),
+        mem_gb=snk_mem_gb("run_augustus_pb"),
+        time_h=snk_time_h("run_augustus_pb"),
         job_id=lambda wildcards, attempt: f"augustus-pb-parallel-{wildcards.genome}-{attempt}"
     run:
         # Create temporary work directory for this genome
@@ -3075,8 +3185,8 @@ rule convert_stringtie_to_strg:
         f"{config['work_dir']}/logs/stringtie_run/{{genome}}_strg_convert.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_convert", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("stringtie_convert", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("stringtie_convert", "time_h"),
+        mem_gb=snk_mem_gb("stringtie_convert"),
+        time_h=snk_time_h("stringtie_convert"),
         job_id=lambda wildcards, attempt: f"strg-convert-{wildcards.genome}-{attempt}"
     run:
         work_dir = config['work_dir']
@@ -3100,7 +3210,7 @@ python -m cat.convert_stringtie_to_augpb_format {input.temp_gtf} {output.gtf} >>
                 [output.gtf],
                 log_file,
                 "stringtie_convert",
-                max_wait_s=3 * 3600,
+                max_wait_s=timeout_s("stringtie_convert"),
             )
 
 rule convert_strg_gtf_to_gp:
@@ -3115,8 +3225,8 @@ rule convert_strg_gtf_to_gp:
         f"{config['work_dir']}/logs/stringtie_run/{{genome}}_strg_gp.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_gp", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("stringtie_gp", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("stringtie_gp", "time_h"),
+        mem_gb=snk_mem_gb("stringtie_gp"),
+        time_h=snk_time_h("stringtie_gp"),
         job_id=lambda wildcards, attempt: f"strg-gp-{wildcards.genome}-{attempt}"
     run:
         work_dir = config['work_dir']
@@ -3145,7 +3255,7 @@ fi
                 [output.gp],
                 log_file,
                 "stringtie_gp",
-                max_wait_s=3 * 3600,
+                max_wait_s=timeout_s("stringtie_gp"),
             )
 
 def get_denovo_gp(wildcards):
@@ -3201,8 +3311,8 @@ rule find_denovo_parents:
         f"{config['work_dir']}/logs/find_denovo_parents/{{genome}}_{{mode}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("find_denovo_parents", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("find_denovo_parents", "mem_gb"),
-        time_h=24,
+        mem_gb=snk_mem_gb("find_denovo_parents"),
+        time_h=snk_time_h("find_denovo_parents"),
         job_id=lambda wildcards, attempt: f"parents-{wildcards.genome}-{wildcards.mode}-{attempt}"
     shell:
         """
@@ -3328,8 +3438,8 @@ rule align_transcripts:
         f"{config['work_dir']}/logs/align_transcripts/{{genome}}_{{alignment_mode}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("align_transcripts", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("align_transcripts", "mem_gb"),
-        time_h=24,
+        mem_gb=snk_mem_gb("align_transcripts"),
+        time_h=snk_time_h("align_transcripts"),
         job_id=lambda wildcards, attempt: f"align-{wildcards.genome}-{wildcards.alignment_mode}-{attempt}"
     shell:
         r"""
@@ -3423,8 +3533,8 @@ rule evaluate_transcripts:
         f"{config['work_dir']}/logs/evaluate_transcripts/{{genome}}_{{alignment_mode}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("evaluate_transcripts", "threads")
     resources:
-        mem_gb=16 if IS_CLUSTER else get_local_res("evaluate_transcripts", "mem_gb"),
-        time_h=24,
+        mem_gb=snk_mem_gb("evaluate_transcripts"),
+        time_h=snk_time_h("evaluate_transcripts"),
         job_id=lambda wildcards, attempt: f"eval-{wildcards.genome}-{wildcards.alignment_mode}-{attempt}"
     shell:
         """
@@ -3485,7 +3595,8 @@ rule aggregate_evaluations:
     wildcard_constraints:
         genome=ANNOTATION_GENOME_WC,
     resources:
-        mem_gb=128,
+        mem_gb=snk_mem_gb("aggregate_evaluations"),
+
         time_h=1,
         job_id=lambda wildcards, attempt: f"agg-eval-{wildcards.genome}-{attempt}"
     shell:
@@ -3799,8 +3910,8 @@ rule generate_consensus:
         f"{config['work_dir']}/logs/consensus/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("generate_consensus", "threads")
     resources:
-        mem_gb=1 if IS_CLUSTER else get_local_res("generate_consensus", "mem_gb"),
-        time_h=1 if IS_CLUSTER else get_local_res("generate_consensus", "time_h"),
+        mem_gb=snk_mem_gb("generate_consensus"),
+        time_h=snk_time_h("generate_consensus"),
         job_id=lambda wildcards, attempt: f"consensus-submit-{wildcards.genome}-{attempt}"
     run:
         import os
@@ -3937,7 +4048,7 @@ python -m cat.consensus_runner \\
                 [output.gp, output.metrics_json],
                 log_file,
                 "generate_consensus",
-                max_wait_s=43200
+                max_wait_s=timeout_s("generate_consensus")
             )
 
             # Post-submission stability check (cluster mode only): wait for output
@@ -3995,8 +4106,8 @@ rule annotate_novel_genes:
         f"{config['work_dir']}/logs/consensus/{{genome}}_novel_annotation.log"
     threads: 1 if IS_CLUSTER else get_local_res("annotate_novel_genes", "threads")
     resources:
-        mem_gb  = 1 if IS_CLUSTER else get_local_res("annotate_novel_genes", "mem_gb"),
-        time_h  = 1 if IS_CLUSTER else get_local_res("annotate_novel_genes", "time_h"),
+        mem_gb=snk_mem_gb("annotate_novel_genes"),
+        time_h=snk_time_h("annotate_novel_genes"),
         job_id  = lambda wildcards, attempt: f"novel-annot-submit-{wildcards.genome}-{attempt}"
     run:
         import os
@@ -4056,7 +4167,7 @@ echo "End time: $(date)"
                 [output.gff3, output.gp_info, output.gp, output.metrics_json],
                 log_file,
                 "annotate_novel_genes",
-                max_wait_s=7200
+                max_wait_s=timeout_s("annotate_novel_genes")
             )
 
 
@@ -4073,7 +4184,8 @@ rule generate_plots:
     log:
         str(WORK_DIR / "logs/consensus/generate_plots.log")
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("generate_plots"),
+
         time_h=1,
         job_id="generate-plots"
     run:
@@ -4125,7 +4237,8 @@ rule gene_family_report:
     log:
         str(WORK_DIR / "logs/consensus/gene_family_report.log")
     resources:
-        mem_gb=16,
+        mem_gb=snk_mem_gb("gene_family_report"),
+
         time_h=1,
         job_id="gene-family-report"
     params:
@@ -4154,7 +4267,8 @@ rule finish_pipeline:
     output:
         str(WORK_DIR / "pipeline.complete.done")
     resources:
-        mem_gb=1,
+        mem_gb=snk_mem_gb("finish_pipeline"),
+
         time_h=1,
         job_id="finish-pipeline"
     run:
@@ -4172,7 +4286,8 @@ rule cleanup_logs_and_done_files:
     output:
         str(WORK_DIR / "cleanup.complete")
     resources:
-        mem_gb=1,
+        mem_gb=snk_mem_gb("cleanup_logs_and_done_files"),
+
         time_h=1,
         job_id="cleanup-logs-done"
     shell:
