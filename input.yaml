@@ -222,7 +222,7 @@ ancestor_modes: ["transMap", "transMap_pairwise", "txTM"]
 #             / hints_db process chunks via multiprocessing instead of job
 #             arrays. Best for small inputs or when no supported scheduler is
 #             available; resource hints come from the `local:` block below.
-execution_mode: "auto"
+execution_mode: "slurm"
 
 # ─── SGE-specific knobs (used when execution_mode: sge) ──────────────────────
 # Site-agnostic Grid Engine config. The CAT2 pipeline reads these once at
@@ -239,7 +239,7 @@ execution_mode: "auto"
 cluster:
   sge:
     queue: "all.q"           # default queue; mapped from per-rule "partition" overrides too
-    parallel_env: "smp"      # PE used for #$ -pe; varies by site: smp / threaded / openmp / mpi
+    parallel_env: "serial"   # PE used for #$ -pe; serial / smp / threaded / openmp
     memory_flag: "h_vmem"    # per-slot memory resource: h_vmem / mem_free / s_vmem
     hostname_exclude: ""     # SGE form ("!h1&!h2"); a comma list is auto-converted
     module_load: ""          # `module load` line inserted at top of every job script
@@ -250,16 +250,20 @@ cluster:
 # `mem` / `cpus` / `time` and are read regardless of execution_mode (SLURM and
 # SGE both honour them; local mode uses the `local:` block further down).
 slurm:
-  # SLURM partition to submit to. Must exist on your cluster; set to "" to use
-  # the cluster's default partition. Ignored on SGE (uses cluster.sge.queue).
+  # SLURM partition to submit to. Empty = cluster default. Ignored on SGE
+  # (uses cluster.sge.queue). Set this to a real partition name at your site.
   partition: "medium"
-  # Optional, site-specific: nodes to avoid (comma list). Safe to set to "".
-  # The value below is specific to the UCSC phoenix cluster — change/clear it.
-  exclude_nodes: "phoenix-22,phoenix-23,phoenix-24,phoenix-09,phoenix-10"
+  # Optional host exclude list (comma-separated). Leave empty unless needed.
+  exclude_nodes: ""
   # Optional: module to load at the top of every cluster job script.
   # Set to "" or omit to skip module loading.
   # Per-rule resource overrides. Absent keys fall back to built-in defaults.
-  # mem: string like "128G"; cpus: int; time: "HH:MM:SS"
+  # Tune cores/memory here:
+  #   mem / cpus              — cluster job request (sbatch/qsub) for submitter rules
+  #   controller_mem_gb       — Snakemake mem for localrules / waiting wrappers
+  #   minisplice_cpus/mem     — nested minisplice array jobs under run_miniprot
+  #   hints_mem / jobs_mem / transcripts_mem — Augustus nested stages
+  # time / timeout_hours / concurrency keys are optional site knobs.
   rules:
     prepare_genome_files:
       mem:   "128G"
@@ -277,6 +281,14 @@ slurm:
       mem:   "16G"
       cpus:  1
       time:  "01:00:00"
+    transmap_filter:
+      mem:   "8G"
+      cpus:  1
+      controller_mem_gb: 8
+    transmap_evaluate:
+      mem:   "8G"
+      cpus:  1
+      controller_mem_gb: 8
     minimap2_bam:
       mem:   "64G"
       cpus:  32
@@ -289,6 +301,10 @@ slurm:
       mem:   "16G"
       cpus:  4
       time:  "01:00:00"
+    transmap_pairwise_filter:
+      mem:   "8G"
+      cpus:  1
+      controller_mem_gb: 8
     run_chaining_per_genome:
       mem:   "128G"
       cpus:  64
@@ -304,6 +320,10 @@ slurm:
       minisplice_mem: "8G"
       minisplice_time: "01:00:00"
       minisplice_max_concurrent: 25
+    miniprot_paf_to_genepred:
+      mem:   "8G"
+      cpus:  1
+      controller_mem_gb: 8
     run_txTM:
       mem:   "128G"
       cpus:  64
@@ -312,6 +332,10 @@ slurm:
       mem:   "128G"
       cpus:  32
       time:  "12:00:00"
+    annotate_novel_genes:
+      mem:   "32G"
+      cpus:  16
+      time:  "02:00:00"
     generate_hints:
       mem:   "256G"
       cpus:  128
@@ -330,17 +354,117 @@ slurm:
       time:  "01:00:00"
       max_concurrent_jobs: 20
       chunk_size: 500
+      controller_mem_gb: 16
     find_denovo_parents:
       mem:   "32G"
       cpus:  1
       time:  "01:00:00"
       max_concurrent_jobs: 20
+    stringtie_merge:
+      mem:   "16G"
+      cpus:  8
+      time:  "04:00:00"
+    stringtie_sort:
+      mem:   "64G"
+      cpus:  16
+      time:  "06:00:00"
+    stringtie_run:
+      mem:   "64G"
+      cpus:  16
+      time:  "12:00:00"
+    stringtie_convert:
+      mem:   "8G"
+      cpus:  2
+      time:  "02:00:00"
+    stringtie_gp:
+      mem:   "8G"
+      cpus:  2
+      time:  "02:00:00"
+    build_db:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    build_protein_db:
+      mem:   "4G"
+      cpus:  1
+      controller_mem_gb: 4
+    setup_pipeline_directories:
+      mem:   "2G"
+      cpus:  1
+      controller_mem_gb: 2
+    init_target_genome_database:
+      mem:   "1G"
+      cpus:  1
+      controller_mem_gb: 1
+    aggregate_evaluations:
+      mem:   "128G"
+      cpus:  1
+      controller_mem_gb: 128
+    generate_plots:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    gene_family_report:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    finish_pipeline:
+      mem:   "1G"
+      cpus:  1
+      controller_mem_gb: 1
+    cleanup_logs_and_done_files:
+      mem:   "1G"
+      cpus:  1
+      controller_mem_gb: 1
+    # Light Augustus post-steps (localrules)
+    augustus_extract_coding_gp:
+      mem:   "2G"
+      cpus:  1
+      controller_mem_gb: 2
+    augustus_extract_coding_gp_pairwise:
+      mem:   "2G"
+      cpus:  1
+      controller_mem_gb: 2
+    augustus_convert_tm_gtf_to_gp:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    augustus_convert_tmr_gtf_to_gp:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    augustus_convert_tm_pairwise_gtf_to_gp:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    augustus_convert_tmr_pairwise_gtf_to_gp:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    augustus_convert_mp_gtf_to_gp:
+      mem:   "16G"
+      cpus:  1
+      controller_mem_gb: 16
+    fix_augmp_gene_names:
+      mem:   "4G"
+      cpus:  1
+      controller_mem_gb: 4
+    # Augustus wrapper waiters (worker mem is under augustus_tm / augustus_pb)
+    augustus_run_tm_and_tmr:
+      controller_mem_gb: 4
+    augustus_run_tm_only:
+      controller_mem_gb: 4
+    augustus_run_tm_pairwise_and_tmr_pairwise:
+      controller_mem_gb: 4
+    augustus_run_tm_pairwise_only:
+      controller_mem_gb: 4
+    augustus_run_mp:
+      controller_mem_gb: 4
+    run_augustus_pb:
+      controller_mem_gb: 4
 
-    # ── Augustus parallel pipelines ─────────────────────────────────────
-    # augustus_parallel.py / augustus_pb_parallel.py run a 3-stage pipeline
-    # (preprocessing → hints/jobs → transcripts/jobs). Each stage has its
-    # own partition, memory, walltime, and concurrency cap. Defaults below
-    # match the historical values used at UCSC; override per-site as needed.
+    # ── Augustus parallel pipelines (nested worker jobs) ────────────────
+    # Tune per-stage memory here. Worker CPUs are 1 per array task.
     augustus_tm:
       preprocessing_partition: "medium"
       jobs_partition:          "medium"
