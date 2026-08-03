@@ -768,11 +768,14 @@ def build_minisplice_step(
     use_slurm_array,
     cpus,
 ):
-    """Return bash for minisplice predict, optionally one SLURM task per chromosome.
+    """Return bash for minisplice predict, optionally one cluster task per chromosome.
 
     ``cpus`` is the parent rule's allocated cores (cluster request or local
     Snakemake threads). Local parallel mode keeps concurrent chrom jobs within
     that budget.
+
+    ``use_slurm_array`` means "submit a nested cluster array from the parent
+    job" (historical name; works for SLURM and SGE).
     """
     parallel = get_res("run_miniprot", "minisplice_parallel")
     chrom_list = f"{work_dir}/miniprot/{genome}_minisplice_chroms.txt"
@@ -780,6 +783,7 @@ def build_minisplice_step(
     chrom_scores_dir = f"{work_dir}/miniprot/{genome}_minisplice_by_chrom"
     array_script = f"{work_dir}/miniprot/{genome}_minisplice_array.sh"
     cpus = max(1, int(cpus))
+    task_id_env = SCHEDULER.task_id_env()  # SLURM_ARRAY_TASK_ID or SGE_TASK_ID
 
     with open(chrom_sizes) as chrom_sizes_f:
         chroms = [line.split()[0] for line in chrom_sizes_f if line.strip()]
@@ -817,9 +821,10 @@ echo "minisplice predict completed" >> {log_path}
     minisplice_cpus = int(get_res("run_miniprot", "minisplice_cpus"))
     per_chrom_body = f"""
 set -euo pipefail
-CHROM=$(sed -n "${{SLURM_ARRAY_TASK_ID:-$1}}p" {chrom_list})
+TASK_ID="${{{task_id_env}:-${{SLURM_ARRAY_TASK_ID:-${{SGE_TASK_ID:-$1}}}}}}"
+CHROM=$(sed -n "${{TASK_ID}}p" {chrom_list})
 if [[ -z "$CHROM" ]]; then
-    echo "ERROR: no chromosome for task id ${{SLURM_ARRAY_TASK_ID:-$1}}" >&2
+    echo "ERROR: no chromosome for task id ${{TASK_ID}}" >&2
     exit 1
 fi
 mkdir -p {chrom_fa_dir} {chrom_scores_dir}
@@ -830,29 +835,57 @@ minisplice predict -t {minisplice_cpus} -c {minisplice_calibration} {minisplice_
 """
 
     if use_slurm_array:
+        # SGE array logs use $TASK_ID; SLURM uses %a. Emit both-compatible paths
+        # via scheduler-specific tokens where needed.
+        if SCHEDULER.name == "sge":
+            array_out = f"{work_dir}/logs/miniprot/{genome}_minisplice_$TASK_ID.out"
+            array_err = f"{work_dir}/logs/miniprot/{genome}_minisplice_$TASK_ID.err"
+        else:
+            array_out = f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.out"
+            array_err = f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.err"
         array_header = SCHEDULER.header(
             job_name=f"minisplice-{genome}",
             cpus=minisplice_cpus,
             mem=get_res("run_miniprot", "minisplice_mem"),
             walltime=get_res("run_miniprot", "minisplice_time"),
-            log_out=f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.out",
-            log_err=f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.err",
+            log_out=array_out,
+            log_err=array_err,
             partition=_slurm_partition("run_miniprot"),
+            queue=_slurm_partition("run_miniprot"),
             array=(1, num_chroms),
             max_concurrent=get_res("run_miniprot", "minisplice_max_concurrent"),
         )
         with open(array_script, "w") as array_script_f:
             array_script_f.write(array_header + per_chrom_body)
 
-        return f"""
-# Step 0: Run minisplice predict per chromosome (SLURM array)
-echo "Running minisplice predict on {num_chroms} chromosomes..." >> {log_path}
-mkdir -p {chrom_fa_dir} {chrom_scores_dir}
+        if SCHEDULER.name == "sge":
+            # Nested qsub from the parent SGE job; poll with qstat -j.
+            # Job id parsing matches cat.scheduler._QSUB_JOB_ID_RE.
+            submit_and_wait = f"""
+ARRAY_JOB=$(qsub {array_script} | sed -nE 's/.*Your[[:space:]]+(job|job-array)[[:space:]]+([0-9]+).*/\\2/p')
+if [[ -z "$ARRAY_JOB" ]]; then
+    echo "ERROR: failed to parse SGE job id from qsub of {array_script}" >> {log_path}
+    exit 1
+fi
+echo "Submitted minisplice array job $ARRAY_JOB ({num_chroms} tasks)" >> {log_path}
+while qstat -j "$ARRAY_JOB" &>/dev/null; do
+    sleep 30
+done
+"""
+        else:
+            submit_and_wait = f"""
 ARRAY_JOB=$(sbatch --parsable {array_script})
 echo "Submitted minisplice array job $ARRAY_JOB ({num_chroms} tasks)" >> {log_path}
 while squeue -h -j "$ARRAY_JOB" 2>/dev/null | grep -q .; do
     sleep 30
 done
+"""
+
+        return f"""
+# Step 0: Run minisplice predict per chromosome ({SCHEDULER.name} array)
+echo "Running minisplice predict on {num_chroms} chromosomes..." >> {log_path}
+mkdir -p {chrom_fa_dir} {chrom_scores_dir}
+{submit_and_wait}
 {merge_scores}
 """
 
