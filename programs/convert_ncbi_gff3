@@ -1,8 +1,20 @@
 #!/usr/bin/env python
-"""Developed against Rnor6 RefSeq"""
+"""Developed against Rnor6 RefSeq.
+
+Also used for vertebrate RefSeq GFF3. Symbolic
+transcript IDs such as NCBI tRNA names (trnaa-agc, trnaa-agc-2) are rewritten
+to GeneID-based IDs so transMapPslToGenePred's version stripping (treats
+trailing -N / .N as versions) cannot collide them.
+"""
 import argparse
+import re
 from BCBio import GFF
 from collections import Counter, OrderedDict
+
+
+# RefSeq / GenBank accessions — keep as transcript_id (version strip is OK).
+ACCESSION_RE = re.compile(r"^[A-Z]{1,3}_\d+(?:\.\d+)?$")
+TYPE_PREFIXES = {"rna", "exon", "cds", "gene", "id"}
 
 
 def parse_args():
@@ -13,6 +25,7 @@ def parse_args():
 
 
 def get_unique_id(i, c, update_id=True):
+    """Uniquify accession-style IDs with .N (intentional version form)."""
     if i not in c:
         c[i] = 0
         return i
@@ -21,6 +34,33 @@ def get_unique_id(i, c, update_id=True):
     if c[i] > 0:
         return f"{i}.{c[i]}"
     return i
+
+
+def allocate_symbolic_tx_id(base, c, update_id=True):
+    """Uniquify non-accession IDs with _vN (NOT .N / -N).
+
+    transMapPslToGenePred strips trailing .N / -N as versions and then looks up
+    the base name, so trnaa-agc-2 collides with trnaa-agc. Underscore suffixes
+    do not trigger that path.
+    """
+    if base not in c:
+        c[base] = 1
+        return base
+    if update_id:
+        c[base] += 1
+    n = c[base]
+    return base if n == 1 else f"{base}_v{n}"
+
+
+def normalize_raw_tx_id(raw):
+    """Strip NCBI type prefixes (rna-, exon-, ...) but keep accessions intact."""
+    if ACCESSION_RE.match(raw):
+        return raw
+    if '-' in raw:
+        prefix, rest = raw.split('-', 1)
+        if prefix.lower() in TYPE_PREFIXES:
+            return rest
+    return raw
 
 
 def add_tags_to_feature(feature, noid_count, tx_counts, gene_counts, parent_feature=None):
@@ -48,17 +88,23 @@ def add_tags_to_feature(feature, noid_count, tx_counts, gene_counts, parent_feat
         return
     feature.qualifiers['gene_id'] = [get_unique_id(ids['GeneID'], gene_counts, update_id=False)]
     feature.qualifiers['gene_name'] = feature.qualifiers.get('gene', feature.qualifiers.get('product', feature.qualifiers['gene_id']))
-    # Get transcript_id, falling back to ID, then Parent if neither exists
-    tx_id = feature.qualifiers.get('transcript_id', feature.qualifiers.get('ID', feature.qualifiers.get('Parent')))[0]
-    if '-' in tx_id:
-        tx_id = tx_id.split('-', 1)[1]
-    if feature.type not in ['CDS', 'exon']:
-        # is a transcript; check for uniqueness
-        tx_id = get_unique_id(tx_id, tx_counts)
+    gene_id = feature.qualifiers['gene_id'][0]
+
+    raw = feature.qualifiers.get('transcript_id', feature.qualifiers.get('ID', feature.qualifiers.get('Parent')))[0]
+    tx_id = normalize_raw_tx_id(raw)
+    is_transcript = feature.type not in ['CDS', 'exon']
+
+    if ACCESSION_RE.match(tx_id):
+        # Keep RefSeq accessions; .N uniquifier / version strip is fine here.
+        tx_id = get_unique_id(tx_id, tx_counts, update_id=is_transcript)
     else:
-        tx_id = get_unique_id(tx_id, tx_counts, update_id=False)
+        # Symbolic names (tRNA, etc.): GeneID-based to avoid version-strip collisions.
+        tx_id = allocate_symbolic_tx_id(f"gid{gene_id}", tx_counts, update_id=is_transcript)
+
     feature.qualifiers['transcript_id'] = [tx_id]
-    feature.qualifiers['transcript_name'] = feature.qualifiers.get('Name', feature.qualifiers['transcript_id'])
+    # Keep a human-readable name when NCBI provided one.
+    pretty = feature.qualifiers.get('Name', feature.qualifiers.get('gene', [tx_id]))
+    feature.qualifiers['transcript_name'] = pretty if pretty else [tx_id]
     # figure out gene biotype
     if 'gene_biotype' in parent_feature.qualifiers:
         gene_biotype = parent_feature.qualifiers['gene_biotype']
@@ -121,8 +167,8 @@ def add_gene_level_transcript_tags(gene_feature, tx_counts):
     """gff3ToGenePred treats gene-only models (exon/CDS under gene) as transcripts."""
     if 'transcript_id' in gene_feature.qualifiers:
         return
-    gene_label = gene_feature.qualifiers.get('gene', gene_feature.qualifiers.get('gene_name'))[0]
-    tx_id = get_unique_id(gene_label, tx_counts, update_id=False)
+    gene_id = gene_feature.qualifiers['gene_id'][0]
+    tx_id = allocate_symbolic_tx_id(f"gid{gene_id}", tx_counts, update_id=False)
     biotype = gene_feature.qualifiers.get('gene_biotype', ['pseudogene'])
     gene_feature.qualifiers['transcript_id'] = [tx_id]
     gene_feature.qualifiers['transcript_name'] = [tx_id]
