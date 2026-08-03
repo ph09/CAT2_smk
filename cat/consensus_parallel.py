@@ -3865,8 +3865,30 @@ def load_transmap_evals(db_path):
 
 
 def load_metrics_from_db(db_path, tx_mode, aln_mode):
-    session = tools.sqlInterface.start_session(db_path)
     metrics_table = tools.sqlInterface.tables[aln_mode][tx_mode]['metrics']
+    table_name = metrics_table.__tablename__
+    # Fail fast with an actionable message when evaluate_transcripts never
+    # wrote this table (stale evaluation.done after DB recreate, or a raced
+    # write). Missing table used to surface as a raw sqlite OperationalError.
+    import sqlite3
+    with sqlite3.connect(db_path) as _con:
+        exists = _con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+    if not exists:
+        genome = os.path.basename(db_path).replace(".db", "")
+        work_dir = os.path.dirname(os.path.dirname(os.path.abspath(db_path)))
+        raise RuntimeError(
+            f"Missing metrics table {table_name!r} in {db_path} "
+            f"(needed for consensus mode {tx_mode!r}/{aln_mode!r}). "
+            f"Re-run evaluation for this genome:\n"
+            f"  rm -f {work_dir}/logs/{genome}_evaluation.done\n"
+            f"  snakemake --configfile <your.yaml> "
+            f"{work_dir}/logs/{genome}_evaluation.done"
+        )
+
+    session = tools.sqlInterface.start_session(db_path)
     metrics_df = tools.sqlInterface.load_metrics(metrics_table, session)
     # Empty metrics table: txTM/transMap_pairwise/augTM_pairwise/etc.
     # legitimately produce zero rows on small or pairwise-disabled genomes.
