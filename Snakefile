@@ -791,12 +791,13 @@ def build_minisplice_step(
 
     num_chroms = len(chroms)
     merge_scores = f"""
-# Merge per-chromosome splice scores (order matches chrom.sizes)
+# Merge per-chromosome splice scores (order matches chrom.sizes).
+# Empty .tsv is OK: minisplice can exit 0 with no sites on short/simple contigs.
 : > {splice_scores_out}
 while read -r chrom _rest; do
     [[ -z "$chrom" ]] && continue
     chrom_tsv="{chrom_scores_dir}/${{chrom}}.tsv"
-    if [[ ! -s "$chrom_tsv" ]]; then
+    if [[ ! -f "$chrom_tsv" ]]; then
         echo "ERROR: missing minisplice scores for $chrom" >> {log_path}
         exit 1
     fi
@@ -1154,8 +1155,11 @@ echo "Job ID: ${{SLURM_JOB_ID:-${{JOB_ID:-$$}}}}"
 echo "Node: $(hostname)"
 echo "Start time: $(date)"
 
-# Convert GFF3 to GenePred with attributes
+# Convert GFF3 to GenePred with attributes.
+# -refseqHacks / -honorStartStopCodons required for NCBI-style cleaned GFF3
+# (keeps lncRNA / pseudogene / guide_RNA models that plain gff3ToGenePred drops).
 gff3ToGenePred -rnaNameAttr=transcript_id -geneNameAttr=gene_id \\
+    -honorStartStopCodons -refseqHacks \\
     -attrsOut={output.attrs} {input.gff3} {output.gp} 2>> {log[0]}
 
 # Generate GTF from GenePred
@@ -3502,7 +3506,10 @@ rule evaluate_transcripts:
         target_fasta=f"{config['work_dir']}/genome_files/{{genome}}.fa",
         gp=get_gp_path_for_mode,
         mrna_psl=f"{config['work_dir']}/transcript_alignment/{{genome}}_{{alignment_mode}}_mRNA.psl",
-        cds_psl=f"{config['work_dir']}/transcript_alignment/{{genome}}_{{alignment_mode}}_CDS.psl"
+        cds_psl=f"{config['work_dir']}/transcript_alignment/{{genome}}_{{alignment_mode}}_CDS.psl",
+        # Shared mutable DB container: require it to exist, but do not use mtime
+        # as a rerun trigger (many rules write into it).
+        db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
     output:
         # Create a done file for each mode to signal completion
         done_file=temp(f"{config['work_dir']}/databases/{{genome}}_{{alignment_mode}}_evaluation.done"),
@@ -3512,7 +3519,6 @@ rule evaluate_transcripts:
         alignment_mode=f"({'|'.join(ALL_ALIGNMENT_MODES)})"
     params:
         script="cat.classify_cluster" if IS_CLUSTER else "cat.classify",
-        db_path=f"{config['work_dir']}/databases/{{genome}}.db",
         ref_db_path=f"{config['work_dir']}/databases/{config['ref_genome']}.db",
         mode_file_args=lambda w, input: f"{w.alignment_mode} {input.gp} {input.mrna_psl} {input.cds_psl}",
         cluster_args=(
@@ -3542,7 +3548,7 @@ rule evaluate_transcripts:
             --annotation-gp {input.ref_gp} \\
             --ref-db-path {params.ref_db_path} \\
             --fasta {input.target_fasta} \\
-            --db-path {params.db_path} \\
+            --db-path {input.db_path} \\
             --resolved-df {output.resolved_df} \\
             --mode-files {params.mode_file_args} \\
             {params.cluster_args}
@@ -3551,20 +3557,20 @@ rule evaluate_transcripts:
 import pandas as pd
 import os
 from tools.sqlite import ExclusiveSqlConnection
-genome_db = "{params.db_path}"
+genome_db = "{input.db_path}"
 pickle_file = "{output.resolved_df}"
 
-# Check if pickle file exists before trying to read it
 if not os.path.exists(pickle_file):
     print(f"Error: Pickle file {{pickle_file}} does not exist")
     exit(1)
 
 try:
     results = pd.read_pickle(pickle_file)
-    for table_name, df in results:
-        # Always write the table so it exists even when empty (consensus expects all evaluation tables).
-        with ExclusiveSqlConnection(genome_db) as engine:
-            df.to_sql(table_name, engine, if_exists="replace", index=True)
+    # One exclusive lock for all tables from this mode so concurrent evaluate
+    # jobs cannot interleave mid-write and leave the DB missing a metrics table.
+    with ExclusiveSqlConnection(genome_db) as con:
+        for table_name, df in results:
+            df.to_sql(table_name, con, if_exists="replace", index=True)
 except Exception as e:
     print(f"Error processing pickle file {{pickle_file}}: {{e}}")
     exit(1)
