@@ -3544,6 +3544,7 @@ rule evaluate_transcripts:
         job_id=lambda wildcards, attempt: f"eval-{wildcards.genome}-{wildcards.alignment_mode}-{attempt}"
     shell:
         """
+        (
         python -m {params.script} \\
             --annotation-gp {input.ref_gp} \\
             --ref-db-path {params.ref_db_path} \\
@@ -3556,7 +3557,7 @@ rule evaluate_transcripts:
         python3 - <<PY
 import pandas as pd
 import os
-from tools.sqlite import ExclusiveSqlConnection
+from tools.sqlite import write_dataframes
 genome_db = "{input.db_path}"
 pickle_file = "{output.resolved_df}"
 
@@ -3566,16 +3567,16 @@ if not os.path.exists(pickle_file):
 
 try:
     results = pd.read_pickle(pickle_file)
-    # One exclusive lock for all tables from this mode so concurrent evaluate
-    # jobs cannot interleave mid-write and leave the DB missing a metrics table.
-    with ExclusiveSqlConnection(genome_db) as con:
-        for table_name, df in results:
-            df.to_sql(table_name, con, if_exists="replace", index=True)
+    # Flock + one exclusive transaction for all tables from this mode. pandas
+    # to_sql commits per table and would otherwise release the lock mid-replace
+    # when concurrent evaluate jobs hit the same genome DB.
+    write_dataframes(genome_db, results)
 except Exception as e:
     print(f"Error processing pickle file {{pickle_file}}: {{e}}")
     exit(1)
 PY
         touch {output.done_file}
+        ) > {log} 2>&1
         """
 
 def get_evaluation_done_inputs(wildcards):
