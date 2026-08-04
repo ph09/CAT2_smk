@@ -742,11 +742,38 @@ else
 fi
 """
 
+def _conda_activate_bash():
+    """Bash snippet that activates the controller's conda env inside a cluster job.
+
+    SGE/SLURM ``-V`` / env propagation alone is unreliable: compute nodes often
+    end up with system ``python3`` on PATH, which then fails on conda-only
+    imports (e.g. ``bx``). Explicitly re-activate here. Runs *before*
+    ``set -u`` so conda's init scripts are safe.
+    """
+    env = (
+        os.environ.get("CONDA_DEFAULT_ENV")
+        or config.get("conda_env")
+        or "cat2"
+    )
+    return f"""
+# Re-activate conda (do not rely on #$ -V / --export alone for PATH).
+if [ -n "${{CONDA_EXE:-}}" ] && [ -f "$(dirname "$(dirname "$CONDA_EXE")")/etc/profile.d/conda.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$(dirname "$(dirname "$CONDA_EXE")")/etc/profile.d/conda.sh"
+elif [ -f "${{HOME}}/miniconda3/etc/profile.d/conda.sh" ]; then
+  # shellcheck source=/dev/null
+  source "${{HOME}}/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "${{HOME}}/mambaforge/etc/profile.d/conda.sh" ]; then
+  # shellcheck source=/dev/null
+  source "${{HOME}}/mambaforge/etc/profile.d/conda.sh"
+fi
+conda activate {shlex.quote(env)}
+export PATH="${{CONDA_PREFIX}}/bin:$PATH:{CAT2_STANDALONES}"
+"""
+
 def build_sbatch_header(rule_name, job_name, log_out, log_err):
     """Backend-agnostic scheduler header for a job script.
     """
-    # Append standalones after the submitter PATH (same precedence as cat/transcript_map.py).
-    path_line = f'export PATH="$PATH:{CAT2_STANDALONES}"\n'
     return SCHEDULER.header(
         job_name=job_name,
         cpus=get_res(rule_name, 'cpus'),
@@ -756,7 +783,7 @@ def build_sbatch_header(rule_name, job_name, log_out, log_err):
         log_err=log_err,
         partition=_slurm_partition(rule_name),
         queue=_slurm_partition(rule_name),
-    ) + path_line + f"cd {CAT2_ROOT}\n" + "set -euo pipefail\n"
+    ) + _conda_activate_bash() + f"cd {CAT2_ROOT}\n" + "set -euo pipefail\n"
 
 def build_minisplice_step(
     *,
