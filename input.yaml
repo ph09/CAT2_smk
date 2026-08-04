@@ -144,7 +144,8 @@ high_recall: false
 global_near_best: 0.15
 # tm_filter_overlapping: collapse overlapping paralogous genes (false keeps more).
 # tm_min_cover / tm_min_span: pslCDnaFilter floors (lower keeps more, default 0.1/0.2).
-# tm_max_ref_span: drop alignments spanning > N x the reference (default 5).
+# tm_max_ref_span: drop alignments/transcripts spanning > N x the reference
+# (default 5). Also applied in align_transcripts before parasail.
 # tm_paralog_rescue_min_coverage: rescue collapse victims above this cov (default 0.5).
 #tm_filter_overlapping: true
 #tm_min_cover: 0.1
@@ -472,6 +473,7 @@ slurm:
       hints_mem:               "64G"
       jobs_mem:                "16G"
       transcripts_mem:         "16G"
+      setup_mem:               "16G"   # setup/joblist; omit to inherit jobs_mem
       setup_time:              "04:00:00"
       hints_time:              "12:00:00"
       jobs_time:               "04:00:00"
@@ -486,6 +488,7 @@ slurm:
       hints_mem:               "64G"
       jobs_mem:                "16G"
       transcripts_mem:         "16G"
+      setup_mem:               "16G"   # setup/joblist; omit to inherit jobs_mem
       setup_time:              "04:00:00"
       hints_time:              "12:00:00"
       jobs_time:               "04:00:00"
