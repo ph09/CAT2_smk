@@ -267,10 +267,14 @@ class ParallelAugustusPB:
         """Create cluster job script for initial setup (genome splitting and chr.lst creation)."""
         logger.info("Creating cluster script for initial setup (genome splitting and chr.lst)...")
 
+        setup_mem = (
+            getattr(self.args, 'slurm_setup_mem', None)
+            or getattr(self.args, 'slurm_jobs_mem', '16G')
+        )
         header = self._scheduler.header(
             job_name="augPB_setup",
             cpus=1,
-            mem="16G",
+            mem=setup_mem,
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augPB_setup_%j.out",
             log_err=f"{self.temp_dir}/augPB_setup_%j.err",
@@ -385,10 +389,14 @@ echo "Wrote hints: {self.temp_dir}/${{CHROM}}_hints.gff"
         logger.info("Creating cluster script for PB job list generation...")
 
         dependency = self._scheduler.depends_on_job_id(dependency_job_id) if dependency_job_id else None
+        setup_mem = (
+            getattr(self.args, 'slurm_setup_mem', None)
+            or getattr(self.args, 'slurm_jobs_mem', '16G')
+        )
         header = self._scheduler.header(
             job_name="augPB_joblist",
             cpus=1,
-            mem="16G",
+            mem=setup_mem,
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augPB_joblist_%j.out",
             log_err=f"{self.temp_dir}/augPB_joblist_%j.err",
@@ -1027,6 +1035,8 @@ def main():
                        help="Memory per hints generation SLURM task. Default: 8G.")
     parser.add_argument("--slurm_jobs_mem", default="32G",
                        help="Memory per Augustus PB execution SLURM task. Default: 32G.")
+    parser.add_argument("--slurm_setup_mem", default="",
+                       help="Memory for setup/joblist jobs. Empty = use --slurm_jobs_mem.")
     parser.add_argument("--slurm_setup_time", default="04:00:00",
                        help="Time limit for setup and joblist SLURM jobs. Default: 04:00:00.")
     parser.add_argument("--slurm_hints_time", default="04:00:00",
