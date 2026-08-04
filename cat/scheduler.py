@@ -168,10 +168,23 @@ class Scheduler(ABC):
         lines: list[str] = []
         if conda_env:
             # Activate before strict mode to avoid unbound-variable errors from
-            # conda's init scripts (matches historical pattern).
-            lines.append("source ~/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true")
-            lines.append("source ~/.bashrc 2>/dev/null || true")
+            # conda's init scripts. Prefer CONDA_EXE (propagated with -V) so
+            # non-~/miniconda3 installs work on SGE compute nodes.
+            lines.append(
+                'if [ -n "${CONDA_EXE:-}" ] && '
+                '[ -f "$(dirname "$(dirname "$CONDA_EXE")")/etc/profile.d/conda.sh" ]; then\n'
+                '  # shellcheck source=/dev/null\n'
+                '  source "$(dirname "$(dirname "$CONDA_EXE")")/etc/profile.d/conda.sh"\n'
+                'elif [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then\n'
+                '  # shellcheck source=/dev/null\n'
+                '  source "${HOME}/miniconda3/etc/profile.d/conda.sh"\n'
+                'elif [ -f "${HOME}/mambaforge/etc/profile.d/conda.sh" ]; then\n'
+                '  # shellcheck source=/dev/null\n'
+                '  source "${HOME}/mambaforge/etc/profile.d/conda.sh"\n'
+                'fi'
+            )
             lines.append(f"conda activate {shlex.quote(conda_env)}")
+            lines.append('export PATH="${CONDA_PREFIX}/bin:$PATH"')
         if set_strict:
             lines.append("set -euo pipefail")
         if extra_env:
@@ -384,11 +397,10 @@ class SlurmScheduler(Scheduler):
         if module_load:
             lines.append("")
             lines.append(f"module load {module_load}")
-        # Jobs must not inherit a controller-specific PYTHONPATH. The snakemake
-        # controller may run under a different interpreter than the job bodies
-        # (e.g. system py3.10 for the controller vs. the conda py3.12 that runs
-        # cat/*.py); a leaked py3.10 site-packages breaks py3.12 C-extension
-        # imports such as pysam. Each job resolves its interpreter from PATH.
+        # Drop a leaked controller PYTHONPATH (wrong site-packages / py version).
+        # Conda packages themselves do NOT live on PYTHONPATH — jobs must still
+        # `conda activate` (see build_sbatch_header / script_preamble) so PATH
+        # points at the env's python. unset alone is not enough on SGE.
         lines.append("")
         lines.append("unset PYTHONPATH")
         lines.append("")
@@ -711,8 +723,8 @@ class SgeScheduler(Scheduler):
         if module_load:
             lines.append("")
             lines.append(f"module load {module_load}")
-        # See SlurmScheduler.header: do not inherit a controller-specific
-        # PYTHONPATH (note this runs even with `#$ -V` environment propagation).
+        # See SlurmScheduler.header: drop leaked PYTHONPATH; jobs must still
+        # conda-activate so PATH resolves to the env python (not system python3).
         lines.append("")
         lines.append("unset PYTHONPATH")
         lines.append("")
