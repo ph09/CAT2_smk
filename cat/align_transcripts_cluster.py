@@ -40,13 +40,27 @@ _HEAVY_SEQ_BP = 100_000
 
 
 def _mem_gb_for_chunks(chunks, base_mem_gb):
-    """Scale SLURM memory with the longest sequence in this batch."""
+    """Return configured memory; never exceed the YAML / CLI ceiling.
+
+    Heavy sequences are already isolated into one-pair chunks by
+    ``chunk_transcripts``. We used to raise requests to 128G/256G here, which
+    ignored ``slurm.rules.align_transcripts.mem`` and could leave jobs queued
+    forever on smaller clusters. Log a warning instead so operators can raise
+    the YAML limit if long transcripts actually OOM.
+    """
+    base = max(1, int(base_mem_gb))
     max_len = max(max(len(x[1]), len(x[3])) for chunk in chunks for x in chunk)
-    if max_len < _HEAVY_SEQ_BP:
-        return base_mem_gb
-    if max_len < 200_000:
-        return max(base_mem_gb, 128)
-    return max(base_mem_gb, 256)
+    if max_len >= 200_000 and base < 256:
+        logger.warning(
+            f"Longest aligned sequence is {max_len} bp but memory is capped at "
+            f"{base}G by config; raise slurm.rules.align_transcripts.mem if jobs OOM"
+        )
+    elif max_len >= _HEAVY_SEQ_BP and base < 128:
+        logger.warning(
+            f"Longest aligned sequence is {max_len} bp but memory is capped at "
+            f"{base}G by config; raise slurm.rules.align_transcripts.mem if jobs OOM"
+        )
+    return base
 
 
 def chunk_transcripts(seq_list, chunk_size=500):
@@ -105,14 +119,27 @@ def process_chunk_worker(chunk_file, output_file):
     return n
 
 
-def get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta, ref_genome_fasta, mode):
-    """Build (tx_id, tx_seq, ref_tx_id, ref_tx_seq) tuples for the given mode."""
+def get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta,
+                            ref_genome_fasta, mode, max_ref_span_ratio=5.0):
+    """Build (tx_id, tx_seq, ref_tx_id, ref_tx_seq) tuples for the given mode.
+
+    Drops targets whose genomic span exceeds ``max_ref_span_ratio`` × the
+    reference transcript span (same idea as ``filter_transmap.ref_span`` /
+    ``tm_max_ref_span``). Those are almost always chimeric / mis-spliced
+    junk and they dominate parasail memory.
+    """
     assert mode in ['mRNA', 'CDS']
     sequences = []
+    dropped_span = 0
     for tx_id, tx in transcript_dict.items():
         ref_tx_id = tools.nameConversions.alignment_id_to_ref_transcript_id(tx_id)
         ref_tx = ref_transcript_dict.get(ref_tx_id)
         if ref_tx is None:
+            continue
+        ref_span = int(ref_tx.stop) - int(ref_tx.start)
+        tx_span = int(tx.stop) - int(tx.start)
+        if ref_span > 0 and max_ref_span_ratio > 0 and tx_span > ref_span * float(max_ref_span_ratio):
+            dropped_span += 1
             continue
         try:
             tx_seq = tx.get_mrna(genome_fasta) if mode == 'mRNA' else tx.get_cds(genome_fasta)
@@ -127,6 +154,11 @@ def get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta, 
         # Parasail behaves poorly on very short sequences.
         if len(ref_tx_seq) > 20 and len(tx_seq) > 20:
             sequences.append((tx_id, tx_seq, ref_tx_id, ref_tx_seq))
+    if dropped_span:
+        logger.info(
+            f"Dropped {dropped_span} {mode} transcripts with genomic span > "
+            f"{max_ref_span_ratio:g}× reference"
+        )
     return sequences
 
 
@@ -298,6 +330,7 @@ def run_cluster_alignment_pipeline(args):
             sequences = get_alignment_sequences(
                 transcript_dict, ref_transcript_dict,
                 genome_fasta, ref_genome_fasta, aln_mode,
+                max_ref_span_ratio=args.max_ref_span,
             )
 
             if not sequences:
@@ -333,11 +366,6 @@ def run_cluster_alignment_pipeline(args):
 
             num_chunks = len(chunks)
             mem_gb = _mem_gb_for_chunks(chunks, args.memory)
-            if mem_gb > args.memory:
-                logger.info(
-                    f"Raising array task memory from {args.memory}G to {mem_gb}G "
-                    f"(longest sequence in batch)"
-                )
             header = scheduler.header(
                 job_name=f"align_{tx_mode}_{aln_mode}",
                 cpus=args.cpus,
@@ -414,7 +442,7 @@ def main():
                         metavar=("MODE", "INPUT_GP", "MRNA_PSL", "CDS_PSL"))
 
     parser.add_argument("--execution-mode", choices=("auto", "slurm", "sge", "local"), default="auto")
-    parser.add_argument("--partition", default="high_priority",
+    parser.add_argument("--partition", default="",
                         help="SLURM partition or SGE queue.")
     parser.add_argument("--exclude-nodes", default="",
                         help=("Comma list (SLURM) or SGE-native '!h1&!h2' expression. "
@@ -428,6 +456,12 @@ def main():
     parser.add_argument("--max-jobs", type=int, default=50)
     parser.add_argument("--timeout-hours", type=int, default=12)
     parser.add_argument("--chunk-size", type=int, default=500)
+    parser.add_argument(
+        "--max-ref-span", type=float, default=5.0,
+        help=("Drop target transcripts whose genomic span exceeds this multiple "
+              "of the reference transcript span (default: 5; same as tm_max_ref_span). "
+              "Set <=0 to disable."),
+    )
     parser.add_argument("--cleanup", action="store_true")
 
     args = parser.parse_args()
