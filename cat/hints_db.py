@@ -2022,9 +2022,10 @@ def run_hints_pipeline_slurm(genome: str,
 
             successful_iso, failed_iso = run_parallel_isoseq_slurm(
                 iso_bams, iso_output_dir, logs_dir=logs_dir,
-                memory_gb=max(128, slurm_opts['memory_gb']),
-                cpus=max(64, slurm_opts['cpus']),
-                time_limit=max(slurm_opts['time_limit'], '12:00:00'),
+                # Cap to configured generate_hints resources (do not floor upward).
+                memory_gb=slurm_opts['memory_gb'],
+                cpus=slurm_opts['cpus'],
+                time_limit=slurm_opts['time_limit'],
                 partition=slurm_opts['partition'],
                 max_concurrent_jobs=slurm_opts['max_concurrent_jobs']
             )
@@ -2064,8 +2065,8 @@ def run_hints_pipeline_slurm(genome: str,
                 anno_hints_file = os.path.join(output_dir, 'annotation_hints.gff')
                 run_annotation_hints_slurm(
                     annotation_gp, anno_hints_file, logs_dir=logs_dir,
-                    memory_gb=64,  # Annotation processing needs less memory
-                    cpus=32,
+                    memory_gb=min(64, int(slurm_opts['memory_gb'])),
+                    cpus=min(32, int(slurm_opts['cpus'])),
                     time_limit='6:00:00',  # Annotation processing is faster
                     partition=slurm_opts['partition']
                 )
@@ -2101,8 +2102,8 @@ def run_hints_pipeline_slurm(genome: str,
             total_size_gb = sum(os.path.getsize(f) / (1024**3) for f in all_hints_files if os.path.exists(f))
             logger.info(f'Total hints data size: {total_size_gb:.2f} GB')
             
-            # Adjust resources based on data size
-            # For very large datasets, use more memory and CPUs for faster sorting
+            # Size-based suggestions, then hard-cap to generate_hints config.
+            # (Previously the "small" tier was still 64G/16 and ignored YAML.)
             if total_size_gb > 50:  # Large dataset
                 merge_memory = max(256, int(total_size_gb * 2))  # 2x data size
                 merge_cpus = 64
@@ -2115,6 +2116,16 @@ def run_hints_pipeline_slurm(genome: str,
                 merge_memory = 64
                 merge_cpus = 16
                 merge_time = "2:00:00"
+
+            cfg_mem = max(1, int(slurm_opts['memory_gb']))
+            cfg_cpus = max(1, int(slurm_opts['cpus']))
+            if merge_memory > cfg_mem or merge_cpus > cfg_cpus:
+                logger.info(
+                    f'Capping merge/sort resources from {merge_memory}G/{merge_cpus}c '
+                    f'to configured generate_hints {cfg_mem}G/{cfg_cpus}c'
+                )
+            merge_memory = min(merge_memory, cfg_mem)
+            merge_cpus = min(merge_cpus, cfg_cpus)
             
             logger.info(f'Using {merge_memory}GB RAM, {merge_cpus} CPUs for merge/sort')
             
