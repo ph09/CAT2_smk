@@ -232,7 +232,10 @@ execution_mode: "slurm"
 #
 # The per-rule mem / cpus / time still come from the `slurm:` block below,
 # so you can flip execution_mode between slurm and sge without touching the
-# resource numbers.
+# resource numbers. ``mem`` is always *total* job memory (same as SLURM
+# --mem). When memory_per_slot is true (default), CAT2 divides that total by
+# cpus before writing #$ -l h_vmem=... / mem_free=..., because those flags are
+# per-slot on most SGE sites. Example: mem 16G + cpus 4 -> h_vmem=4G x 4 slots.
 #
 # Tip: on first use at a new site, start with one small genome / one rule
 # (evaluate_transcripts is the simplest array exercise) to confirm
@@ -242,6 +245,7 @@ cluster:
     queue: "all.q"           # default queue; mapped from per-rule "partition" overrides too
     parallel_env: "serial"   # PE used for #$ -pe; serial / smp / threaded / openmp
     memory_flag: "h_vmem"    # per-slot memory resource: h_vmem / mem_free / s_vmem
+    memory_per_slot: true    # divide YAML mem by cpus (set false if mem is already per-slot)
     hostname_exclude: ""     # SGE form ("!h1&!h2"); a comma list is auto-converted
     module_load: ""          # `module load` line inserted at top of every job script
     extra_qsub_flags: []     # site-specific quirks (e.g. ["-P projectcode", "-l gpu=0"])
