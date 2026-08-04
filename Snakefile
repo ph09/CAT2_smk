@@ -1161,7 +1161,6 @@ rule prepare_reference_files:
         psl = WORK_DIR / f"reference/{REF_GENOME}.psl",
         duplicates = WORK_DIR / f"reference/{REF_GENOME}.duplicates.txt",
         db = WORK_DIR / f"databases/{REF_GENOME}.db",
-        gff3_db = WORK_DIR / f"reference/{REF_GENOME}.gff3_db",
         db_ready = WORK_DIR / f"databases/{REF_GENOME}.db.ready"
     threads: 1 if IS_CLUSTER else get_local_res("prepare_reference_files", "threads")
     resources:
@@ -1219,15 +1218,10 @@ genePredToFakePsl -chromSize={input.ref_sizes} noDB {output.gp} {output.psl} /de
     -attrsOut=/dev/null {input.gff3} /dev/stdout 2>/dev/null || true ) \\
 | awk '{{print $1}}' | sort | uniq -d > {output.duplicates} 2>> {log[0]}
 
-# Build the GFF3 sqlite db FIRST so the augmentation step can read it
-python3 - <<EOF 2>> {log[0]}
-import gffutils
-gffutils.create_db("{input.gff3}", "{output.gff3_db}",
-                   merge_strategy="create_unique", force=True)
-EOF
-
+# Recover gene-only GFF3 features (pseudogenes / ncRNA genes without transcript
+# children) as synthetic single-exon transcripts. Streams the GFF3 — no gffutils DB.
 python -m cat.augment_reference_for_lifting \\
-    --gff3-db   {output.gff3_db} \\
+    --gff3      {input.gff3} \\
     --ref-gp    {output.gp} \\
     --ref-fa    {output.transcript_fasta} \\
     --genome-fa {input.ref_fasta} \\
@@ -1238,13 +1232,12 @@ genePredToGtf file {output.gp} -utr -honorCdsStat -source=CAT {output.gtf} 2>> {
 genePredToBed {output.gp} {output.bed} 2>> {log[0]}
 genePredToFakePsl -chromSize={input.ref_sizes} noDB {output.gp} {output.psl} /dev/null 2>> {log[0]}
 
-# Create annotation database from the augmented GP + gp_attrs
+# Create annotation database from (possibly augmented) GP + gp_attrs
 python3 - <<EOF 2>> {log[0]}
 from tools.sqlInterface import Annotation
 from tools.sqlite import ExclusiveSqlConnection
 from tools.gff3 import parse_gff3
 
-# Parse and load annotation data
 df = parse_gff3("{output.attrs}", "{output.gp}")
 table = Annotation.__tablename__
 with ExclusiveSqlConnection("{output.db}") as engine:
@@ -1266,7 +1259,7 @@ echo "End time: $(date)"
                 job_script,
                 [output.gp, output.attrs, output.gtf, output.bed, output.transcript_fasta,
                  output.transcript_fasta_index, output.psl, output.duplicates, output.db,
-                 output.gff3_db, output.db_ready],
+                 output.db_ready],
                 log_file,
                 "prepare_reference_files",
                 max_wait_s=timeout_s("prepare_reference_files")
