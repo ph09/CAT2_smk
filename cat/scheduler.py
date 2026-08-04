@@ -584,6 +584,11 @@ class SgeScheduler(Scheduler):
         self.parallel_env: str = cfg.get("parallel_env", "smp")
         # h_vmem is most portable; some clusters require mem_free or s_vmem.
         self.memory_flag: str = cfg.get("memory_flag", "h_vmem")
+        # When True (default), YAML/SLURM-style ``mem`` is treated as *total*
+        # job memory and divided by ``cpus`` before writing #$ -l <flag>=...,
+        # because h_vmem / mem_free are per-slot on most SGE sites. Set False
+        # only if your YAML values are already per-slot.
+        self.memory_per_slot: bool = bool(cfg.get("memory_per_slot", True))
         self.hostname_exclude: str = cfg.get("hostname_exclude", "") or ""
         self.default_module_load: str = cfg.get("module_load", "") or ""
         self.extra_qsub_flags: list[str] = list(cfg.get("extra_qsub_flags", []) or [])
@@ -613,6 +618,28 @@ class SgeScheduler(Scheduler):
         hosts = [h.strip() for h in raw.split(",") if h.strip()]
         return "&".join(f"!{h}" for h in hosts)
 
+    @staticmethod
+    def _mem_for_slots(mem: str, cpus: int) -> str:
+        """Convert total job memory to a per-slot request (ceil division).
+
+        ``mem`` uses the same strings as SLURM ``--mem`` (e.g. ``16G``, ``512M``).
+        """
+        import math
+
+        cpus = max(1, int(cpus or 1))
+        s = str(mem).strip().upper()
+        if s.endswith("G"):
+            total, unit = float(s[:-1]), "G"
+        elif s.endswith("M"):
+            total, unit = float(s[:-1]), "M"
+        else:
+            total, unit = float(s), "G"
+        per = math.ceil(total / cpus)
+        if unit == "G" and per < 1:
+            # Tiny totals: request at least 1M per slot rather than 0G.
+            return f"{max(1, math.ceil(total * 1024 / cpus))}M"
+        return f"{max(1, int(per))}{unit}"
+
     # ── header ────────────────────────────────────────────────────────────
     def header(
         self,
@@ -638,11 +665,12 @@ class SgeScheduler(Scheduler):
         if module_load is None:
             module_load = self.default_module_load
 
-        # Per-CPU memory: SGE's h_vmem on most setups is *per slot* (per CPU),
-        # so we keep the value as-is and document the assumption. Sites that
-        # need an overall total can override by setting `memory_flag` to a
-        # non-per-slot resource (or by halving the value in their config).
-        mem_expr = f"{self.memory_flag}={mem}"
+        # YAML / SLURM ``mem`` is total job memory. On most SGE sites h_vmem and
+        # mem_free are per-slot, so divide by cpus unless memory_per_slot=False.
+        mem_req = (
+            self._mem_for_slots(mem, cpus) if self.memory_per_slot else mem
+        )
+        mem_expr = f"{self.memory_flag}={mem_req}"
         # walltime: h_rt is universally supported.
         walltime_expr = f"h_rt={walltime}"
 
