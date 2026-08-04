@@ -552,10 +552,14 @@ class ParallelAugustus:
         """Create SLURM script for initial setup (genome splitting and chr.lst creation)."""
         logger.info("Creating SLURM script for initial setup (genome splitting and chr.lst)...")
         
+        setup_mem = (
+            getattr(self.args, 'slurm_setup_mem', None)
+            or getattr(self.args, 'slurm_jobs_mem', '16G')
+        )
         header = self._scheduler.header(
             job_name="augustus_setup",
             cpus=1,
-            mem="16G",
+            mem=setup_mem,
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augustus_setup_%j.out",
             log_err=f"{self.temp_dir}/augustus_setup_%j.err",
@@ -787,10 +791,14 @@ echo "Completed hints generation for chromosome: $CHROM"
 
         dependency = self._scheduler.depends_on_job_id(dependency_job_id) if dependency_job_id else None
 
+        setup_mem = (
+            getattr(self.args, 'slurm_setup_mem', None)
+            or getattr(self.args, 'slurm_jobs_mem', '16G')
+        )
         header = self._scheduler.header(
             job_name="augustus_joblist",
             cpus=1,
-            mem="16G",
+            mem=setup_mem,
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
             log_out=f"{self.temp_dir}/augustus_joblist_%j.out",
             log_err=f"{self.temp_dir}/augustus_joblist_%j.err",
@@ -2179,6 +2187,8 @@ def main():
                        help="Memory per Augustus execution SLURM task. Default: 16G.")
     parser.add_argument("--slurm_transcripts_mem", default="64G",
                        help="Memory per transcript processing SLURM task. Default: 64G.")
+    parser.add_argument("--slurm_setup_mem", default="",
+                       help="Memory for setup/joblist jobs. Empty = use --slurm_jobs_mem.")
     parser.add_argument("--slurm_setup_time", default="04:00:00",
                        help="Time limit for setup and joblist SLURM jobs. Default: 04:00:00.")
     parser.add_argument("--slurm_hints_time", default="04:00:00",
