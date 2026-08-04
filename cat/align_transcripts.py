@@ -172,8 +172,11 @@ def setup(job, args, input_file_ids, resources):
             # Always register expected outputs so empty inputs still produce empty PSLs
             # (valid for ancestors / sparse pairwise modes with no surviving projections).
             results.setdefault(out_path, [])
-            seq_iter = get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta,
-                                               ref_genome_fasta, aln_mode)
+            seq_iter = get_alignment_sequences(
+                transcript_dict, ref_transcript_dict, genome_fasta,
+                ref_genome_fasta, aln_mode,
+                max_ref_span_ratio=getattr(args, 'max_ref_span', 5.0),
+            )
             for chunk in group_transcripts(seq_iter):
                 j = job.addChildJobFn(run_aln_chunk, chunk, 
                                     memory=resources['chunk_memory'], 
@@ -190,9 +193,15 @@ def setup(job, args, input_file_ids, resources):
                                disk=resources['merge_disk']).rv()
 
 
-def get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta, ref_genome_fasta, mode):
-    """Generator that yields tuples of (tx_id, tx_seq, ref_tx_id, ref_tx_seq) for alignment."""
+def get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta,
+                            ref_genome_fasta, mode, max_ref_span_ratio=5.0):
+    """Generator that yields tuples of (tx_id, tx_seq, ref_tx_id, ref_tx_seq) for alignment.
+
+    Drops targets whose genomic span exceeds ``max_ref_span_ratio`` × the
+    reference transcript span (matches ``tm_max_ref_span`` / filter_transmap).
+    """
     assert mode in ['mRNA', 'CDS']
+    dropped_span = 0
     for tx_id, tx in transcript_dict.items():
         ref_tx_id = tools.nameConversions.alignment_id_to_ref_transcript_id(tx_id)
         # Some inputs (e.g., raw Augustus IDs like g1.t1) may not map to a reference transcript.
@@ -200,11 +209,21 @@ def get_alignment_sequences(transcript_dict, ref_transcript_dict, genome_fasta, 
         ref_tx = ref_transcript_dict.get(ref_tx_id)
         if ref_tx is None:
             continue
+        ref_span = int(ref_tx.stop) - int(ref_tx.start)
+        tx_span = int(tx.stop) - int(tx.start)
+        if ref_span > 0 and max_ref_span_ratio > 0 and tx_span > ref_span * float(max_ref_span_ratio):
+            dropped_span += 1
+            continue
         tx_seq = tx.get_mrna(genome_fasta) if mode == 'mRNA' else tx.get_cds(genome_fasta)
         ref_tx_seq = ref_tx.get_mrna(ref_genome_fasta) if mode == 'mRNA' else ref_tx.get_cds(ref_genome_fasta)
         # Parasail has issues with very short sequences
         if len(ref_tx_seq) > 20 and len(tx_seq) > 20:
             yield tx_id, tx_seq, ref_tx_id, ref_tx_seq
+    if dropped_span:
+        logging.info(
+            "Dropped %d %s transcripts with genomic span > %gx reference",
+            dropped_span, mode, max_ref_span_ratio,
+        )
 
 
 def run_aln_chunk(job, chunk):
@@ -304,6 +323,12 @@ def main():
     parser.add_argument("--max-jobs", type=int, default=200)
     parser.add_argument("--timeout-hours", type=int, default=12)
     parser.add_argument("--chunk-size", type=int, default=500)
+    parser.add_argument(
+        "--max-ref-span", type=float, default=5.0,
+        help=("Drop target transcripts whose genomic span exceeds this multiple "
+              "of the reference transcript span (default: 5; same as tm_max_ref_span). "
+              "Set <=0 to disable."),
+    )
     parser.add_argument("--cleanup", action="store_true")
 
     if '--mode' in sys.argv and sys.argv[sys.argv.index('--mode') + 1] == 'cluster':
