@@ -633,6 +633,7 @@ def _aug_slurm_args(rule_key):
         "hints_mem":               "--slurm_hints_mem",
         "jobs_mem":                "--slurm_jobs_mem",
         "transcripts_mem":         "--slurm_transcripts_mem",
+        "setup_mem":               "--slurm_setup_mem",
         "setup_time":              "--slurm_setup_time",
         "hints_time":              "--slurm_hints_time",
         "jobs_time":               "--slurm_jobs_time",
@@ -660,6 +661,8 @@ def _aug_slurm_args(rule_key):
                 val = sge_queue
             if not val:
                 continue  # omit; CLI default is ""
+        elif not val:
+            continue  # omit empty optional strings (e.g. setup_mem -> inherit jobs_mem)
         args += [arg_name, val]
     if exclude:
         args += ["--slurm_exclude_nodes", exclude]
@@ -3470,7 +3473,8 @@ rule align_transcripts:
         partition=_slurm_partition("align_transcripts"),
         max_jobs=get_res("align_transcripts", "max_concurrent_jobs"),
         timeout_hours=get_res("align_transcripts", "timeout_hours"),
-        chunk_size=get_res("align_transcripts", "chunk_size")
+        chunk_size=get_res("align_transcripts", "chunk_size"),
+        max_ref_span=rcfg("tm_max_ref_span", 5),
     log:
         f"{config['work_dir']}/logs/align_transcripts/{{genome}}_{{alignment_mode}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("align_transcripts", "threads")
@@ -3504,6 +3508,7 @@ rule align_transcripts:
               --max-jobs {params.max_jobs} \
               --timeout-hours {params.timeout_hours} \
               --chunk-size {params.chunk_size} \
+              --max-ref-span {params.max_ref_span} \
               --cleanup >> {log} 2>&1
         else
             echo "Using local transcript alignment for {wildcards.genome} {wildcards.alignment_mode}" > {log}
@@ -3524,6 +3529,7 @@ rule align_transcripts:
               --annotation-gp {input.ref_gp} \
               --ref-db-path {input.ref_db} \
               --genome {params.genome_name} \
+              --max-ref-span {params.max_ref_span} \
               {params.mode_file_args} >> {log} 2>&1
         fi
         """
