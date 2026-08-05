@@ -187,13 +187,14 @@ def process_mode_with_cluster(tx_mode, path_dict, ref_tx_dict, tx_biotype_map,
 
             # 1-based array; chunk filenames stay 0-based (IDX shift in body).
             num_chunks = len(chunks)
+            log_out, log_err = scheduler.array_log_paths(work_dir / "cluster_logs", "eval")
             header = scheduler.header(
                 job_name=f"evaluate_{tx_mode}_{aln_mode}",
                 cpus=args.cpus,
                 mem=f"{args.memory}G",
                 walltime=args.time,
-                log_out=str(work_dir / "cluster_logs/eval_%A_%a.out"),
-                log_err=str(work_dir / "cluster_logs/eval_%A_%a.err"),
+                log_out=log_out,
+                log_err=log_err,
                 partition=args.partition,
                 queue=args.partition,
                 array=(1, num_chunks),
@@ -312,7 +313,7 @@ def main():
     parser.add_argument("--mode-files", nargs=4, action='append', required=True,
                         metavar=("MODE", "INPUT_GP", "MRNA_PSL", "CDS_PSL"))
     parser.add_argument("--execution-mode", choices=("auto", "slurm", "sge", "local"), default="auto")
-    parser.add_argument("--partition", default="high_priority",
+    parser.add_argument("--partition", default="",
                         help="SLURM partition or SGE queue. Both backends read this.")
     parser.add_argument("--exclude-nodes", default="",
                         help="Comma list (SLURM) or SGE-native '!h1&!h2' expression.")
