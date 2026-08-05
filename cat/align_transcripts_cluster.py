@@ -366,13 +366,14 @@ def run_cluster_alignment_pipeline(args):
 
             num_chunks = len(chunks)
             mem_gb = _mem_gb_for_chunks(chunks, args.memory)
+            log_out, log_err = scheduler.array_log_paths(log_dir, "align")
             header = scheduler.header(
                 job_name=f"align_{tx_mode}_{aln_mode}",
                 cpus=args.cpus,
                 mem=f"{mem_gb}G",
                 walltime=args.time,
-                log_out=str(log_dir / "align_%A_%a.out"),
-                log_err=str(log_dir / "align_%A_%a.err"),
+                log_out=log_out,
+                log_err=log_err,
                 partition=args.partition,
                 queue=args.partition,
                 array=(1, num_chunks),
