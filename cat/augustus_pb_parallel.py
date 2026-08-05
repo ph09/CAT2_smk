@@ -33,6 +33,7 @@ def _scheduler_from_args(args):
                 "memory_flag": getattr(args, "sge_memory_flag", "h_vmem"),
                 "hostname_exclude": getattr(args, "slurm_exclude_nodes", "") or "",
                 "module_load": getattr(args, "module_load", "") or "",
+                "memory_per_slot": getattr(args, "sge_memory_per_slot", True),
             },
         }
     }
@@ -83,6 +84,20 @@ class ParallelAugustusPB:
 
         for dir_path in [self.temp_dir, self.split_dir, self.jobs_dir, self.results_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
+
+    def _conda_env_name(self) -> str:
+        return os.environ.get("CONDA_DEFAULT_ENV") or "cat2"
+
+    def _wrap_cluster_header(self, header: str) -> str:
+        """Append conda activation so cluster jobs use the CAT env."""
+        return (
+            header
+            + self._scheduler.script_preamble(
+                conda_env=self._conda_env_name(),
+                set_strict=False,
+            )
+            + "\n"
+        )
 
     def validate_inputs(self) -> bool:
         """Validate all required input files exist."""
@@ -271,17 +286,18 @@ class ParallelAugustusPB:
             getattr(self.args, 'slurm_setup_mem', None)
             or getattr(self.args, 'slurm_jobs_mem', '16G')
         )
+        log_out, log_err = self._scheduler.job_log_paths(self.temp_dir, "augPB_setup")
         header = self._scheduler.header(
             job_name="augPB_setup",
             cpus=1,
             mem=setup_mem,
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
-            log_out=f"{self.temp_dir}/augPB_setup_%j.out",
-            log_err=f"{self.temp_dir}/augPB_setup_%j.err",
+            log_out=log_out,
+            log_err=log_err,
             partition=getattr(self.args, 'slurm_partition', ''),
             queue=getattr(self.args, 'slurm_partition', ''),
         )
-        slurm_script = header + rf"""
+        slurm_script = self._wrap_cluster_header(header) + rf"""
 set -euo pipefail
 
 echo "Starting PB initial setup..."
@@ -353,20 +369,21 @@ echo "PB initial setup completed successfully!"
 
         dependency = self._scheduler.depends_on_job_id(dependency_job_id) if dependency_job_id else None
         task_var = self._scheduler.task_id_env()
+        log_out, log_err = self._scheduler.array_log_paths(self.temp_dir, "augPB_hints")
         header = self._scheduler.header(
             job_name="augPB_hints",
             cpus=1,
             mem=getattr(self.args, 'slurm_hints_mem', '8G'),
             walltime=getattr(self.args, 'slurm_hints_time', '04:00:00'),
-            log_out=f"{self.temp_dir}/augPB_hints_%A_%a.out",
-            log_err=f"{self.temp_dir}/augPB_hints_%A_%a.err",
+            log_out=log_out,
+            log_err=log_err,
             partition=getattr(self.args, 'slurm_partition', ''),
             queue=getattr(self.args, 'slurm_partition', ''),
             array=(1, num_chromosomes),
             max_concurrent=getattr(self.args, 'slurm_hints_concurrency', 10),
             dependency=dependency,
         )
-        slurm_script = header + rf"""
+        slurm_script = self._wrap_cluster_header(header) + rf"""
 set -euo pipefail
 
 TASK_ID="${{{task_var}}}"
@@ -393,18 +410,19 @@ echo "Wrote hints: {self.temp_dir}/${{CHROM}}_hints.gff"
             getattr(self.args, 'slurm_setup_mem', None)
             or getattr(self.args, 'slurm_jobs_mem', '16G')
         )
+        log_out, log_err = self._scheduler.job_log_paths(self.temp_dir, "augPB_joblist")
         header = self._scheduler.header(
             job_name="augPB_joblist",
             cpus=1,
             mem=setup_mem,
             walltime=getattr(self.args, 'slurm_setup_time', '04:00:00'),
-            log_out=f"{self.temp_dir}/augPB_joblist_%j.out",
-            log_err=f"{self.temp_dir}/augPB_joblist_%j.err",
+            log_out=log_out,
+            log_err=log_err,
             partition=getattr(self.args, 'slurm_partition', ''),
             queue=getattr(self.args, 'slurm_partition', ''),
             dependency=dependency,
         )
-        slurm_script = header + rf"""
+        slurm_script = self._wrap_cluster_header(header) + rf"""
 set -euo pipefail
 
 chr_lst_file="{self.temp_dir}/chr.lst"
@@ -430,20 +448,21 @@ echo "Created PB job list: {self.temp_dir}/jobs_PB.lst"
 
         dependency = self._scheduler.depends_on_job_id(dependency_job_id) if dependency_job_id else None
         task_var = self._scheduler.task_id_env()
+        log_out, log_err = self._scheduler.array_log_paths(self.temp_dir, "augustus_PB")
         header = self._scheduler.header(
             job_name="augustus_PB",
             cpus=1,
             mem=getattr(self.args, 'slurm_jobs_mem', '32G'),
             walltime=getattr(self.args, 'slurm_jobs_time', '24:00:00'),
-            log_out=f"{self.temp_dir}/augustus_PB_%A_%a.out",
-            log_err=f"{self.temp_dir}/augustus_PB_%A_%a.err",
+            log_out=log_out,
+            log_err=log_err,
             partition=getattr(self.args, 'slurm_jobs_partition', ''),
             queue=getattr(self.args, 'slurm_jobs_partition', ''),
             array=(1, num_jobs),
             max_concurrent=getattr(self.args, 'slurm_jobs_concurrency', 10),
             dependency=dependency,
         )
-        slurm_script = header + f"""
+        slurm_script = self._wrap_cluster_header(header) + f"""
 # Change to temp directory (job paths in the list are relative to this directory)
 cd {self.temp_dir}
 
