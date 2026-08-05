@@ -161,13 +161,14 @@ def run_cluster_parent_assignment(args):
         num_chroms = len(chromosomes)
         print(f"Processing {num_chroms} chromosomes via {scheduler.name} array jobs")
 
+        log_out, log_err = scheduler.array_log_paths(work_dir / "cluster_logs", "parent")
         header = scheduler.header(
             job_name=f"parent_assign_{args.table_name}",
             cpus=args.cpus,
             mem=f"{args.memory}G",
             walltime=args.time,
-            log_out=str(work_dir / "cluster_logs/parent_%A_%a.out"),
-            log_err=str(work_dir / "cluster_logs/parent_%A_%a.err"),
+            log_out=log_out,
+            log_err=log_err,
             partition=args.partition,
             queue=args.partition,
             array=(1, num_chroms),
@@ -336,7 +337,7 @@ def main():
     parser.add_argument("--table-name", required=True)
     parser.add_argument("--min-distance", type=float, default=0.9)
     parser.add_argument("--execution-mode", choices=("auto", "slurm", "sge", "local"), default="auto")
-    parser.add_argument("--partition", default="medium",
+    parser.add_argument("--partition", default="",
                         help="SLURM partition or SGE queue.")
     parser.add_argument("--exclude-nodes", default="")
     parser.add_argument("--module-load", default="")
