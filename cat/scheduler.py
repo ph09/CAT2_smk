@@ -152,6 +152,28 @@ class Scheduler(ABC):
             Raw extra directive lines, already in the backend's native syntax.
         """
 
+    def array_log_paths(self, directory: str | os.PathLike, stem: str) -> tuple[str, str]:
+        """Return (stdout, stderr) paths with backend-specific array placeholders.
+
+        SLURM expands ``%A`` / ``%a``; SGE expands ``$JOB_ID`` / ``$TASK_ID``.
+        Passing SLURM tokens to SGE leaves a literal ``%A_%a`` filename and
+        makes failures nearly undiagnosable.
+        """
+        d = str(directory).rstrip("/")
+        if self.name == "sge":
+            return (
+                f"{d}/{stem}.$JOB_ID.$TASK_ID.out",
+                f"{d}/{stem}.$JOB_ID.$TASK_ID.err",
+            )
+        return (f"{d}/{stem}_%A_%a.out", f"{d}/{stem}_%A_%a.err")
+
+    def job_log_paths(self, directory: str | os.PathLike, stem: str) -> tuple[str, str]:
+        """Return (stdout, stderr) paths for a non-array job."""
+        d = str(directory).rstrip("/")
+        if self.name == "sge":
+            return (f"{d}/{stem}.$JOB_ID.out", f"{d}/{stem}.$JOB_ID.err")
+        return (f"{d}/{stem}_%j.out", f"{d}/{stem}_%j.err")
+
     def script_preamble(
         self,
         *,
