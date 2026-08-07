@@ -205,7 +205,12 @@ class Scheduler(ABC):
                 '  source "${HOME}/mambaforge/etc/profile.d/conda.sh"\n'
                 'fi'
             )
-            lines.append(f"conda activate {shlex.quote(conda_env)}")
+            # Fail hard after callers install trap_sentinel so wait() sees a
+            # non-zero sentinel instead of a silent empty sentinel_dir.
+            lines.append(
+                f"conda activate {shlex.quote(conda_env)} "
+                f'|| {{ echo "ERROR: conda activate {shlex.quote(conda_env)} failed" >&2; exit 127; }}'
+            )
             lines.append('export PATH="${CONDA_PREFIX}/bin:$PATH"')
         if set_strict:
             lines.append("set -euo pipefail")
@@ -325,17 +330,74 @@ class Scheduler(ABC):
     def trap_sentinel(self, sentinel_dir: str | os.PathLike, task_id_var: Optional[str] = None) -> str:
         """Bash snippet that emits a sentinel on EXIT, capturing the exit code.
 
-        Use at the top of a job body so any path (success or failure) writes a
-        sentinel file. Requires ``set -e`` to be either off or paired with an
-        explicit final ``exit 0`` for the success case.
+        Install this **before** ``set -e`` / conda activation so a failure in
+        setup still leaves a ``done.<task>`` file for :meth:`wait`.
         """
         var = task_id_var or self.task_id_env()
         return (
             f'_CAT_SENT_DIR={shlex.quote(str(sentinel_dir))}\n'
-            f'mkdir -p "$_CAT_SENT_DIR"\n'
+            f'mkdir -p "$_CAT_SENT_DIR" || true\n'
             f'_CAT_SENT_FILE="$_CAT_SENT_DIR/done.${{{var}:-0}}"\n'
-            'trap \'echo $? > "$_CAT_SENT_FILE"\' EXIT\n'
+            '_cat_write_sentinel() {\n'
+            '  echo "${1:-0}" > "$_CAT_SENT_FILE" 2>/dev/null || true\n'
+            '}\n'
+            'trap \'_cat_write_sentinel $?\' EXIT\n'
         )
+
+    @staticmethod
+    def resolve_conda_env(explicit: Optional[str] = None) -> str:
+        """Resolve the conda env name for cluster job activation.
+
+        Order: *explicit* argument → ``CONDA_DEFAULT_ENV``. No baked-in
+        default name — the env comes from the active session (or caller).
+        """
+        env = (explicit or os.environ.get("CONDA_DEFAULT_ENV") or "").strip()
+        if not env:
+            raise RuntimeError(
+                "No conda environment available for cluster job scripts. "
+                "Activate your env before running (so CONDA_DEFAULT_ENV is set), "
+                "or pass an explicit env name / set conda_env in the config."
+            )
+        return env
+
+    def summarize_log_dir(
+        self,
+        log_dir: str | os.PathLike,
+        stem: str,
+        *,
+        max_files: int = 3,
+        max_lines: int = 40,
+    ) -> str:
+        """Return a short text summary of recent ``{stem}*.err`` log tails."""
+        log_dir = Path(log_dir)
+        if not log_dir.is_dir():
+            return f"(no log directory {log_dir})"
+        err_files = sorted(
+            list(log_dir.glob(f"{stem}*.err")) + list(log_dir.glob(f"{stem}_*.err")),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        # Deduplicate while preserving mtime order
+        seen: set[str] = set()
+        unique: list[Path] = []
+        for p in err_files:
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(p)
+        if not unique:
+            return f"(no {stem}*.err files under {log_dir})"
+        chunks: list[str] = []
+        for path in unique[:max_files]:
+            try:
+                lines = path.read_text(errors="replace").splitlines()
+            except OSError as exc:
+                chunks.append(f"{path.name}: <unreadable: {exc}>")
+                continue
+            tail = "\n".join(lines[-max_lines:]) if lines else "<empty>"
+            chunks.append(f"--- {path.name} (last {min(len(lines), max_lines)} lines) ---\n{tail}")
+        return "\n".join(chunks)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -838,12 +900,19 @@ class SgeScheduler(Scheduler):
                 return JobResult(ok=True, completed=total, total=total)
 
             # Fallback: if all sentinels haven't appeared but the job is gone
-            # from qstat, assume crash.
+            # from qstat, assume crash. Retry briefly for NFS/latency races.
             if not self._job_present(job_id):
-                # Give the filesystem a moment in case sentinels are racing.
-                time.sleep(2)
-                done_ids = {p.name for p in expected if p.exists()}
-                done2 = len(done_ids) if total == 1 else sum(1 for p in expected[:total] if p.exists())
+                done2 = 0
+                for _ in range(5):
+                    time.sleep(3)
+                    done_ids = {p.name for p in expected if p.exists()}
+                    done2 = (
+                        len(done_ids)
+                        if total == 1
+                        else sum(1 for p in expected[:total] if p.exists())
+                    )
+                    if done2 >= total:
+                        break
                 if done2 >= total:
                     failed = 0
                     for p in expected:
@@ -861,9 +930,16 @@ class SgeScheduler(Scheduler):
                             detail=f"{failed}/{total} tasks exited non-zero",
                         )
                     return JobResult(ok=True, completed=total, total=total)
+                qacct_note = self._qacct_summary(job_id)
+                detail = (
+                    f"job {job_id} no longer in queue but only {done2}/{total} "
+                    f"sentinels present"
+                )
+                if qacct_note:
+                    detail = f"{detail}; {qacct_note}"
                 return JobResult(
                     ok=False, completed=done2, failed=total - done2, total=total,
-                    detail=f"job {job_id} no longer in queue but only {done2}/{total} sentinels present",
+                    detail=detail,
                 )
 
             elapsed = time.time() - start
@@ -873,6 +949,44 @@ class SgeScheduler(Scheduler):
             time.sleep(check_interval_s)
 
         return JobResult(ok=False, detail=f"timeout after {timeout_s / 3600:.1f}h")
+
+    def _qacct_summary(self, job_id: str) -> str:
+        """Best-effort one-line summary from ``qacct -j`` (may be empty)."""
+        try:
+            result = subprocess.run(
+                ["qacct", "-j", str(job_id)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return ""
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            return ""
+        failed_vals: list[str] = []
+        exit_vals: list[str] = []
+        reasons: list[str] = []
+        for raw in result.stdout.splitlines():
+            line = raw.strip()
+            if line.startswith("failed ") or line.startswith("failed\t"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    failed_vals.append(parts[1])
+            elif line.startswith("exit_status"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    exit_vals.append(parts[1])
+            elif "error reason" in line.lower() or line.startswith("failed_txt"):
+                reasons.append(line)
+        bits: list[str] = []
+        if failed_vals:
+            bits.append(f"qacct failed={','.join(sorted(set(failed_vals)))}")
+        if exit_vals:
+            bits.append(f"exit_status={','.join(sorted(set(exit_vals)))}")
+        if reasons:
+            bits.append(reasons[0][:160])
+        return "; ".join(bits)
 
     def cancel(self, job_id: str) -> None:
         try:
