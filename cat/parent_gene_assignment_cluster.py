@@ -79,10 +79,10 @@ def _build_body(scheduler, work_dir, sentinel_dir, min_distance):
     """
     task_var = scheduler.task_id_env()
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    preamble = scheduler.script_preamble(conda_env=os.environ.get("CONDA_DEFAULT_ENV", "cat") or "cat")
     sentinel = scheduler.trap_sentinel(sentinel_dir)
-    return f"""{preamble}
-{sentinel}
+    preamble = scheduler.script_preamble(conda_env=scheduler.resolve_conda_env())
+    return f"""{sentinel}
+{preamble}
 
 TASK_ID="${{{task_var}:-1}}"
 IDX=$((TASK_ID - 1))
@@ -144,80 +144,84 @@ def run_cluster_parent_assignment(args):
 
     print(f"Work directory: {work_dir}")
 
-    try:
-        chromosomes = list(denovo_chrom_dict.keys())
-        with open(work_dir / "chromosomes.pkl", "wb") as f:
-            pickle.dump(chromosomes, f)
+    chromosomes = list(denovo_chrom_dict.keys())
+    with open(work_dir / "chromosomes.pkl", "wb") as f:
+        pickle.dump(chromosomes, f)
 
-        with open(work_dir / "filtered_ids.pkl", "wb") as f:
-            pickle.dump(filtered_ids, f)
+    with open(work_dir / "filtered_ids.pkl", "wb") as f:
+        pickle.dump(filtered_ids, f)
 
-        for chrom in chromosomes:
-            with open(work_dir / f"chromosomes/{chrom}_denovo.pkl", "wb") as f:
-                pickle.dump(denovo_chrom_dict[chrom], f)
-            with open(work_dir / f"chromosomes/{chrom}_tm.pkl", "wb") as f:
-                pickle.dump(tm_chrom_dict.get(chrom, {}), f)
+    for chrom in chromosomes:
+        with open(work_dir / f"chromosomes/{chrom}_denovo.pkl", "wb") as f:
+            pickle.dump(denovo_chrom_dict[chrom], f)
+        with open(work_dir / f"chromosomes/{chrom}_tm.pkl", "wb") as f:
+            pickle.dump(tm_chrom_dict.get(chrom, {}), f)
 
-        num_chroms = len(chromosomes)
-        print(f"Processing {num_chroms} chromosomes via {scheduler.name} array jobs")
+    num_chroms = len(chromosomes)
+    print(f"Processing {num_chroms} chromosomes via {scheduler.name} array jobs")
 
-        log_out, log_err = scheduler.array_log_paths(work_dir / "cluster_logs", "parent")
-        header = scheduler.header(
-            job_name=f"parent_assign_{args.table_name}",
-            cpus=args.cpus,
-            mem=f"{args.memory}G",
-            walltime=args.time,
-            log_out=log_out,
-            log_err=log_err,
-            partition=args.partition,
-            queue=args.partition,
-            array=(1, num_chroms),
-            max_concurrent=args.max_jobs,
+    log_out, log_err = scheduler.array_log_paths(work_dir / "cluster_logs", "parent")
+    header = scheduler.header(
+        job_name=f"parent_assign_{args.table_name}",
+        cpus=args.cpus,
+        mem=f"{args.memory}G",
+        walltime=args.time,
+        log_out=log_out,
+        log_err=log_err,
+        partition=args.partition,
+        queue=args.partition,
+        array=(1, num_chroms),
+        max_concurrent=args.max_jobs,
+    )
+    body = _build_body(scheduler, work_dir, sentinel_dir, args.min_distance)
+    script_path = scheduler.write_script(header + body, work_dir / "cluster_job.sh")
+
+    job_id = scheduler.submit(script_path)
+    print(f"Submitted {scheduler.name} array job {job_id}")
+
+    result = scheduler.wait(
+        job_id,
+        num_tasks=num_chroms,
+        timeout_s=args.timeout_hours * 3600,
+        sentinel_dir=sentinel_dir,
+    )
+    if not result.ok:
+        log_tail = scheduler.summarize_log_dir(work_dir / "cluster_logs", "parent")
+        print(f"Cluster job failed; preserving work dir: {work_dir}")
+        print(log_tail)
+        raise RuntimeError(
+            f"{scheduler.name} job {job_id} failed: {result.detail}\n"
+            f"Inspect logs under {work_dir / 'cluster_logs'}"
         )
-        body = _build_body(scheduler, work_dir, sentinel_dir, args.min_distance)
-        script_path = scheduler.write_script(header + body, work_dir / "cluster_job.sh")
+    print(f"Job {job_id} succeeded: {result.completed}/{result.total} tasks")
 
-        job_id = scheduler.submit(script_path)
-        print(f"Submitted {scheduler.name} array job {job_id}")
-
-        result = scheduler.wait(
-            job_id,
-            num_tasks=num_chroms,
-            timeout_s=args.timeout_hours * 3600,
-            sentinel_dir=sentinel_dir,
-        )
-        if not result.ok:
-            raise RuntimeError(f"{scheduler.name} job {job_id} failed: {result.detail}")
-        print(f"Job {job_id} succeeded: {result.completed}/{result.total} tasks")
-
-        all_records = []
-        for chrom in chromosomes:
-            result_file = work_dir / f"results/result_{chrom}.pkl"
-            if result_file.exists():
-                with open(result_file, "rb") as f:
-                    records = pickle.load(f)
-                    all_records.extend(records)
-            else:
-                print(f"Warning: Missing result file for chromosome {chrom}")
-
-        if all_records:
-            df = pd.DataFrame(all_records)
-            for col in df.columns:
-                df[col] = df[col].astype(str)
+    all_records = []
+    for chrom in chromosomes:
+        result_file = work_dir / f"results/result_{chrom}.pkl"
+        if result_file.exists():
+            with open(result_file, "rb") as f:
+                records = pickle.load(f)
+                all_records.extend(records)
         else:
-            df = pd.DataFrame(columns=['TranscriptId', 'AssignedGeneId', 'AlternativeGeneIds', 'ResolutionMethod']).astype(str)
+            print(f"Warning: Missing result file for chromosome {chrom}")
 
-        print(f"Completed processing: {len(df)} total transcript assignments")
-        write_to_database(df, args.db_path, args.table_name)
+    if all_records:
+        df = pd.DataFrame(all_records)
+        for col in df.columns:
+            df[col] = df[col].astype(str)
+    else:
+        df = pd.DataFrame(columns=['TranscriptId', 'AssignedGeneId', 'AlternativeGeneIds', 'ResolutionMethod']).astype(str)
 
-    finally:
-        if args.cleanup:
-            import shutil
-            try:
-                shutil.rmtree(work_dir)
-                print(f"Cleaned up work directory: {work_dir}")
-            except Exception as e:  # noqa: BLE001
-                print(f"Warning: Could not clean up work directory {work_dir}: {e}")
+    print(f"Completed processing: {len(df)} total transcript assignments")
+    write_to_database(df, args.db_path, args.table_name)
+
+    if args.cleanup:
+        import shutil
+        try:
+            shutil.rmtree(work_dir)
+            print(f"Cleaned up work directory: {work_dir}")
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: Could not clean up work directory {work_dir}: {e}")
 
 
 def _scheduler_config(args):
