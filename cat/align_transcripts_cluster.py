@@ -175,10 +175,10 @@ def _build_body(scheduler, chunk_dir, output_dir, sentinel_dir):
     """
     task_var = scheduler.task_id_env()
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    preamble = scheduler.script_preamble(conda_env=os.environ.get("CONDA_DEFAULT_ENV", "cat") or "cat")
     sentinel = scheduler.trap_sentinel(sentinel_dir)
-    return f"""{preamble}
-{sentinel}
+    preamble = scheduler.script_preamble(conda_env=scheduler.resolve_conda_env())
+    return f"""{sentinel}
+{preamble}
 
 TASK_ID="${{{task_var}:-1}}"
 IDX=$((TASK_ID - 1))
@@ -392,7 +392,10 @@ def run_cluster_alignment_pipeline(args):
                 sentinel_dir=sentinel_dir,
             )
             if not result.ok:
+                log_tail = scheduler.summarize_log_dir(log_dir, "align")
                 logger.error(f"{scheduler.name} job {job_id} failed: {result.detail}")
+                logger.error(f"Preserving work directory for diagnosis: {work_dir}")
+                logger.error(log_tail)
                 sys.exit(1)
             logger.info(f"Job {job_id} succeeded: {result.completed}/{result.total} tasks")
 
