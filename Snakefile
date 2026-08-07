@@ -742,6 +742,22 @@ else
 fi
 """
 
+def _resolve_conda_env():
+    """Env name for cluster job activation: active session, else config.
+
+    No baked-in default (e.g. ``cat2``). The install name lives in
+    ``environment.yaml``; runtime must activate that env or set ``conda_env``.
+    """
+    env = (os.environ.get("CONDA_DEFAULT_ENV") or config.get("conda_env") or "").strip()
+    if not env:
+        raise ValueError(
+            "Cannot determine conda env for cluster job scripts. "
+            "Activate your environment before running snakemake "
+            "(so CONDA_DEFAULT_ENV is set), or set conda_env in your config."
+        )
+    return env
+
+
 def _conda_activate_bash():
     """Bash snippet that activates the controller's conda env inside a cluster job.
 
@@ -750,11 +766,7 @@ def _conda_activate_bash():
     imports (e.g. ``bx``). Explicitly re-activate here. Runs *before*
     ``set -u`` so conda's init scripts are safe.
     """
-    env = (
-        os.environ.get("CONDA_DEFAULT_ENV")
-        or config.get("conda_env")
-        or "cat2"
-    )
+    env = _resolve_conda_env()
     return f"""
 # Re-activate conda (do not rely on #$ -V / --export alone for PATH).
 if [ -n "${{CONDA_EXE:-}}" ] && [ -f "$(dirname "$(dirname "$CONDA_EXE")")/etc/profile.d/conda.sh" ]; then
