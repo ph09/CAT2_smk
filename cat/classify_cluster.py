@@ -100,10 +100,11 @@ def _build_body(scheduler, work_dir, aln_mode, sentinel_dir):
     """
     task_var = scheduler.task_id_env()
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    preamble = scheduler.script_preamble(conda_env=os.environ.get("CONDA_DEFAULT_ENV", "cat") or "cat")
+    # Trap first so conda/set -e failures still leave a sentinel for wait().
     sentinel = scheduler.trap_sentinel(sentinel_dir)
-    return f"""{preamble}
-{sentinel}
+    preamble = scheduler.script_preamble(conda_env=scheduler.resolve_conda_env())
+    return f"""{sentinel}
+{preamble}
 
 TASK_ID="${{{task_var}:-1}}"
 IDX=$((TASK_ID - 1))
@@ -168,90 +169,92 @@ def process_mode_with_cluster(tx_mode, path_dict, ref_tx_dict, tx_biotype_map,
 
         print(f"    Work directory: {work_dir}")
 
-        try:
-            with open(work_dir / "ref_tx_dict.pkl", "wb") as f:
-                pickle.dump(ref_tx_dict, f)
-            with open(work_dir / "tx_dict.pkl", "wb") as f:
-                pickle.dump(tx_dict, f)
-            with open(work_dir / "tx_biotype_map.pkl", "wb") as f:
-                pickle.dump(tx_biotype_map, f)
-            with open(work_dir / "fasta_path.txt", "w") as f:
-                f.write(os.path.abspath(fasta_path))
+        with open(work_dir / "ref_tx_dict.pkl", "wb") as f:
+            pickle.dump(ref_tx_dict, f)
+        with open(work_dir / "tx_dict.pkl", "wb") as f:
+            pickle.dump(tx_dict, f)
+        with open(work_dir / "tx_biotype_map.pkl", "wb") as f:
+            pickle.dump(tx_biotype_map, f)
+        with open(work_dir / "fasta_path.txt", "w") as f:
+            f.write(os.path.abspath(fasta_path))
 
-            chunks = list(chunk_list(psl_list, args.chunk_size))
-            print(f"    Split into {len(chunks)} chunks of size ~{args.chunk_size}")
+        chunks = list(chunk_list(psl_list, args.chunk_size))
+        print(f"    Split into {len(chunks)} chunks of size ~{args.chunk_size}")
 
-            for chunk_id, chunk in enumerate(chunks):
-                with open(work_dir / f"chunks/chunk_{chunk_id}.pkl", "wb") as f:
-                    pickle.dump(chunk, f)
+        for chunk_id, chunk in enumerate(chunks):
+            with open(work_dir / f"chunks/chunk_{chunk_id}.pkl", "wb") as f:
+                pickle.dump(chunk, f)
 
-            # 1-based array; chunk filenames stay 0-based (IDX shift in body).
-            num_chunks = len(chunks)
-            log_out, log_err = scheduler.array_log_paths(work_dir / "cluster_logs", "eval")
-            header = scheduler.header(
-                job_name=f"evaluate_{tx_mode}_{aln_mode}",
-                cpus=args.cpus,
-                mem=f"{args.memory}G",
-                walltime=args.time,
-                log_out=log_out,
-                log_err=log_err,
-                partition=args.partition,
-                queue=args.partition,
-                array=(1, num_chunks),
-                max_concurrent=args.max_jobs,
+        # 1-based array; chunk filenames stay 0-based (IDX shift in body).
+        num_chunks = len(chunks)
+        log_out, log_err = scheduler.array_log_paths(work_dir / "cluster_logs", "eval")
+        header = scheduler.header(
+            job_name=f"evaluate_{tx_mode}_{aln_mode}",
+            cpus=args.cpus,
+            mem=f"{args.memory}G",
+            walltime=args.time,
+            log_out=log_out,
+            log_err=log_err,
+            partition=args.partition,
+            queue=args.partition,
+            array=(1, num_chunks),
+            max_concurrent=args.max_jobs,
+        )
+        body = _build_body(scheduler, work_dir, aln_mode, sentinel_dir)
+        script_path = scheduler.write_script(header + body, work_dir / f"cluster_job_{aln_mode}.sh")
+
+        job_id = scheduler.submit(script_path)
+        print(f"    Submitted {scheduler.name} array job {job_id}")
+
+        result = scheduler.wait(
+            job_id,
+            num_tasks=num_chunks,
+            timeout_s=args.timeout_hours * 3600,
+            sentinel_dir=sentinel_dir,
+        )
+        if not result.ok:
+            log_tail = scheduler.summarize_log_dir(work_dir / "cluster_logs", "eval")
+            print(f"    Cluster job failed; preserving work dir: {work_dir}")
+            print(log_tail)
+            raise RuntimeError(
+                f"{scheduler.name} job {job_id} failed for {tx_mode}/{aln_mode}: "
+                f"{result.detail}\nInspect logs under {work_dir / 'cluster_logs'}"
             )
-            body = _build_body(scheduler, work_dir, aln_mode, sentinel_dir)
-            script_path = scheduler.write_script(header + body, work_dir / f"cluster_job_{aln_mode}.sh")
+        print(f"    Job {job_id} succeeded: {result.completed}/{result.total} tasks")
 
-            job_id = scheduler.submit(script_path)
-            print(f"    Submitted {scheduler.name} array job {job_id}")
+        all_metrics = []
+        all_eval = []
+        for chunk_id in range(num_chunks):
+            result_file = work_dir / f"results/result_{chunk_id}.pkl"
+            if result_file.exists():
+                with open(result_file, "rb") as f:
+                    chunk_results = pickle.load(f)
+                    all_metrics.extend(chunk_results['metrics'])
+                    all_eval.extend(chunk_results['evaluation'])
+            else:
+                print(f"    Warning: Missing result file for chunk {chunk_id}")
 
-            result = scheduler.wait(
-                job_id,
-                num_tasks=num_chunks,
-                timeout_s=args.timeout_hours * 3600,
-                sentinel_dir=sentinel_dir,
-            )
-            if not result.ok:
-                raise RuntimeError(
-                    f"{scheduler.name} job {job_id} failed for {tx_mode}/{aln_mode}: {result.detail}"
-                )
-            print(f"    Job {job_id} succeeded: {result.completed}/{result.total} tasks")
+        columns = ['GeneId', 'TranscriptId', 'AlignmentId', 'classifier', 'value']
+        mc_df = pd.DataFrame(all_metrics, columns=columns).sort_values(columns).set_index('AlignmentId')
 
-            all_metrics = []
-            all_eval = []
-            for chunk_id in range(num_chunks):
-                result_file = work_dir / f"results/result_{chunk_id}.pkl"
-                if result_file.exists():
-                    with open(result_file, "rb") as f:
-                        chunk_results = pickle.load(f)
-                        all_metrics.extend(chunk_results['metrics'])
-                        all_eval.extend(chunk_results['evaluation'])
-                else:
-                    print(f"    Warning: Missing result file for chunk {chunk_id}")
+        columns = ['AlignmentId', 'chromosome', 'start', 'stop', 'name', 'score', 'strand',
+                   'thickStart', 'thickStop', 'rgb', 'blockCount', 'blockSizes', 'blockStarts']
+        ec_df = pd.DataFrame(all_eval, columns=columns).sort_values(columns).set_index('AlignmentId')
 
-            columns = ['GeneId', 'TranscriptId', 'AlignmentId', 'classifier', 'value']
-            mc_df = pd.DataFrame(all_metrics, columns=columns).sort_values(columns).set_index('AlignmentId')
+        metrics_tbl_name = tools.sqlInterface.tables[aln_mode][tx_mode]['metrics'].__tablename__
+        eval_tbl_name = tools.sqlInterface.tables[aln_mode][tx_mode]['evaluation'].__tablename__
+        results.append((metrics_tbl_name, mc_df))
+        results.append((eval_tbl_name, ec_df))
 
-            columns = ['AlignmentId', 'chromosome', 'start', 'stop', 'name', 'score', 'strand',
-                       'thickStart', 'thickStop', 'rgb', 'blockCount', 'blockSizes', 'blockStarts']
-            ec_df = pd.DataFrame(all_eval, columns=columns).sort_values(columns).set_index('AlignmentId')
+        print(f"    Completed: {len(mc_df)} metrics records, {len(ec_df)} evaluation records")
 
-            metrics_tbl_name = tools.sqlInterface.tables[aln_mode][tx_mode]['metrics'].__tablename__
-            eval_tbl_name = tools.sqlInterface.tables[aln_mode][tx_mode]['evaluation'].__tablename__
-            results.append((metrics_tbl_name, mc_df))
-            results.append((eval_tbl_name, ec_df))
-
-            print(f"    Completed: {len(mc_df)} metrics records, {len(ec_df)} evaluation records")
-
-        finally:
-            if args.cleanup:
-                import shutil
-                try:
-                    shutil.rmtree(work_dir)
-                    print(f"    Cleaned up work directory: {work_dir}")
-                except Exception as e:  # noqa: BLE001
-                    print(f"    Warning: Could not clean up work directory {work_dir}: {e}")
+        if args.cleanup:
+            import shutil
+            try:
+                shutil.rmtree(work_dir)
+                print(f"    Cleaned up work directory: {work_dir}")
+            except Exception as e:  # noqa: BLE001
+                print(f"    Warning: Could not clean up work directory {work_dir}: {e}")
 
 
 def run_cluster_classification(args):
