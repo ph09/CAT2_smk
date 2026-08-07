@@ -85,15 +85,12 @@ class ParallelAugustusPB:
         for dir_path in [self.temp_dir, self.split_dir, self.jobs_dir, self.results_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
 
-    def _conda_env_name(self) -> str:
-        return os.environ.get("CONDA_DEFAULT_ENV") or "cat2"
-
     def _wrap_cluster_header(self, header: str) -> str:
-        """Append conda activation so cluster jobs use the CAT env."""
+        """Append conda activation so cluster jobs use the active CAT env."""
         return (
             header
             + self._scheduler.script_preamble(
-                conda_env=self._conda_env_name(),
+                conda_env=self._scheduler.resolve_conda_env(),
                 set_strict=False,
             )
             + "\n"
