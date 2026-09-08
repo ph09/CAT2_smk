@@ -98,11 +98,23 @@ def validate_config():
 
     # 6. Ancestor annotation sanity.
     if config.get("annotate_ancestors", False):
-        for m in (config.get("ancestor_modes") or []):
-            if m not in ("transMap", "transMap_pairwise", "txTM"):
+        ancestor_modes = config.get("ancestor_modes") or []
+        for m in ancestor_modes:
+            if m not in ("transMap", "transMap_pairwise", "txTM", "augMP"):
                 errors.append(
                     f"ancestor_modes contains unsupported mode '{m}' "
-                    "(allowed: transMap, transMap_pairwise, txTM)"
+                    "(allowed: transMap, transMap_pairwise, txTM, augMP)"
+                )
+        if "augMP" in ancestor_modes:
+            if not config.get("augustus", False):
+                errors.append(
+                    "ancestor_modes includes 'augMP' but augustus is disabled; "
+                    "augMP (miniprot) requires the Augustus/miniprot path"
+                )
+            if "transMap" not in ancestor_modes:
+                errors.append(
+                    "ancestor_modes includes 'augMP' which requires 'transMap' "
+                    "(Augustus MP uses the transMap PSL as alignment context)"
                 )
 
     for w in warnings:
@@ -144,12 +156,14 @@ AUGUSTUS_PB_GENOMES = [g for g in ISOSEQ_GENOMES if config.get("augustus_pb", Fa
 STRG_GENOMES = [g for g in ISOSEQ_GENOMES if config.get("stringtie", False) and g in config.get("stringtie_genomes", TARGET_GENOMES)]
 
 # --- Protein reference set for miniprot / augMP --------------------------------
-# augMP aligns a protein database to every target genome with miniprot. Using only
-# reference (e.g. human) proteins means augMP can never find a gene that has no
-# reference ortholog. A `protein_db:` block builds a broader, multi-species protein
-# set from UniProt reference proteomes (scripts/build_protein_db.py); its output
-# then becomes the miniprot input. Without that block the static `protein_fasta:`
-# file is used directly. PROTEIN_FASTA is the single source of truth downstream.
+# augMP aligns a protein database to every annotated genome with miniprot
+# (target leaves when augustus is on, plus ancestors when augMP is in
+# ancestor_modes). Using only reference (e.g. human) proteins means augMP can
+# never find a gene that has no reference ortholog. A `protein_db:` block builds
+# a broader, multi-species protein set from UniProt reference proteomes
+# (scripts/build_protein_db.py); its output then becomes the miniprot input.
+# Without that block the static `protein_fasta:` file is used directly.
+# PROTEIN_FASTA is the single source of truth downstream.
 _PROTEIN_DB_CFG = config.get("protein_db")
 if _PROTEIN_DB_CFG:
     PROTEIN_FASTA = _PROTEIN_DB_CFG.get("out") or f"{config['work_dir']}/protein_db/protein_db.fa"
@@ -179,9 +193,10 @@ if config.get("augustus", False):
 if config.get("txTM", False):
     ACTIVE_ALIGNMENT_MODES.append("txTM")
 
-# Ancestor genome annotation (internal Cactus HAL nodes)
-ANCESTOR_MODES_DEFAULT = ["transMap", "transMap_pairwise", "txTM"]
-VALID_ANCESTOR_MODES = ["transMap", "transMap_pairwise", "txTM"]
+# Ancestor genome annotation (internal Cactus HAL nodes).
+# Alignment-only plus miniprot/augMP (no RNA-seq / Augustus PB / StringTie).
+ANCESTOR_MODES_DEFAULT = ["transMap", "transMap_pairwise", "txTM", "augMP"]
+VALID_ANCESTOR_MODES = ["transMap", "transMap_pairwise", "txTM", "augMP"]
 
 def _genome_wc(genomes):
     return "|".join(genomes) if genomes else "never_match"
@@ -218,10 +233,17 @@ ANCESTOR_ALIGNMENT_MODES = [m for m in ANCESTOR_MODES if m in VALID_ANCESTOR_MOD
 ALL_ALIGNMENT_MODES = list(dict.fromkeys(ACTIVE_ALIGNMENT_MODES + ANCESTOR_ALIGNMENT_MODES))
 TXTM_GENOMES = ([g for g in TARGET_GENOMES if config.get("txTM", False)] +
                 [g for g in ANCESTOR_GENOMES if "txTM" in ANCESTOR_MODES])
+# miniprot / augMP: every Augustus leaf, plus ancestors when augMP is requested.
+AUGMP_GENOMES = list(AUGUSTUS_GENOMES)
+if ANCESTOR_GENOMES and "augMP" in ANCESTOR_MODES:
+    for g in ANCESTOR_GENOMES:
+        if g not in AUGMP_GENOMES:
+            AUGMP_GENOMES.append(g)
 ANNOTATION_GENOME_WC = _genome_wc(ANNOTATION_GENOMES)
 TXTM_GENOME_WC = _genome_wc(TXTM_GENOMES)
 # Per-mode genome wildcard patterns (reused across the Augustus rules).
 AUGUSTUS_GENOME_WC = _genome_wc(AUGUSTUS_GENOMES)
+AUGMP_GENOME_WC = _genome_wc(AUGMP_GENOMES)
 RNASEQ_GENOME_WC = _genome_wc(RNASEQ_GENOMES)
 AUGUSTUS_RNASEQ_GENOME_WC = _genome_wc([g for g in RNASEQ_GENOMES if g in AUGUSTUS_GENOMES])
 AUGUSTUS_NON_RNASEQ_GENOME_WC = _genome_wc([g for g in NON_RNASEQ_GENOMES if g in AUGUSTUS_GENOMES])
@@ -2449,7 +2471,7 @@ rule run_miniprot:
         paf=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.paf",
         splice_scores=f"{config['work_dir']}/miniprot/{{genome}}_minisplice_scores.tsv"
     wildcard_constraints:
-        genome = "|".join(TARGET_GENOMES)
+        genome = AUGMP_GENOME_WC
     priority: 90  # High priority to unblock augustus
     log:
         f"{config['work_dir']}/logs/miniprot/{{genome}}.log"
@@ -2969,7 +2991,7 @@ rule miniprot_paf_to_genepred:
         gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp",
         psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl"
     wildcard_constraints:
-        genome = AUGUSTUS_GENOME_WC
+        genome = AUGMP_GENOME_WC
     log:
         f"{config['work_dir']}/logs/miniprot_to_gp/{{genome}}.log"
     resources:
@@ -3010,7 +3032,7 @@ rule augustus_run_mp:
         mp_gtf=f"{config['work_dir']}/augustus/{{genome}}_augMP.gtf",
         mp_gtf_done=f"{config['work_dir']}/augustus/{{genome}}_augMP.gtf.done"
     wildcard_constraints:
-        genome = AUGUSTUS_GENOME_WC
+        genome = AUGMP_GENOME_WC
     params:
         work_dir=config['work_dir'],
         species=config['augustus_species'],
@@ -3136,7 +3158,7 @@ rule augustus_convert_mp_gtf_to_gp:
     output:
         gp=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.gp"
     wildcard_constraints:
-        genome = AUGUSTUS_GENOME_WC
+        genome = AUGMP_GENOME_WC
     log:
         f"{config['work_dir']}/logs/augustus_convert/{{genome}}_augMP.log"
     resources:
@@ -3165,7 +3187,7 @@ rule fix_augmp_gene_names:
     output:
         done=touch(f"{config['work_dir']}/databases/{{genome}}_augMP_gene_names_fixed.done")
     wildcard_constraints:
-        genome = AUGUSTUS_GENOME_WC
+        genome = AUGMP_GENOME_WC
     log:
         f"{config['work_dir']}/logs/fix_augmp_gene_names/{{genome}}.log"
     resources:
@@ -3654,7 +3676,8 @@ def get_evaluation_done_inputs(wildcards):
     """
     Collect only the evaluation.done files for the supported alignment modes.
     Uses per-genome active modes so e.g. augTMR is not required for genomes
-    without RNA-seq (bosTau8), while ancestors only get ancestor_modes.
+    without RNA-seq (bosTau8), while ancestors only get ancestor_modes
+    (transMap / transMap_pairwise / txTM / augMP).
     """
     alignment_modes = get_alignment_modes_for_genome(wildcards)
     return expand(
@@ -3738,23 +3761,17 @@ def get_consensus_inputs(wildcards):
     work_dir = config["work_dir"]
     genome = wildcards.genome
     done_files = []
-    if genome in ANCESTOR_GENOMES:
-        if "txTM" in ANCESTOR_MODES:
-            done_files.append(f"{work_dir}/databases/{genome}_txTM_psl_metrics.done")
-        if "transMap" in ANCESTOR_MODES:
-            done_files.append(f"{work_dir}/databases/{genome}_transMap_psl_metrics.done")
-        if "transMap_pairwise" in ANCESTOR_MODES:
-            done_files.append(f"{work_dir}/databases/{genome}_transMap_pairwise_psl_metrics.done")
-    else:
-        if config.get("txTM", False):
-            done_files.append(f"{work_dir}/databases/{genome}_txTM_psl_metrics.done")
+    if "txTM" in active_modes:
+        done_files.append(f"{work_dir}/databases/{genome}_txTM_psl_metrics.done")
+    if "transMap" in active_modes:
         done_files.append(f"{work_dir}/databases/{genome}_transMap_psl_metrics.done")
+    if "transMap_pairwise" in active_modes:
         done_files.append(f"{work_dir}/databases/{genome}_transMap_pairwise_psl_metrics.done")
-        # augMP has no native DB metrics tables; add the real miniprot-PSL-derived
-        # coverage/identity (see generate_augMP_psl) so consensus filtering treats
-        # augMP like other modes.
-        if "augMP" in active_modes:
-            done_files.append(f"{work_dir}/databases/{genome}_augMP_psl_metrics.done")
+    # augMP has no native DB metrics tables; add the real miniprot-PSL-derived
+    # coverage/identity (see generate_augMP_psl) so consensus filtering treats
+    # augMP like other modes. Applies to both leaves and ancestors.
+    if "augMP" in active_modes:
+        done_files.append(f"{work_dir}/databases/{genome}_augMP_psl_metrics.done")
     inputs["psl_metrics_done"] = done_files
     
     return inputs
@@ -3768,6 +3785,20 @@ def psl_metrics_prior_after_txTM(wildcards):
         return f"{config['work_dir']}/.setup_done"
     if config.get("txTM", False):
         return f"{config['work_dir']}/databases/{wildcards.genome}_txTM_psl_metrics.done"
+    return f"{config['work_dir']}/.setup_done"
+
+
+def psl_metrics_prior_for_augMP(wildcards):
+    """Order PSL metric DB writes: augMP runs after the last map-mode metrics write."""
+    genome = wildcards.genome
+    modes = (ANCESTOR_MODES if genome in ANCESTOR_GENOMES
+             else get_active_modes_for_wildcards(wildcards))
+    if "transMap_pairwise" in modes:
+        return f"{config['work_dir']}/databases/{genome}_transMap_pairwise_psl_metrics.done"
+    if "transMap" in modes:
+        return f"{config['work_dir']}/databases/{genome}_transMap_psl_metrics.done"
+    if "txTM" in modes:
+        return f"{config['work_dir']}/databases/{genome}_txTM_psl_metrics.done"
     return f"{config['work_dir']}/.setup_done"
 
 
@@ -3870,7 +3901,7 @@ rule generate_augMP_psl:
         # Sentinel so store_psl_metrics_augMP cannot run on a stale 0-byte PSL file.
         generated=f"{config['work_dir']}/databases/{{genome}}_augMP_psl_generated.done",
     wildcard_constraints:
-        genome = "|".join(TARGET_GENOMES)
+        genome = AUGMP_GENOME_WC
     log:
         f"{config['work_dir']}/logs/generate_augMP_psl/{{genome}}.log"
     shell:
@@ -3911,7 +3942,7 @@ rule filter_augMP:
         gp=f"{config['work_dir']}/augustus/{{genome}}_augMP.gp",
         psl=f"{config['work_dir']}/augustus/{{genome}}_augMP.psl",
     wildcard_constraints:
-        genome = "|".join(TARGET_GENOMES)
+        genome = AUGMP_GENOME_WC
     params:
         disabled_flag="" if rcfg("augMP_filter_enabled", True) else "--disabled",
         max_per_locus=rcfg("augMP_filter_max_models_per_locus", 25),
@@ -3945,11 +3976,11 @@ rule store_psl_metrics_augMP:
         # freshness is tracked by the *_psl_metrics.done markers.
         db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
         ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
-        prior_pairwise=f"{config['work_dir']}/databases/{{genome}}_transMap_pairwise_psl_metrics.done",
+        prior_pairwise=psl_metrics_prior_for_augMP,
     output:
         done=f"{config['work_dir']}/databases/{{genome}}_augMP_psl_metrics.done"
     wildcard_constraints:
-        genome = "|".join(TARGET_GENOMES)
+        genome = AUGMP_GENOME_WC
     shell:
         """
         set -euo pipefail
@@ -4074,8 +4105,8 @@ python -m cat.consensus_runner \\
     --cnv-score-similarity {rcfg("cnv_score_similarity", 0.80)} \\
     --fragment-max-coverage {rcfg("consensus_fragment_max_coverage", 30.0)} \\
     --fragment-max-identity {rcfg("consensus_fragment_max_identity", 30.0)} \\
-    {"--keep-protein-only-novel " if rcfg("keep_protein_only_novel", False) else ""}\\
-    {f"--protein-novel-min-coverage {rcfg('protein_novel_min_coverage', 0.0)} --protein-novel-min-identity {rcfg('protein_novel_min_identity', 0.0)} --protein-novel-min-exons {rcfg('protein_novel_min_exons', 2)} --protein-novel-min-cds-aa {rcfg('protein_novel_min_cds_aa', 100)} " if rcfg("keep_protein_only_novel", False) else ""}\\
+    {"--keep-protein-only-novel " if rcfg("keep_protein_only_novel", True) else "--no-keep-protein-only-novel "}\\
+    {f"--protein-novel-min-coverage {rcfg('protein_novel_min_coverage', 0.0)} --protein-novel-min-identity {rcfg('protein_novel_min_identity', 0.0)} --protein-novel-min-exons {rcfg('protein_novel_min_exons', 2)} --protein-novel-min-cds-aa {rcfg('protein_novel_min_cds_aa', 100)} " if rcfg("keep_protein_only_novel", True) else ""}\\
     {"--protein-novel-keep-overlapping " if rcfg("protein_novel_keep_overlapping", False) else ""}\\
     {f"--rescue-expressed-noncoding-to-pc --rescue-expressed-min-cds-aa {rcfg('rescue_expressed_min_cds_aa', 100)} " if rcfg("rescue_expressed_noncoding_to_pc", True) else ""}\\
     {"--rescue-expressed-allow-single-exon " if rcfg("rescue_expressed_allow_single_exon", False) else ""}\\
