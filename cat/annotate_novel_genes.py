@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 NOVEL_CLASS = 'putative_novel'
 
 
+def read_gp_info(path):
+    """Load a consensus gp_info TSV as a (gene_id, transcript_id) MultiIndex frame.
+
+    Do not pass index_col= to read_csv. Pandas 3.x low_memory chunking plus
+    index_col raises IndexError on mixed numeric/'N/A' columns (GH#67375).
+    """
+    df = pd.read_csv(path, sep='\t', low_memory=False)
+    return df.set_index(['gene_id', 'transcript_id'])
+
+
 # ── Reference protein extraction ─────────────────────────────────────────────
 
 def build_tx_to_gene_name_map(gp_attrs_file):
@@ -236,7 +246,7 @@ def update_gp_info(gp_info_file, output_gp_info, tx_descriptions, tx_novel_class
     """
     tx_novel_class = tx_novel_class or {}
     drop_tx_ids = drop_tx_ids or set()
-    df = pd.read_csv(gp_info_file, sep='\t', index_col=[0, 1])
+    df = read_gp_info(gp_info_file)
     if drop_tx_ids:
         keep = ~df.index.get_level_values('transcript_id').isin(drop_tx_ids)
         df = df[keep]
@@ -471,7 +481,7 @@ def main():
 
     # ── Step 1: identify novel transcripts ───────────────────────────────────
     logger.info("Reading consensus gp_info...")
-    gp_info_df = pd.read_csv(args.consensus_gp_info, sep='\t', index_col=[0, 1])
+    gp_info_df = read_gp_info(args.consensus_gp_info)
 
     tc_col = 'transcript_class'
     if tc_col not in gp_info_df.columns:
