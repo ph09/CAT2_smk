@@ -4,8 +4,9 @@ hal: "test_data/vertebrates.hal"
 annotation: "test_data/GRCm38.mm10.subset.gff3"
 
 # --- Protein set for miniprot / augMP -----------------------------------------
-# augMP aligns a protein database to every target genome with miniprot; it is the
-# one mode that can find genes ABSENT from the reference annotation (lineage-
+# augMP aligns a protein database to every annotated genome with miniprot
+# (leaves, and ancestors when augMP is in ancestor_modes). It is the one mode
+# that can find genes ABSENT from the reference annotation (lineage-
 # specific genes, or genes lost in the reference lineage). It can only find such
 # genes if the protein DB actually contains proteins from those lineages, so with
 # a single-species (e.g. human-only) reference you will miss non-reference genes.
@@ -161,14 +162,14 @@ global_near_best: 0.15
 
 # Protein-only novel genes: lineage-specific genes found ONLY via protein/augMP
 # evidence (a miniprot model whose protein is not a reference transcript, e.g. a
-# non-human primate gene absent from a human reference). Off by default: such
-# models are otherwise kept but mislabeled as 'ortholog' with a synthetic id and
-# exposed to CDS-overlap resolution. When true, they are relabeled putative_novel
-# protein_coding with clean MP-NOVEL-<genome>-N ids, redundant per-locus copies
-# are collapsed, and (unless protein_novel_keep_overlapping) only intergenic loci
-# are kept. Automatically enabled under high_recall. Pair with a multi-species
-# protein_db (above) so augMP actually has non-reference proteins to find.
-#keep_protein_only_novel: false
+# non-human primate gene absent from a human reference). On by default: they are
+# relabeled putative_novel protein_coding with clean MP-NOVEL-<genome>-N ids,
+# redundant per-locus copies are collapsed, and (unless
+# protein_novel_keep_overlapping) only intergenic loci are kept. Set false to
+# leave them as mislabeled 'ortholog' with a synthetic id. Pair with a
+# multi-species protein_db (above) so augMP actually has non-reference proteins
+# to find.
+#keep_protein_only_novel: true
 #protein_novel_min_coverage: 0.0    # extra miniprot coverage floor (percent) for these genes
 #protein_novel_min_identity: 0.0    # extra miniprot identity floor (percent)
 #protein_novel_keep_overlapping: false  # true = also keep ones overlapping a reference gene's CDS
@@ -197,10 +198,11 @@ overlapping_ignore_bases: 0
 # Annotate reconstructed ancestral genomes from the Cactus HAL alignment.
 # When enabled, internal tree nodes on the subtree spanning config genomes are
 # auto-detected (or set explicitly via ancestor_genomes) and projected using
-# alignment-only modes (no RNA-seq / Augustus PB).
+# alignment-only modes plus miniprot/augMP (no RNA-seq / Augustus PB / StringTie).
+# augMP requires augustus: true and transMap in ancestor_modes.
 annotate_ancestors: true
 ancestor_genomes: ["Anc0", "Anc1", "Anc2", "Anc3", "Anc4", "Anc5", "Anc6"]   # optional explicit list, e.g. ["Anc0", "Anc1"]
-ancestor_modes: ["transMap", "transMap_pairwise", "txTM"]
+ancestor_modes: ["transMap", "transMap_pairwise", "txTM", "augMP"]
 
 # Execution mode
 # Determines the cluster backend used by every CAT2 rule and helper script.
@@ -224,6 +226,10 @@ ancestor_modes: ["transMap", "transMap_pairwise", "txTM"]
 #             arrays. Best for small inputs or when no supported scheduler is
 #             available; resource hints come from the `local:` block below.
 execution_mode: "slurm"
+# Optional override for cluster job `conda activate` only when snakemake is
+# launched *without* an activated env. Prefer activating first so
+# CONDA_DEFAULT_ENV is set — there is no baked-in default env name in code.
+# conda_env: "my_env_name"
 
 # ─── SGE-specific knobs (used when execution_mode: sge) ──────────────────────
 # Site-agnostic Grid Engine config. The CAT2 pipeline reads these once at
