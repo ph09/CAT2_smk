@@ -181,13 +181,20 @@ def add_arguments(parser):
     parser.add_argument("--fragment-max-identity", type=float, default=30.0, help="Identity (percent) companion to --fragment-max-coverage; set to 0 to disable fragment reclassification.")
     parser.add_argument(
         "--keep-protein-only-novel",
+        dest="keep_protein_only_novel",
         action="store_true",
+        default=True,
         help="Retain (and cleanly label) lineage-specific genes found ONLY in protein/augMP "
-             "evidence, i.e. augMP models whose protein is not a reference transcript. When set, "
-             "such orphan models are relabeled 'putative_novel' protein_coding with MP-NOVEL-<genome>-N "
+             "evidence, i.e. augMP models whose protein is not a reference transcript. Orphan "
+             "models are relabeled 'putative_novel' protein_coding with MP-NOVEL-<genome>-N "
              "gene ids, redundant per-locus copies are collapsed, and (unless "
-             "--protein-novel-keep-overlapping) only intergenic loci are kept. Off by default; "
-             "enabled automatically under high_recall.",
+             "--protein-novel-keep-overlapping) only intergenic loci are kept. On by default.",
+    )
+    parser.add_argument(
+        "--no-keep-protein-only-novel",
+        dest="keep_protein_only_novel",
+        action="store_false",
+        help="Disable protein-only novel reclassification (orphans stay mislabeled as ortholog).",
     )
     parser.add_argument(
         "--protein-novel-min-coverage",
@@ -2163,12 +2170,12 @@ def generate_consensus(args):
     )
 
     # Guarantee retention + clean labeling of lineage-specific genes found ONLY in
-    # protein/augMP evidence (no reference transcript). Off by default; enabled via
-    # --keep-protein-only-novel (which the high_recall preset turns on). Runs after
-    # the reference rescues so the intergenic test sees the full reference footprint,
-    # and before the gene/PC counting + completeness below so survivors are counted
-    # as novel protein-coding genes in the final stats.
-    if getattr(args, 'keep_protein_only_novel', False):
+    # protein/augMP evidence (no reference transcript). On by default; disable with
+    # --no-keep-protein-only-novel. Runs after the reference rescues so the
+    # intergenic test sees the full reference footprint, and before the gene/PC
+    # counting + completeness below so survivors are counted as novel protein-coding
+    # genes in the final stats.
+    if getattr(args, 'keep_protein_only_novel', True):
         before = len(final_consensus)
         final_consensus = reclassify_protein_only_novel(
             final_consensus, tx_dict, ref_df, metrics, args.genome,
