@@ -250,6 +250,23 @@ AUGUSTUS_NON_RNASEQ_GENOME_WC = _genome_wc([g for g in NON_RNASEQ_GENOMES if g i
 AUGUSTUS_PB_GENOME_WC = _genome_wc(AUGUSTUS_PB_GENOMES)
 STRG_GENOME_WC = _genome_wc(STRG_GENOMES)
 
+# Drop bulky one-hop intermediates once their last consumer finishes. Expensive
+# products (PAF, chains, filtered genePreds, consensus) are kept so consensus
+# / converter / filter reruns do not redo miniprot or Augustus. Set
+# clean_intermediates: false to retain everything.
+CLEAN_INTERMEDIATES = bool(config.get("clean_intermediates", True))
+
+def maybe_temp(path):
+    """Wrap ``path`` in ``temp()`` when clean_intermediates is on.
+
+    Only use when every kept product of the producing rule stays as a
+    non-temp output, or the whole rule is cheap given files we keep.
+    Temping one output of an expensive multi-output rule whose other
+    outputs must survive will rerun that whole rule when the temp file
+    is later missing.
+    """
+    return temp(path) if CLEAN_INTERMEDIATES else path
+
 # Wildcard constraints for validation
 wildcard_constraints:
     genome = f"({'|'.join(TARGET_GENOMES)})",
@@ -340,6 +357,7 @@ _RULE_DEFAULTS = {
     # controller_mem_gb / controller_time_h: Snakemake resources for the waiting
     # localrule on the controller (override when the waiter needs more headroom).
     "prepare_genome_files":      {"mem": "128G", "cpus": 64,  "time": "01:00:00", "timeout_hours": 4},
+    "build_miniprot_index":      {"mem": "64G",  "cpus": 16,  "time": "01:00:00", "timeout_hours": 3},
     "prepare_reference_files":   {"mem": "64G",  "cpus": 2,   "time": "01:00:00", "timeout_hours": 3},
     "transmap_map_psl":          {"mem": "16G",  "cpus": 4,   "time": "01:00:00", "timeout_hours": 2},
     "transmap_unfiltered_gtf":   {"mem": "16G",  "cpus": 1,   "time": "01:00:00", "timeout_hours": 2},
@@ -401,6 +419,7 @@ _RULE_DEFAULTS = {
 
 _LOCAL_DEFAULTS = {
     "prepare_genome_files":    {"threads": 64,  "mem_gb": 128, "time_h": 4},
+    "build_miniprot_index":    {"threads": 16,  "mem_gb": 64,  "time_h": 2},
     "prepare_reference_files": {"threads": 2,   "mem_gb": 64,  "time_h": 2},
     "transmap_map_psl":        {"threads": 4,   "mem_gb": 16,  "time_h": 2},
     "transmap_unfiltered_gtf": {"threads": 1,   "mem_gb": 16,  "time_h": 1},
@@ -1027,7 +1046,7 @@ def run_or_submit(script_body, job_script_path, outputs_to_check,
 # declared local so Snakemake doesn't double-count their threads — actual
 # concurrency is gated by threads: / mem_gb: in each rule's resources block.
 localrules: setup_pipeline_directories, build_db, prepare_genome_files, \
-    prepare_reference_files, transmap_map_psl, run_miniprot, run_transcript_map, \
+    build_miniprot_index, prepare_reference_files, transmap_map_psl, run_miniprot, run_transcript_map, \
     run_chaining_per_genome, transmap_unfiltered_gtf, minimap2_bam, \
     bam_to_chain, transmap_pairwise_map_psl, augustus_run_tm_and_tmr, \
     augustus_run_tm_only, augustus_run_tm_pairwise_and_tmr_pairwise, \
@@ -1114,9 +1133,6 @@ rule prepare_genome_files:
         two_bit = WORK_DIR / "genome_files/{genome}.2bit", 
         sizes = WORK_DIR / "genome_files/{genome}.chrom.sizes",
         fasta_index = WORK_DIR / "genome_files/{genome}.fa.fai",
-        # The miniprot index is only needed by the augMP path; skip it otherwise.
-        **({"protein_index": WORK_DIR / "genome_files/{genome}.mpi"}
-           if config.get("augustus", False) else {}),
     wildcard_constraints:
         genome = f"({'|'.join(ALL_GENOMES)})"
     threads: 1 if IS_CLUSTER else get_local_res("prepare_genome_files", "threads")
@@ -1135,16 +1151,6 @@ rule prepare_genome_files:
         work_dir = config['work_dir']
         genome = wildcards.genome
         job_script = f"{work_dir}/genome_files/{genome}_prepare_job.sh"
-
-        # The miniprot index is only needed by the augMP path; skip it otherwise.
-        if config.get("augustus", False):
-            miniprot_index_cmd = (
-                "\n# Create miniprot index (augMP path only)\n"
-                f"miniprot -t{job_cpus('prepare_genome_files', threads)} "
-                f"-d {output.protein_index} {output.fasta} 2>> {log[0]}\n"
-            )
-        else:
-            miniprot_index_cmd = ""
 
         script_content = build_sbatch_header(
             "prepare_genome_files",
@@ -1169,7 +1175,7 @@ faSize -detailed {output.fasta} > {output.sizes} 2>> {log[0]}
 
 # Index FASTA for pysam
 samtools faidx {output.fasta} 2>> {log[0]}
-{miniprot_index_cmd}
+
 # Log completion
 echo "Completed genome preparation for: {genome}"
 echo "End time: $(date)"
@@ -1180,11 +1186,57 @@ echo "End time: $(date)"
             run_or_submit(
                 script_content,
                 job_script,
-                [output.fasta, output.two_bit, output.sizes, output.fasta_index]
-                + ([output.protein_index] if config.get("augustus", False) else []),
+                [output.fasta, output.two_bit, output.sizes, output.fasta_index],
                 log_file,
                 "prepare_genome_files",
                 max_wait_s=timeout_s("prepare_genome_files")
+            )
+
+rule build_miniprot_index:
+    """Build the miniprot .mpi index from the genome FASTA.
+
+    Split out of prepare_genome_files so the index can be dropped after
+    run_miniprot without forcing a HAL extract / 2bit rebuild.
+    """
+    input:
+        fasta=WORK_DIR / "genome_files/{genome}.fa",
+    output:
+        protein_index=maybe_temp(WORK_DIR / "genome_files/{genome}.mpi"),
+    wildcard_constraints:
+        genome=AUGMP_GENOME_WC,
+    threads: 1 if IS_CLUSTER else get_local_res("build_miniprot_index", "threads")
+    resources:
+        mem_gb=snk_mem_gb("build_miniprot_index"),
+        time_h=snk_time_h("build_miniprot_index"),
+        job_id=lambda wildcards, attempt: f"miniprot-index-{wildcards.genome}-{attempt}",
+    log:
+        WORK_DIR / "logs/prepare_genome_files/{genome}_mpi.log"
+    run:
+        work_dir = config["work_dir"]
+        genome = wildcards.genome
+        job_script = f"{work_dir}/genome_files/{genome}_mpi_job.sh"
+        cpus = job_cpus("build_miniprot_index", threads)
+        script_content = build_sbatch_header(
+            "build_miniprot_index",
+            f"mpi-{genome}",
+            f"{work_dir}/logs/prepare_genome_files/{genome}_mpi_slurm.out",
+            f"{work_dir}/logs/prepare_genome_files/{genome}_mpi_slurm.err",
+        ) + f"""
+echo "Building miniprot index for: {genome}"
+echo "Start time: $(date)"
+miniprot -t{cpus} -d {output.protein_index} {input.fasta} 2>> {log[0]}
+echo "Completed miniprot index for: {genome}"
+echo "End time: $(date)"
+"""
+        with open(log[0], "a") as log_file:
+            log_file.write(f"Submitting miniprot index job for {genome}...\n")
+            run_or_submit(
+                script_content,
+                job_script,
+                [output.protein_index],
+                log_file,
+                "build_miniprot_index",
+                max_wait_s=timeout_s("build_miniprot_index"),
             )
 
 rule init_target_genome_database:
@@ -1586,8 +1638,8 @@ rule minimap2_bam:
         query_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
         query_fa=f"{config['work_dir']}/genome_files/{config['ref_genome']}.fa"
     output:
-        bam=f"{config['work_dir']}/chaining_bam/{{genome}}/{config['ref_genome']}-{{genome}}.bam",
-        bam_bai=f"{config['work_dir']}/chaining_bam/{{genome}}/{config['ref_genome']}-{{genome}}.bam.bai",
+        bam=maybe_temp(f"{config['work_dir']}/chaining_bam/{{genome}}/{config['ref_genome']}-{{genome}}.bam"),
+        bam_bai=maybe_temp(f"{config['work_dir']}/chaining_bam/{{genome}}/{config['ref_genome']}-{{genome}}.bam.bai"),
     wildcard_constraints:
         genome = ANNOTATION_GENOME_WC
     params:
@@ -2250,8 +2302,8 @@ rule stringtie_merge_bams:
         # Use the helper function to dynamically get lists of BAMs
         unpack(get_stringtie_bams)
     output:
-        sr_merged=f"{config['work_dir']}/stringtie/{{genome}}_short_read_merged.bam",
-        lr_merged=f"{config['work_dir']}/stringtie/{{genome}}_long_read_merged.bam"
+        sr_merged=maybe_temp(f"{config['work_dir']}/stringtie/{{genome}}_short_read_merged.bam"),
+        lr_merged=maybe_temp(f"{config['work_dir']}/stringtie/{{genome}}_long_read_merged.bam")
     log:
         f"{config['work_dir']}/logs/stringtie_merge/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_merge", "threads")
@@ -2303,7 +2355,7 @@ rule stringtie_sort_bams:
         # Use a wildcard to handle both short and long read types
         bam=f"{config['work_dir']}/stringtie/{{genome}}_{{type}}_read_merged.bam"
     output:
-        bam=f"{config['work_dir']}/stringtie/{{genome}}_{{type}}_read_merged_sorted.bam"
+        bam=maybe_temp(f"{config['work_dir']}/stringtie/{{genome}}_{{type}}_read_merged_sorted.bam")
     log:
         f"{config['work_dir']}/logs/stringtie_sort/{{genome}}_{{type}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_sort", "threads")
@@ -2353,7 +2405,7 @@ rule stringtie_run:
         sr_sorted=f"{config['work_dir']}/stringtie/{{genome}}_short_read_merged_sorted.bam",
         lr_sorted=f"{config['work_dir']}/stringtie/{{genome}}_long_read_merged_sorted.bam"
     output:
-        temp_gtf=f"{config['work_dir']}/stringtie/{{genome}}_temp_stringtie.gtf"
+        temp_gtf=maybe_temp(f"{config['work_dir']}/stringtie/{{genome}}_temp_stringtie.gtf")
     log:
         f"{config['work_dir']}/logs/stringtie_run/{{genome}}.log"
     threads: 1 if IS_CLUSTER else get_local_res("stringtie_run", "threads")
@@ -2469,7 +2521,6 @@ rule run_miniprot:
     output:
         hints=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_hints.gff",
         paf=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.paf",
-        splice_scores=f"{config['work_dir']}/miniprot/{{genome}}_minisplice_scores.tsv"
     wildcard_constraints:
         genome = AUGMP_GENOME_WC
     priority: 90  # High priority to unblock augustus
@@ -2490,6 +2541,9 @@ rule run_miniprot:
         genome = wildcards.genome
         job_script = f"{work_dir}/miniprot/{genome}_miniprot_job.sh"
         miniprot_cpus = job_cpus("run_miniprot", threads)
+        splice_scores = f"{work_dir}/miniprot/{genome}_minisplice_scores.tsv"
+        chrom_fa_dir = f"{work_dir}/miniprot/{genome}_minisplice_chrom_fasta"
+        chrom_scores_dir = f"{work_dir}/miniprot/{genome}_minisplice_by_chrom"
         minisplice_step = build_minisplice_step(
             work_dir=work_dir,
             genome=genome,
@@ -2497,7 +2551,7 @@ rule run_miniprot:
             chrom_sizes=input.chrom_sizes,
             minisplice_model=input.minisplice_model,
             minisplice_calibration=input.minisplice_calibration,
-            splice_scores_out=output.splice_scores,
+            splice_scores_out=splice_scores,
             log_path=log[0],
             use_slurm_array=IS_CLUSTER,
             cpus=miniprot_cpus,
@@ -2515,12 +2569,12 @@ rule run_miniprot:
 # Step 1a: Run miniprot in PAF mode with splice scores (templates for augMP)
 echo "Running miniprot for PAF (templates)..." >> {log[0]}
 echo "miniprot map flags: {map_flags}" >> {log[0]}
-miniprot {map_flags} --spsc={output.splice_scores} {input.genome_index} {input.protein_ref} > {output.paf} 2>> {log[0]}
+miniprot {map_flags} --spsc={splice_scores} {input.genome_index} {input.protein_ref} > {output.paf} 2>> {log[0]}
 
 # Step 1b: Run miniprot with --gtf and splice scores for hints generation
 echo "Running miniprot for GTF (hints)..." >> {log[0]}
 TEMP_GTF={work_dir}/miniprot/{genome}_miniprot_temp.gtf
-miniprot {map_flags} --gtf --spsc={output.splice_scores} {input.genome_index} {input.protein_ref} > $TEMP_GTF 2>> {log[0]}
+miniprot {map_flags} --gtf --spsc={splice_scores} {input.genome_index} {input.protein_ref} > $TEMP_GTF 2>> {log[0]}
 
 # Step 2: Convert the GTF output to an Augustus hints file
 echo "Converting GTF to hints..." >> {log[0]}
@@ -2529,8 +2583,9 @@ aln2hints.pl --genome_file={input.genome_fasta} \\
              --out={output.hints} \\
              --prg=miniprot >> {log[0]} 2>&1
 
-# Clean up temporary GTF
-rm -f $TEMP_GTF
+# Drop scratch: temp GTF, splice scores, and the extra per-chromosome genome copy.
+rm -f $TEMP_GTF {splice_scores}
+rm -rf {chrom_fa_dir} {chrom_scores_dir}
 """
 
         with open(log[0], 'a') as log_file:
@@ -2538,7 +2593,7 @@ rm -f $TEMP_GTF
             run_or_submit(
                 script_content,
                 job_script,
-                [output.hints, output.paf, output.splice_scores],
+                [output.hints, output.paf],
                 log_file,
                 "run_miniprot",
                 max_wait_s=timeout_s_val
@@ -2988,8 +3043,8 @@ rule miniprot_paf_to_genepred:
     input:
         paf=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.paf"
     output:
-        gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp",
-        psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl"
+        gp=maybe_temp(f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp"),
+        psl=maybe_temp(f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl")
     wildcard_constraints:
         genome = AUGMP_GENOME_WC
     log:
@@ -3897,7 +3952,7 @@ rule generate_augMP_psl:
         miniprot_psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl",
         augmp_fix=f"{config['work_dir']}/databases/{{genome}}_augMP_gene_names_fixed.done",
     output:
-        psl=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl",
+        psl=maybe_temp(f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl"),
         # Sentinel so store_psl_metrics_augMP cannot run on a stale 0-byte PSL file.
         generated=f"{config['work_dir']}/databases/{{genome}}_augMP_psl_generated.done",
     wildcard_constraints:
@@ -4147,6 +4202,18 @@ python -m cat.consensus_runner \\
     {isoseq_bam_args} \\
     {ref_gp_arg} \\
     {optional_flags_str}
+
+# Drop per-genome scratch that consensus no longer needs. Kept products
+# (genePreds, PAF, chains, alignment PSLs, consensus) are untouched.
+if [ "{int(CLEAN_INTERMEDIATES)}" = "1" ]; then
+    rm -rf {work_dir}/toil_job_stores/align_transcripts_{genome}_* \\
+           {work_dir}/toil_job_stores/{genome}_hints \\
+           {work_dir}/augustus_mp_temp_{genome} \\
+           {work_dir}/augustus_parallel_temp_{genome} \\
+           {work_dir}/augustus_pb_parallel_temp_{genome} \\
+           {work_dir}/miniprot/{genome}_minisplice_chrom_fasta \\
+           {work_dir}/miniprot/{genome}_minisplice_by_chrom
+fi
 """
 
         with open(log[0], 'a') as log_file:
