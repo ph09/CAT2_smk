@@ -129,6 +129,12 @@ denovo_allow_bad_annot_or_tm: False
 require_pacbio_support: False
 in_species_rna_support_only: False
 rebuild_consensus: true
+# Drop bulky one-hop intermediates once their last consumer finishes (minimap2
+# BAMs, minisplice per-chrom FASTA, miniprot .mpi, converted miniprot gp/psl,
+# StringTie merged BAMs, leftover Toil/Augustus temp dirs). Expensive products
+# (miniprot PAF, chains, Augustus GTF/GP, consensus) are kept so converter /
+# consensus reruns stay cheap. Set false to retain everything.
+clean_intermediates: true
 
 # ─── recall vs precision ──────────────────────────────────────────────────────
 # high_recall is an opt-in master switch. When true, the recall-limiting gates
