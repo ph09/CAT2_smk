@@ -852,14 +852,14 @@ def build_minisplice_step(
     use_slurm_array,
     cpus,
 ):
-    """Return bash for minisplice predict, optionally one cluster task per chromosome.
+    """Return bash for minisplice predict.
+
+    minisplice aborts on multi-FASTA input, so predict is always per contig.
+    Compact assemblies may use a nested cluster array; fragmented genomes run
+    those contig jobs inside the parent process with GNU parallel / xargs.
 
     ``cpus`` is the parent rule's allocated cores (cluster request or local
-    Snakemake threads). Local parallel mode keeps concurrent chrom jobs within
-    that budget.
-
-    ``use_slurm_array`` means "submit a nested cluster array from the parent
-    job" (historical name; works for SLURM and SGE).
+    Snakemake threads).
     """
     parallel = get_res("run_miniprot", "minisplice_parallel")
     chrom_list = f"{work_dir}/miniprot/{genome}_minisplice_chroms.txt"
@@ -894,24 +894,58 @@ done < {chrom_sizes}
 echo "minisplice predict completed ({num_chroms} chromosomes merged)" >> {log_path}
 """
 
-    whole_genome_step = f"""
-# Step 0: Run minisplice on the full genome
-echo "Running minisplice predict on whole genome ({num_chroms} sequences, {cpus} threads)..." >> {log_path}
-minisplice predict -t {cpus} -c {minisplice_calibration} {minisplice_model} {genome_fasta} > {splice_scores_out} 2>> {log_path}
-echo "minisplice predict completed" >> {log_path}
+    minisplice_cpus = int(get_res("run_miniprot", "minisplice_cpus"))
+    minisplice_cpus = max(1, min(minisplice_cpus, cpus))
+    # GNU parallel / xargs workers inside the parent job. Nested SLURM arrays
+    # are only used below when the chrom count is small.
+    in_parent_jobs = max(1, cpus // minisplice_cpus)
+    if use_slurm_array:
+        in_parent_jobs = min(in_parent_jobs, int(get_res("run_miniprot", "minisplice_max_concurrent")))
+    else:
+        in_parent_jobs = min(in_parent_jobs, int(get_local_res("run_miniprot", "minisplice_max_jobs")))
+    if not parallel:
+        in_parent_jobs = 1
+
+    in_parent_step = f"""
+# Step 0: Run minisplice predict per sequence inside this job.
+# minisplice segfaults / aborts on multi-FASTA input, so each contig is a
+# separate predict. No nested cluster array.
+echo "Running minisplice predict on {num_chroms} sequences ({in_parent_jobs} jobs x {minisplice_cpus} threads)..." >> {log_path}
+mkdir -p {chrom_fa_dir} {chrom_scores_dir}
+run_minisplice_chrom() {{
+    local chrom="$1"
+    local chrom_fa="{chrom_fa_dir}/${{chrom}}.fa"
+    local chrom_tsv="{chrom_scores_dir}/${{chrom}}.tsv"
+    samtools faidx {genome_fasta} "$chrom" > "$chrom_fa"
+    minisplice predict -t {minisplice_cpus} -c {minisplice_calibration} {minisplice_model} "$chrom_fa" > "$chrom_tsv"
+    rm -f "$chrom_fa"
+}}
+export -f run_minisplice_chrom
+if command -v parallel >/dev/null 2>&1; then
+    parallel --will-cite -j {in_parent_jobs} run_minisplice_chrom :::: {chrom_list} >> {log_path} 2>&1
+elif command -v xargs >/dev/null 2>&1; then
+    xargs -a {chrom_list} -P {in_parent_jobs} -I{{}} bash -c 'run_minisplice_chrom "$1"' _ {{}} >> {log_path} 2>&1
+else
+    while read -r chrom; do
+        [[ -z "$chrom" ]] && continue
+        run_minisplice_chrom "$chrom"
+    done < {chrom_list}
+fi
+{merge_scores}
 """
 
-    if not parallel:
-        return whole_genome_step
-
     max_array_tasks = int(get_res("run_miniprot", "minisplice_max_array_tasks"))
-    # Cactus ancestors often have thousands of tiny scaffolds. A per-chrom
-    # array of that size floods the scheduler, and squeue-based waits return
-    # early while throttled (%N) tasks are still pending.
-    if use_slurm_array and (max_array_tasks <= 0 or num_chroms > max_array_tasks):
-        return whole_genome_step
+    # Nested per-chrom arrays are for compact assemblies only. Cactus ancestors
+    # have hundreds/thousands of scaffolds; those stay in-process (above).
+    use_nested_array = (
+        bool(parallel)
+        and use_slurm_array
+        and max_array_tasks > 0
+        and num_chroms <= max_array_tasks
+    )
+    if not use_nested_array:
+        return in_parent_step
 
-    minisplice_cpus = int(get_res("run_miniprot", "minisplice_cpus"))
     per_chrom_body = f"""
 set -euo pipefail
 TASK_ID="${{{task_id_env}:-${{SLURM_ARRAY_TASK_ID:-${{SGE_TASK_ID:-$1}}}}}}"
@@ -927,35 +961,30 @@ samtools faidx {genome_fasta} "$CHROM" > "$CHROM_FA"
 minisplice predict -t {minisplice_cpus} -c {minisplice_calibration} {minisplice_model} "$CHROM_FA" > "$CHROM_TSV"
 """
 
-    if use_slurm_array:
-        # SGE array logs use $TASK_ID; SLURM uses %a. Emit both-compatible paths
-        # via scheduler-specific tokens where needed.
-        if SCHEDULER.name == "sge":
-            array_out = f"{work_dir}/logs/miniprot/{genome}_minisplice_$TASK_ID.out"
-            array_err = f"{work_dir}/logs/miniprot/{genome}_minisplice_$TASK_ID.err"
-        else:
-            array_out = f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.out"
-            array_err = f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.err"
-        array_header = SCHEDULER.header(
-            job_name=f"minisplice-{genome}",
-            cpus=minisplice_cpus,
-            mem=get_res("run_miniprot", "minisplice_mem"),
-            walltime=get_res("run_miniprot", "minisplice_time"),
-            log_out=array_out,
-            log_err=array_err,
-            partition=_slurm_partition("run_miniprot"),
-            queue=_slurm_partition("run_miniprot"),
-            array=(1, num_chroms),
-            max_concurrent=get_res("run_miniprot", "minisplice_max_concurrent"),
-        )
-        with open(array_script, "w") as array_script_f:
-            array_script_f.write(array_header + per_chrom_body)
+    if SCHEDULER.name == "sge":
+        array_out = f"{work_dir}/logs/miniprot/{genome}_minisplice_$TASK_ID.out"
+        array_err = f"{work_dir}/logs/miniprot/{genome}_minisplice_$TASK_ID.err"
+    else:
+        array_out = f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.out"
+        array_err = f"{work_dir}/logs/miniprot/{genome}_minisplice_%a_slurm.err"
+    array_header = SCHEDULER.header(
+        job_name=f"minisplice-{genome}",
+        cpus=minisplice_cpus,
+        mem=get_res("run_miniprot", "minisplice_mem"),
+        walltime=get_res("run_miniprot", "minisplice_time"),
+        log_out=array_out,
+        log_err=array_err,
+        partition=_slurm_partition("run_miniprot"),
+        queue=_slurm_partition("run_miniprot"),
+        array=(1, num_chroms),
+        max_concurrent=get_res("run_miniprot", "minisplice_max_concurrent"),
+    )
+    with open(array_script, "w") as array_script_f:
+        array_script_f.write(array_header + per_chrom_body)
 
-        wait_timeout = int(timeout_s("run_miniprot"))
-        if SCHEDULER.name == "sge":
-            # Nested qsub from the parent SGE job; poll with qstat -j.
-            # Job id parsing matches cat.scheduler._QSUB_JOB_ID_RE.
-            submit_and_wait = f"""
+    wait_timeout = int(timeout_s("run_miniprot"))
+    if SCHEDULER.name == "sge":
+        submit_and_wait = f"""
 ARRAY_JOB=$(qsub {array_script} | sed -nE 's/.*Your[[:space:]]+(job|job-array)[[:space:]]+([0-9]+).*/\\2/p')
 if [[ -z "$ARRAY_JOB" ]]; then
     echo "ERROR: failed to parse SGE job id from qsub of {array_script}" >> {log_path}
@@ -966,8 +995,8 @@ while qstat -j "$ARRAY_JOB" &>/dev/null; do
     sleep 30
 done
 """
-        else:
-            submit_and_wait = f"""
+    else:
+        submit_and_wait = f"""
 ARRAY_JOB=$(sbatch --parsable {array_script})
 ARRAY_JOB="${{ARRAY_JOB%%;*}}"
 if [[ -z "$ARRAY_JOB" ]]; then
@@ -986,38 +1015,11 @@ if not res.ok:
 PY
 """
 
-        return f"""
+    return f"""
 # Step 0: Run minisplice predict per chromosome ({SCHEDULER.name} array)
 echo "Running minisplice predict on {num_chroms} chromosomes..." >> {log_path}
 mkdir -p {chrom_fa_dir} {chrom_scores_dir}
 {submit_and_wait}
-{merge_scores}
-"""
-
-    # Local parallel: stay within the parent rule's thread budget.
-    minisplice_cpus = max(1, min(minisplice_cpus, cpus))
-    local_jobs = int(get_local_res("run_miniprot", "minisplice_max_jobs"))
-    local_jobs = max(1, min(local_jobs, max(1, cpus // minisplice_cpus)))
-    return f"""
-# Step 0: Run minisplice predict per chromosome (local parallel)
-echo "Running minisplice predict on {num_chroms} chromosomes ({local_jobs} jobs x {minisplice_cpus} threads)..." >> {log_path}
-mkdir -p {chrom_fa_dir} {chrom_scores_dir}
-run_minisplice_chrom() {{
-    local chrom="$1"
-    local chrom_fa="{chrom_fa_dir}/${{chrom}}.fa"
-    local chrom_tsv="{chrom_scores_dir}/${{chrom}}.tsv"
-    samtools faidx {genome_fasta} "$chrom" > "$chrom_fa"
-    minisplice predict -t {minisplice_cpus} -c {minisplice_calibration} {minisplice_model} "$chrom_fa" > "$chrom_tsv"
-}}
-export -f run_minisplice_chrom
-if command -v parallel >/dev/null 2>&1; then
-    parallel -j {local_jobs} run_minisplice_chrom :::: {chrom_list} >> {log_path} 2>&1
-else
-    while read -r chrom; do
-        [[ -z "$chrom" ]] && continue
-        run_minisplice_chrom "$chrom"
-    done < {chrom_list}
-fi
 {merge_scores}
 """
 
