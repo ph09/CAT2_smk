@@ -367,7 +367,8 @@ _RULE_DEFAULTS = {
     "run_chaining_per_genome":   {"mem": "128G", "cpus": 64,  "time": "12:00:00", "timeout_hours": 24},
     "run_miniprot":              {"mem": "128G", "cpus": 64,  "time": "04:00:00", "timeout_hours": 12,
                                  "minisplice_parallel": True, "minisplice_cpus": 4, "minisplice_mem": "8G",
-                                 "minisplice_time": "01:00:00", "minisplice_max_concurrent": 25},
+                                 "minisplice_time": "01:00:00", "minisplice_max_concurrent": 25,
+                                 "minisplice_max_array_tasks": 80},
     "run_txTM":                  {"mem": "128G", "cpus": 64,  "time": "04:00:00", "timeout_hours": 12},
     "stringtie_merge":           {"mem": "16G",  "cpus": 8,   "time": "04:00:00", "timeout_hours": 6},
     "stringtie_sort":            {"mem": "64G",  "cpus": 16,  "time": "06:00:00", "timeout_hours": 8},
@@ -893,13 +894,22 @@ done < {chrom_sizes}
 echo "minisplice predict completed ({num_chroms} chromosomes merged)" >> {log_path}
 """
 
-    if not parallel:
-        return f"""
+    whole_genome_step = f"""
 # Step 0: Run minisplice on the full genome
-echo "Running minisplice predict..." >> {log_path}
+echo "Running minisplice predict on whole genome ({num_chroms} sequences, {cpus} threads)..." >> {log_path}
 minisplice predict -t {cpus} -c {minisplice_calibration} {minisplice_model} {genome_fasta} > {splice_scores_out} 2>> {log_path}
 echo "minisplice predict completed" >> {log_path}
 """
+
+    if not parallel:
+        return whole_genome_step
+
+    max_array_tasks = int(get_res("run_miniprot", "minisplice_max_array_tasks"))
+    # Cactus ancestors often have thousands of tiny scaffolds. A per-chrom
+    # array of that size floods the scheduler, and squeue-based waits return
+    # early while throttled (%N) tasks are still pending.
+    if use_slurm_array and (max_array_tasks <= 0 or num_chroms > max_array_tasks):
+        return whole_genome_step
 
     minisplice_cpus = int(get_res("run_miniprot", "minisplice_cpus"))
     per_chrom_body = f"""
@@ -941,6 +951,7 @@ minisplice predict -t {minisplice_cpus} -c {minisplice_calibration} {minisplice_
         with open(array_script, "w") as array_script_f:
             array_script_f.write(array_header + per_chrom_body)
 
+        wait_timeout = int(timeout_s("run_miniprot"))
         if SCHEDULER.name == "sge":
             # Nested qsub from the parent SGE job; poll with qstat -j.
             # Job id parsing matches cat.scheduler._QSUB_JOB_ID_RE.
@@ -958,10 +969,21 @@ done
         else:
             submit_and_wait = f"""
 ARRAY_JOB=$(sbatch --parsable {array_script})
+ARRAY_JOB="${{ARRAY_JOB%%;*}}"
+if [[ -z "$ARRAY_JOB" ]]; then
+    echo "ERROR: failed to parse SLURM job id from sbatch of {array_script}" >> {log_path}
+    exit 1
+fi
 echo "Submitted minisplice array job $ARRAY_JOB ({num_chroms} tasks)" >> {log_path}
-while squeue -h -j "$ARRAY_JOB" 2>/dev/null | grep -q .; do
-    sleep 30
-done
+python3 - "$ARRAY_JOB" {num_chroms} {wait_timeout} <<'PY'
+import sys
+from cat.scheduler import get_scheduler
+job_id, n, timeout = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+res = get_scheduler("slurm").wait(job_id, num_tasks=n, timeout_s=timeout)
+if not res.ok:
+    sys.stderr.write(f"minisplice array {{job_id}} failed: {{res.detail}}\\n")
+    sys.exit(1)
+PY
 """
 
         return f"""
