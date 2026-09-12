@@ -561,16 +561,25 @@ class SlurmScheduler(Scheduler):
                 failed = sum(1 for s in task_states.values() if s in _SLURM_FAILED_STATES)
                 running = sum(1 for s in task_states.values() if s not in _SLURM_SUCCESS_STATES and s not in _SLURM_FAILED_STATES)
                 total = len(task_states)
+                expected = int(num_tasks)
 
                 elapsed = time.time() - start
                 if elapsed - last_report > status_report_interval:
                     logger.info(
-                        f"Job {job_id} progress: {completed}/{total} done, "
-                        f"{failed} failed, {running} running ({elapsed / 60:.1f} min)"
+                        f"Job {job_id} progress: {completed}/{expected} done "
+                        f"({total} visible), {failed} failed, {running} running "
+                        f"({elapsed / 60:.1f} min)"
                     )
                     last_report = elapsed
 
-                if completed + failed == total:
+                # Throttled arrays (--array=1-N%K) only appear in sacct after
+                # they start. "all currently visible tasks finished" is not
+                # done until we have seen at least N task rows.
+                if total < expected:
+                    time.sleep(check_interval_s)
+                    continue
+
+                if running == 0 and completed + failed >= expected:
                     if failed > 0:
                         return JobResult(
                             ok=False, completed=completed, failed=failed, total=total,
