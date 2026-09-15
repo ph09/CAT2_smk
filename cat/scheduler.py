@@ -620,9 +620,9 @@ class SlurmScheduler(Scheduler):
         Mirrors the historical sacct-validation logic that lived inline in
         augustus_parallel.py / augustus_pb_parallel.py before the migration.
         Returns ok=False if any non-step task ended in a failed state OR with
-        a non-zero exit code. Step rows (``.batch`` / ``.extern``) are
-        ignored. DependencyNeverSatisfied is reported via the parent row's
-        state being something other than COMPLETED.
+        a non-zero exit code. ``.extern`` rows are ignored. A failed
+        ``.batch`` row is treated as failure (the payload exit code lives
+        there even when the parent shows COMPLETED 0:0).
         """
         try:
             res = subprocess.run(
@@ -641,7 +641,16 @@ class SlurmScheduler(Scheduler):
             if len(parts) < 3:
                 continue
             spec, state, exit_code = parts[0], parts[1], parts[2]
-            if ".batch" in spec or ".extern" in spec:
+            if ".extern" in spec:
+                continue
+            # The payload's real exit code lives on the ``.batch`` row. Parent
+            # can show COMPLETED 0:0 while the script failed (and the reverse
+            # on some SLURM versions), so treat a bad .batch as failure. Do
+            # not count .batch toward total/completed — array task rows are
+            # the unit of work.
+            if ".batch" in spec:
+                if not (state in _SLURM_SUCCESS_STATES and exit_code == "0:0"):
+                    failed.append(f"{spec}(state={state},exit={exit_code})")
                 continue
             total += 1
             if state in _SLURM_SUCCESS_STATES and exit_code == "0:0":
