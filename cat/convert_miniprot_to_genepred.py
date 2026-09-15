@@ -321,20 +321,101 @@ def convert(
     return n_written
 
 
+# ---------------------------------------------------------------------------
+# Augustus hints from genePred
+# ---------------------------------------------------------------------------
+
+# Match standalones/aln2hints.pl miniprot defaults (CDSpart trim, src=P, pri=4).
+_HINTS_PRGSRC = "miniprot2h"
+_HINTS_SOURCE = "P"
+_HINTS_PRIORITY = 4
+_HINTS_CDSPART_CUTOFF = 15
+
+
+def gp_to_hints(gp_path: str, hints_path: str) -> int:
+    """Write Augustus ``miniprot2h`` hints (CDSpart + intron) from genePred.
+
+    Coordinates: genePred is 0-based half-open; hints GFF is 1-based inclusive.
+    ``grp`` is the genePred name so augMP templates join to the same models.
+    Start/stop codon hints are omitted (aln2hints.pl needs the whole genome in
+    memory for those; CDSpart + intron are the hints Augustus actually uses).
+    """
+    n_cds = 0
+    n_intron = 0
+    with open(gp_path) as fin, open(hints_path, "w") as out:
+        for line in fin:
+            if not line.strip() or line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 10:
+                continue
+            name, chrom, strand = f[0], f[1], f[2]
+            if chrom == "*":
+                continue
+            cds_start, cds_end = int(f[5]), int(f[6])
+            exon_starts = [int(x) for x in f[8].rstrip(",").split(",") if x]
+            exon_ends = [int(x) for x in f[9].rstrip(",").split(",") if x]
+            if len(exon_starts) != len(exon_ends):
+                continue
+            score = f[10] if len(f) > 10 else "."
+            frames: List[int] = []
+            if len(f) > 15 and f[15]:
+                frames = [int(x) for x in f[15].rstrip(",").split(",") if x != ""]
+
+            for i, (es, ee) in enumerate(zip(exon_starts, exon_ends)):
+                if i > 0:
+                    prev_ee = exon_ends[i - 1]
+                    if es > prev_ee:
+                        out.write(
+                            f"{chrom}\t{_HINTS_PRGSRC}\tintron\t"
+                            f"{prev_ee + 1}\t{es}\t0\t{strand}\t.\t"
+                            f"src={_HINTS_SOURCE};grp={name};pri={_HINTS_PRIORITY}\n"
+                        )
+                        n_intron += 1
+                cs = max(es, cds_start)
+                ce = min(ee, cds_end)
+                if ce <= cs:
+                    continue
+                gff_s = cs + 1
+                gff_e = ce
+                part_s = gff_s + _HINTS_CDSPART_CUTOFF
+                part_e = gff_e - _HINTS_CDSPART_CUTOFF
+                if part_s > part_e:
+                    part_s = part_e = (gff_s + gff_e) // 2
+                frame = frames[i] if i < len(frames) else 0
+                if frame < 0:
+                    frame = 0
+                out.write(
+                    f"{chrom}\t{_HINTS_PRGSRC}\tCDSpart\t"
+                    f"{part_s}\t{part_e}\t{score}\t{strand}\t{frame}\t"
+                    f"src={_HINTS_SOURCE};grp={name};pri={_HINTS_PRIORITY}\n"
+                )
+                n_cds += 1
+    print(
+        f"gp_to_hints: wrote {n_cds:,} CDSpart and {n_intron:,} intron hints "
+        f"from {gp_path}",
+        file=sys.stderr,
+    )
+    return n_cds + n_intron
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=(
             "Convert miniprot PAF output to GenePred and (optionally) a real "
-            "PSL. Parses the cg:Z: CIGAR for proper exon structure; emits one "
-            "record per PAF row with _2, _3, ... copy suffixes for paralogs; "
-            "filters by protein-space coverage / identity / mapq / score."
+            "PSL, or write Augustus miniprot2h hints from an existing genePred."
         ),
     )
-    ap.add_argument('paf', help='miniprot PAF input')
-    ap.add_argument('gp',  help='Output genePredExt')
+    ap.add_argument('paf', nargs='?', help='miniprot PAF input')
+    ap.add_argument('gp',  nargs='?', help='Output genePredExt')
     ap.add_argument('--psl', default=None,
                     help='Optional real PSL output for downstream metric '
                          'derivation (store_psl_metrics.py).')
+    ap.add_argument('--from-gp', dest='from_gp', default=None,
+                    help='Existing genePred to convert to Augustus hints '
+                         '(requires --hints).')
+    ap.add_argument('--hints', default=None,
+                    help='Write Augustus miniprot2h hints GFF to this path.')
     ap.add_argument('--min-coverage', type=float, default=0.0,
                     help='Drop records whose (aligned_aa / q_len) < this. '
                          'Default 0.0 = keep everything (real metrics are '
@@ -352,6 +433,14 @@ def main():
                     help='Drop records whose AS:i: alignment score < this '
                          '(default 0, i.e. no filter).')
     args = ap.parse_args()
+
+    if args.from_gp:
+        if not args.hints:
+            ap.error('--from-gp requires --hints')
+        gp_to_hints(args.from_gp, args.hints)
+        return
+    if not args.paf or not args.gp:
+        ap.error('paf and gp are required unless --from-gp is set')
 
     convert(
         args.paf, args.gp, args.psl,
