@@ -251,8 +251,8 @@ AUGUSTUS_PB_GENOME_WC = _genome_wc(AUGUSTUS_PB_GENOMES)
 STRG_GENOME_WC = _genome_wc(STRG_GENOMES)
 
 # Drop bulky one-hop intermediates once their last consumer finishes. Expensive
-# products (PAF, chains, filtered genePreds, consensus) are kept so consensus
-# / converter / filter reruns do not redo miniprot or Augustus. Set
+# products (PAF, chains, filtered genePreds, consensus, miniprot hints) are kept
+# so consensus / converter / filter reruns do not redo miniprot or Augustus. Set
 # clean_intermediates: false to retain everything.
 CLEAN_INTERMEDIATES = bool(config.get("clean_intermediates", True))
 
@@ -411,6 +411,7 @@ _RULE_DEFAULTS = {
     "augustus_convert_tmr_pairwise_gtf_to_gp": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
     "augustus_convert_mp_gtf_to_gp": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
     "miniprot_paf_to_genepred": {"mem": "8G", "cpus": 1, "controller_mem_gb": 8},
+    "miniprot_gp_to_hints": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
     "aggregate_evaluations": {"mem": "128G", "cpus": 1, "controller_mem_gb": 128},
     "generate_plots": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
     "gene_family_report": {"mem": "16G", "cpus": 1, "controller_mem_gb": 16},
@@ -1023,46 +1024,136 @@ mkdir -p {chrom_fa_dir} {chrom_scores_dir}
 {merge_scores}
 """
 
+_TRANSIENT_JOB_STATES = (
+    "RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "REQUEUED", "RESIZING",
+)
+
+
+def _log_write(log_handle, msg):
+    log_handle.write(msg if msg.endswith("\n") else msg + "\n")
+    flush = getattr(log_handle, "flush", None)
+    if callable(flush):
+        flush()
+
+
+def wait_for_outputs(paths, log_handle=None, timeout_s=300, interval_s=10, min_bytes=1):
+    """Retry until every path exists, is non-empty, and has a stable size.
+
+    Cluster NFS often lags close-to-open visibility by tens of seconds after
+    the producer exits. A single exists() check would mark a successful job
+    as failed, and Snakemake would then delete the outputs that *are* visible
+    (e.g. a finished PAF when hints is still catching up on NFS).
+    """
+    import os as _os
+    import time as _t
+
+    paths = [str(p) for p in paths]
+    if not paths:
+        return []
+    deadline = _t.time() + timeout_s
+    last_sizes = {p: -1 for p in paths}
+    while _t.time() < deadline:
+        missing = []
+        sizes = {}
+        for p in paths:
+            if not _os.path.exists(p):
+                missing.append(p)
+                continue
+            sz = _os.path.getsize(p)
+            sizes[p] = sz
+            if sz < min_bytes:
+                missing.append(f"{p} (empty)")
+        if missing:
+            last_sizes = {p: sizes.get(p, -1) for p in paths}
+            left = max(0, int(deadline - _t.time()))
+            if log_handle is not None:
+                _log_write(
+                    log_handle,
+                    f"waiting for outputs ({left}s left): {', '.join(missing)}",
+                )
+            _t.sleep(interval_s)
+            continue
+        if all(sizes[p] == last_sizes.get(p) for p in paths):
+            return []
+        last_sizes = sizes
+        _t.sleep(interval_s)
+    return [
+        p for p in paths
+        if not _os.path.exists(p) or _os.path.getsize(p) < min_bytes
+    ]
+
+
 def run_or_submit(script_body, job_script_path, outputs_to_check,
                   log_handle, rule_name, max_wait_s=14400, check_interval_s=30):
     """Write a job script and run it via the active backend.
     """
     import subprocess as _sp
     import time as _t
-    import os as _os
 
     if IS_CLUSTER:
         SCHEDULER.write_script(script_body, job_script_path)
         job_id = SCHEDULER.submit(job_script_path)
-        log_handle.write(f"Submitted: {SCHEDULER.name} job {job_id}\n")
+        _log_write(log_handle, f"Submitted: {SCHEDULER.name} job {job_id}")
         elapsed = 0
         while elapsed < max_wait_s:
             if not SCHEDULER.job_present(job_id):
+                # squeue can drop a job a few seconds before sacct is final.
+                _t.sleep(5)
+                elapsed += 5
                 result = SCHEDULER.verify_completed(job_id)
                 if not result.ok:
-                    raise RuntimeError(
-                        f"[{rule_name}] cluster job {job_id} failed: {result.detail}"
+                    detail = result.detail or ""
+                    if any(tok in detail for tok in _TRANSIENT_JOB_STATES):
+                        _log_write(
+                            log_handle,
+                            f"[{rule_name}] job {job_id} not in squeue yet "
+                            f"sacct={detail}; keep waiting",
+                        )
+                    else:
+                        msg = (
+                            f"[{rule_name}] cluster job {job_id} failed: "
+                            f"{result.detail}"
+                        )
+                        _log_write(log_handle, msg)
+                        raise RuntimeError(msg)
+                else:
+                    missing = wait_for_outputs(outputs_to_check, log_handle)
+                    if missing:
+                        msg = (
+                            f"[{rule_name}] cluster job {job_id} finished but "
+                            f"outputs missing: {', '.join(str(p) for p in missing)}"
+                        )
+                        _log_write(log_handle, msg)
+                        raise RuntimeError(msg)
+                    _log_write(
+                        log_handle,
+                        f"[{rule_name}] completed after {elapsed}s",
                     )
-                missing = [p for p in outputs_to_check if not _os.path.exists(str(p))]
-                if missing:
-                    raise RuntimeError(
-                        f"[{rule_name}] cluster job {job_id} finished but outputs "
-                        f"missing: {', '.join(str(p) for p in missing)}"
-                    )
-                log_handle.write(f"[{rule_name}] completed after {elapsed}s\n")
-                return
+                    return
             _t.sleep(check_interval_s)
             elapsed += check_interval_s
-        raise RuntimeError(f"[{rule_name}] timed out after {max_wait_s}s")
+        msg = f"[{rule_name}] timed out after {max_wait_s}s"
+        _log_write(log_handle, msg)
+        raise RuntimeError(msg)
     else:
         clean = "\n".join(
             line for line in script_body.splitlines()
             if not line.startswith("#SBATCH") and not line.startswith("#$") and line != "#!/bin/bash"
         )
-        log_handle.write(f"[{rule_name}] running locally\n")
+        _log_write(log_handle, f"[{rule_name}] running locally")
         result = _sp.run(['bash', '-euo', 'pipefail', '-c', clean])
         if result.returncode != 0:
-            raise RuntimeError(f"[{rule_name}] local run failed (rc={result.returncode})")
+            msg = f"[{rule_name}] local run failed (rc={result.returncode})"
+            _log_write(log_handle, msg)
+            raise RuntimeError(msg)
+        missing = wait_for_outputs(outputs_to_check, log_handle, timeout_s=60, interval_s=5)
+        if missing:
+            msg = (
+                f"[{rule_name}] local run finished but outputs missing: "
+                f"{', '.join(str(p) for p in missing)}"
+            )
+            _log_write(log_handle, msg)
+            raise RuntimeError(msg)
 
 # ─── localrules ───────────────────────────────────────────────────────────────
 # In SLURM mode, the sbatch-submitting rules are lightweight wrappers (use
@@ -2529,9 +2620,11 @@ if BUILD_PROTEIN_DB:
 
 rule run_miniprot:
     """
-    Submits miniprot as a SLURM job to the short queue to align a protein reference 
-    set against a target genome, then converts the alignments to a GFF hints file.
-    Runs minisplice predict first to generate splice-site scores for miniprot.
+    Submits miniprot as a SLURM job to align a protein reference set against a
+    target genome (PAF). Runs minisplice predict first to generate splice-site
+    scores. Hints for augMP are derived later from the converted genePred
+    (``miniprot_gp_to_hints``), so a hints-conversion glitch cannot delete the
+    expensive PAF and we do not run a second full miniprot ``--gtf`` pass.
     When minisplice_parallel is enabled (default), minisplice runs one task per
     chromosome and merges the TSV scores before miniprot.
     """
@@ -2543,7 +2636,6 @@ rule run_miniprot:
         minisplice_model=config["minisplice_model"],
         minisplice_calibration=config["minisplice_calibration"]
     output:
-        hints=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_hints.gff",
         paf=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.paf",
     wildcard_constraints:
         genome = AUGMP_GENOME_WC
@@ -2556,11 +2648,6 @@ rule run_miniprot:
         time_h=snk_time_h("run_miniprot"),
         job_id=lambda wildcards, attempt: f"miniprot-submit-{wildcards.genome}-{attempt}"
     run:
-        import os
-        import subprocess
-        import time
-
-        # Get paths and variables
         work_dir = config['work_dir']
         genome = wildcards.genome
         job_script = f"{work_dir}/miniprot/{genome}_miniprot_job.sh"
@@ -2590,34 +2677,29 @@ rule run_miniprot:
             f"{work_dir}/logs/miniprot/{genome}_slurm.err"
         ) + minisplice_step + f"""
 
-# Step 1a: Run miniprot in PAF mode with splice scores (templates for augMP)
+# Step 1: Run miniprot in PAF mode with splice scores (templates for augMP)
 echo "Running miniprot for PAF (templates)..." >> {log[0]}
 echo "miniprot map flags: {map_flags}" >> {log[0]}
 miniprot {map_flags} --spsc={splice_scores} {input.genome_index} {input.protein_ref} > {output.paf} 2>> {log[0]}
+if [[ ! -s {output.paf} ]]; then
+    echo "ERROR: miniprot wrote an empty PAF" >> {log[0]}
+    exit 1
+fi
+echo "miniprot PAF ready ($(wc -c < {output.paf}) bytes)" >> {log[0]}
+sync {output.paf} || true
 
-# Step 1b: Run miniprot with --gtf and splice scores for hints generation
-echo "Running miniprot for GTF (hints)..." >> {log[0]}
-TEMP_GTF={work_dir}/miniprot/{genome}_miniprot_temp.gtf
-miniprot {map_flags} --gtf --spsc={splice_scores} {input.genome_index} {input.protein_ref} > $TEMP_GTF 2>> {log[0]}
-
-# Step 2: Convert the GTF output to an Augustus hints file
-echo "Converting GTF to hints..." >> {log[0]}
-aln2hints.pl --genome_file={input.genome_fasta} \\
-             --in=$TEMP_GTF \\
-             --out={output.hints} \\
-             --prg=miniprot >> {log[0]} 2>&1
-
-# Drop scratch: temp GTF, splice scores, and the extra per-chromosome genome copy.
-rm -f $TEMP_GTF {splice_scores}
+# Drop scratch: splice scores and the extra per-chromosome genome copy.
+rm -f {splice_scores}
 rm -rf {chrom_fa_dir} {chrom_scores_dir}
 """
 
         with open(log[0], 'a') as log_file:
             log_file.write(f"Submitting miniprot job for {genome}...\n")
+            log_file.flush()
             run_or_submit(
                 script_content,
                 job_script,
-                [output.hints, output.paf],
+                [output.paf],
                 log_file,
                 "run_miniprot",
                 max_wait_s=timeout_s_val
@@ -3091,6 +3173,31 @@ rule miniprot_paf_to_genepred:
             --min-identity {params.min_identity} \
             --min-mapq {params.min_mapq} \
             --min-score {params.min_score} \
+            > {log} 2>&1
+        """
+
+rule miniprot_gp_to_hints:
+    """Augustus miniprot2h hints (CDSpart + intron) from the converted genePred.
+
+    Kept as a separate cheap rule so a hints glitch cannot delete the miniprot
+    PAF, and so genomes that already have aln2hints output keep those files.
+    """
+    input:
+        gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp"
+    output:
+        hints=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_hints.gff"
+    wildcard_constraints:
+        genome = AUGMP_GENOME_WC
+    log:
+        f"{config['work_dir']}/logs/miniprot_to_gp/{{genome}}_hints.log"
+    resources:
+        mem_gb=snk_mem_gb("miniprot_gp_to_hints"),
+        time_h=2,
+        job_id=lambda wildcards, attempt: f"mp-gp-hints-{wildcards.genome}-{attempt}"
+    shell:
+        """
+        python -m cat.convert_miniprot_to_genepred \
+            --from-gp {input.gp} --hints {output.hints} \
             > {log} 2>&1
         """
 
