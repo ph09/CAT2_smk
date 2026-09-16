@@ -1036,13 +1036,16 @@ def _log_write(log_handle, msg):
         flush()
 
 
-def wait_for_outputs(paths, log_handle=None, timeout_s=300, interval_s=10, min_bytes=1):
-    """Retry until every path exists, is non-empty, and has a stable size.
+def wait_for_outputs(paths, log_handle=None, timeout_s=300, interval_s=10, min_bytes=0):
+    """Retry until every path exists and has a stable size.
 
     Cluster NFS often lags close-to-open visibility by tens of seconds after
     the producer exits. A single exists() check would mark a successful job
-    as failed, and Snakemake would then delete the outputs that *are* visible
-    (e.g. a finished PAF when hints is still catching up on NFS).
+    as failed, and Snakemake would then delete the outputs that *are* visible.
+
+    Empty files are valid (``touch`` sentinels, ``duplicates.txt`` with no
+    duplicates). Require a non-empty file only by passing ``min_bytes>0``;
+    expensive tools should still ``test -s`` in the job script themselves.
     """
     import os as _os
     import time as _t
