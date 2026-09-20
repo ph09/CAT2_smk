@@ -595,6 +595,8 @@ _HIGH_RECALL_OVERRIDES = {
     "protein_novel_min_coverage":       0.0,    # no extra coverage gate
     "protein_novel_min_identity":       0.0,    # no extra identity gate
     "protein_novel_keep_overlapping":   True,   # keep novel overlapping projected features too
+    "protein_novel_as_coding":          True,   # label protein-only novels as protein_coding
+    "rescue_augMP_novels":              True,   # keep UniProt-only empty-locus recoveries
     # expressed non-coding -> protein_coding rescue (recall). On by default; in
     # high_recall also allow single-exon and shorter ORFs to maximise recovery.
     "rescue_expressed_noncoding_to_pc": True,
@@ -4301,6 +4303,8 @@ python -m cat.consensus_runner \\
     {"--rescue-expressed-allow-single-exon " if rcfg("rescue_expressed_allow_single_exon", False) else ""}\\
     {"" if rcfg("rescue_noncoding_require_protein_evidence", True) else "--no-rescue-noncoding-require-protein-evidence "}\\
     {f"--rescue-dropped-augMP --rescue-augMP-min-exons {rcfg('rescue_augMP_min_exons', 2)} --rescue-augMP-min-cds-aa {rcfg('rescue_augMP_min_cds_aa', 100)} --rescue-augMP-single-exon-min-cds-aa {rcfg('rescue_augMP_single_exon_min_cds_aa', 300)} --rescue-augMP-min-coverage {rcfg('rescue_augMP_min_coverage', 0.0)} --rescue-augMP-min-identity {rcfg('rescue_augMP_min_identity', 0.0)} " if rcfg("rescue_dropped_augMP", True) else ""}\\
+    {"--rescue-augMP-novels " if rcfg("rescue_augMP_novels", True) else ""}\\
+    {"--protein-novel-as-coding " if rcfg("protein_novel_as_coding", False) else ""}\\
     --txTM-min-coverage {rcfg("txTM_min_coverage", 0.0)} \\
     {"--txTM-strict-metrics " if rcfg("txTM_strict_metrics", False) else ""}\\
     --txTM-min-coverage-no-transmap {rcfg("txTM_min_coverage_no_transmap", 80)} \\
