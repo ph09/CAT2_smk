@@ -17,9 +17,124 @@ import tempfile
 import pandas as pd
 from pathlib import Path
 
+from cat.miniprot_novel_call import (
+    PROTEIN_CODING,
+    UNKNOWN_LIKELY_CODING,
+    call_miniprot_novel,
+    has_rna_support,
+    parent_symbol_from_description,
+)
+
 logger = logging.getLogger(__name__)
 
 NOVEL_CLASS = 'putative_novel'
+
+
+def load_gp_structure(gp_path):
+    """transcript_id -> (n_exons, cds_aa, chrom) from a genePred."""
+    out = {}
+    if not gp_path or not Path(gp_path).exists():
+        return out
+    with open(gp_path) as fh:
+        for line in fh:
+            f = line.rstrip('\n').split('\t')
+            if len(f) < 10:
+                continue
+            try:
+                cds0, cds1 = int(f[5]), int(f[6])
+                n_ex = int(f[7])
+                starts = [int(x) for x in f[8].rstrip(',').split(',') if x]
+                ends = [int(x) for x in f[9].rstrip(',').split(',') if x]
+            except ValueError:
+                continue
+            cds_nt = 0
+            for s, e in zip(starts, ends):
+                a, b = max(s, cds0), min(e, cds1)
+                if b > a:
+                    cds_nt += b - a
+            out[f[0]] = (n_ex, cds_nt // 3, f[1])
+    return out
+
+
+def classify_novel_biotypes(gp_info_df, gene_to_txs, gene_descriptions, tx_novel_class,
+                            gp_structure, drop_gene_ids=None):
+    """Apply call_miniprot_novel now that DIAMOND has labeled paralog vs lineage.
+
+    Returns (tx_biotype, tx_call, gene_biotype) dicts. Projected protein_coding
+    genes in gp_info_df define which parent symbols already exist, on which
+    chromosomes, and how large they are (local CNV vs complete interchrom
+    CNV vs dispersed hit).
+    """
+    drop_gene_ids = drop_gene_ids or set()
+    proj_chroms = collections.defaultdict(set)
+    proj_exons = collections.defaultdict(int)
+    proj_aa = collections.defaultdict(int)
+    if gp_info_df is not None and len(gp_info_df):
+        pon_col = 'protein_only_novel' if 'protein_only_novel' in gp_info_df.columns else None
+        gb_col = 'gene_biotype' if 'gene_biotype' in gp_info_df.columns else None
+        name_col = 'source_gene_common_name' if 'source_gene_common_name' in gp_info_df.columns else None
+        tx_ids = gp_info_df.index.get_level_values('transcript_id')
+        for i, tx_id in enumerate(tx_ids):
+            row = gp_info_df.iloc[i]
+            if pon_col and str(row.get(pon_col, '')).lower() in {'1', 'true'}:
+                continue
+            if gb_col and str(row.get(gb_col, '')) != 'protein_coding':
+                continue
+            name = str(row.get(name_col, '') or '').strip().upper() if name_col else ''
+            if not name or name in {'N/A', 'NAN', 'NONE'}:
+                continue
+            if tx_id in gp_structure:
+                n_ex, aa, chrom = gp_structure[tx_id]
+                proj_chroms[name].add(chrom)
+                proj_exons[name] = max(proj_exons[name], n_ex)
+                proj_aa[name] = max(proj_aa[name], aa)
+
+    tx_biotype = {}
+    tx_call = {}
+    gene_biotype = {}
+    reasons = collections.Counter()
+    for gene_id, tx_list in gene_to_txs.items():
+        if gene_id in drop_gene_ids:
+            continue
+        n_ex = 0
+        cds_aa = 0
+        chroms = set()
+        rna = False
+        for tx_id in tx_list:
+            if tx_id in gp_structure:
+                e, aa, chrom = gp_structure[tx_id]
+                n_ex = max(n_ex, e)
+                cds_aa = max(cds_aa, aa)
+                chroms.add(chrom)
+        rna = False
+        for tx_id in tx_list:
+            try:
+                row = gp_info_df.loc[(gene_id, tx_id)]
+                if hasattr(row, 'to_dict'):
+                    rna = rna or has_rna_support(row.to_dict())
+            except Exception:
+                pass
+        ncl = tx_novel_class.get(tx_list[0], '')
+        parent = parent_symbol_from_description(gene_descriptions.get(gene_id, ''))
+        parent_present = bool(parent) and parent in proj_chroms
+        same_chrom = bool(parent) and bool(chroms & proj_chroms.get(parent, set()))
+        bt, reason = call_miniprot_novel(
+            n_exons=n_ex,
+            cds_aa=cds_aa,
+            has_rna=rna,
+            novel_class=ncl,
+            parent_already_projected=parent_present if parent else None,
+            same_chrom_as_parent=same_chrom if parent_present else None,
+            parent_n_exons=proj_exons.get(parent, 0) if parent_present else None,
+            parent_cds_aa=proj_aa.get(parent, 0) if parent_present else None,
+        )
+        gene_biotype[gene_id] = bt
+        reasons[reason] += 1
+        for tx_id in tx_list:
+            tx_biotype[tx_id] = bt
+            tx_call[tx_id] = reason
+    logger.info("Miniprot novel calls: " + ", ".join(f"{k}={v}" for k, v in reasons.most_common()))
+    return tx_biotype, tx_call, gene_biotype
 
 
 def read_gp_info(path):
@@ -231,7 +346,7 @@ def build_description(gene_name):
 # ── gp_info update ────────────────────────────────────────────────────────────
 
 def update_gp_info(gp_info_file, output_gp_info, tx_descriptions, tx_novel_class=None,
-                   drop_tx_ids=None):
+                   drop_tx_ids=None, tx_biotype=None, tx_call=None):
     """
     Add 'novel_gene_description' and 'novel_class' columns to the gp_info TSV.
 
@@ -243,9 +358,14 @@ def update_gp_info(gp_info_file, output_gp_info, tx_descriptions, tx_novel_class
         this only labels them.
     drop_tx_ids:     optional set of transcript_ids to remove entirely (excess
         novel paralog copies from the copy-number cap).
+    tx_biotype:      optional transcript_id -> gene/transcript biotype to write
+        (protein_coding vs unknown_likely_coding from call_miniprot_novel).
+    tx_call:         optional transcript_id -> call reason string.
     """
     tx_novel_class = tx_novel_class or {}
     drop_tx_ids = drop_tx_ids or set()
+    tx_biotype = tx_biotype or {}
+    tx_call = tx_call or {}
     df = read_gp_info(gp_info_file)
     if drop_tx_ids:
         keep = ~df.index.get_level_values('transcript_id').isin(drop_tx_ids)
@@ -261,14 +381,42 @@ def update_gp_info(gp_info_file, output_gp_info, tx_descriptions, tx_novel_class
         'novel_class',
         [tx_novel_class.get(tx_id, 'N/A') for tx_id in tx_ids]
     )
+    if tx_biotype:
+        new_gb = []
+        new_tb = []
+        for tx_id, gb, tb in zip(
+            tx_ids,
+            df['gene_biotype'] if 'gene_biotype' in df.columns else [''] * len(df),
+            df['transcript_biotype'] if 'transcript_biotype' in df.columns else [''] * len(df),
+        ):
+            bt = tx_biotype.get(tx_id)
+            new_gb.append(bt if bt else gb)
+            new_tb.append(bt if bt else tb)
+        if 'gene_biotype' in df.columns:
+            df['gene_biotype'] = new_gb
+        else:
+            df.insert(len(df.columns), 'gene_biotype', new_gb)
+        if 'transcript_biotype' in df.columns:
+            df['transcript_biotype'] = new_tb
+        else:
+            df.insert(len(df.columns), 'transcript_biotype', new_tb)
+    if tx_call:
+        df.insert(
+            len(df.columns),
+            'miniprot_novel_call',
+            [tx_call.get(tx_id, 'N/A') for tx_id in tx_ids]
+        )
     with open(output_gp_info, 'w') as fh:
         df.to_csv(fh, sep='\t', na_rep='N/A')
 
     n_assigned = sum(1 for v in tx_descriptions.values() if v != 'N/A')
     n_para = sum(1 for v in tx_novel_class.values() if v == 'paralog')
     n_ls = sum(1 for v in tx_novel_class.values() if v == 'lineage_specific')
+    n_pc = sum(1 for v in tx_biotype.values() if v == PROTEIN_CODING)
+    n_ulc = sum(1 for v in tx_biotype.values() if v == UNKNOWN_LIKELY_CODING)
     logger.info(f"Updated gp_info: {n_assigned} transcripts assigned descriptions, "
-                f"novel_class = {n_para} paralog / {n_ls} lineage_specific "
+                f"novel_class = {n_para} paralog / {n_ls} lineage_specific, "
+                f"miniprot call = {n_pc} protein_coding / {n_ulc} unknown_likely_coding "
                 f"(written to {output_gp_info})")
 
 
@@ -295,7 +443,8 @@ def _render_gff3_attrs(d):
 
 
 def update_gff3(input_gff3, output_gff3, gene_descriptions, tx_descriptions,
-                drop_gene_ids=None, drop_tx_ids=None):
+                drop_gene_ids=None, drop_tx_ids=None, gene_biotype=None,
+                tx_biotype=None):
     """
     Add a 'description' attribute to gene and transcript records in the GFF3
     for any entry that has a novel gene description.
@@ -308,6 +457,8 @@ def update_gff3(input_gff3, output_gff3, gene_descriptions, tx_descriptions,
     """
     drop_gene_ids = drop_gene_ids or set()
     drop_tx_ids = drop_tx_ids or set()
+    gene_biotype = gene_biotype or {}
+    tx_biotype = tx_biotype or {}
     n_gene = 0
     n_tx = 0
     with open(input_gff3) as inf, open(output_gff3, 'w') as outf:
@@ -332,6 +483,7 @@ def update_gff3(input_gff3, output_gff3, gene_descriptions, tx_descriptions,
                     continue
 
             description = None
+            changed = False
 
             if feature == 'gene':
                 gene_id = attrs.get('ID') or attrs.get('gene_id')
@@ -339,6 +491,9 @@ def update_gff3(input_gff3, output_gff3, gene_descriptions, tx_descriptions,
                     description = gene_descriptions.get(gene_id)
                     if description:
                         n_gene += 1
+                    if gene_biotype and gene_id in gene_biotype:
+                        attrs['gene_biotype'] = gene_biotype[gene_id]
+                        changed = True
 
             elif feature in ('transcript', 'mRNA'):
                 tx_id = attrs.get('ID')
@@ -346,12 +501,20 @@ def update_gff3(input_gff3, output_gff3, gene_descriptions, tx_descriptions,
                     description = tx_descriptions.get(tx_id)
                     if description:
                         n_tx += 1
+                    if tx_biotype and tx_id in tx_biotype:
+                        attrs['transcript_biotype'] = tx_biotype[tx_id]
+                        if 'gene_biotype' in attrs:
+                            attrs['gene_biotype'] = tx_biotype[tx_id]
+                        changed = True
 
             if description:
                 # URL-encode characters that would break GFF3 attribute parsing
                 desc_enc = description.replace('%', '%25').replace(
                     '=', '%3D').replace(';', '%3B').replace(',', '%2C')
                 attrs['description'] = desc_enc
+                changed = True
+
+            if changed:
                 parts[8] = _render_gff3_attrs(attrs)
 
             outf.write('\t'.join(parts) + '\n')
@@ -635,13 +798,21 @@ def main():
                 f"dropped {len(drop_gene_ids)} novel paralog genes "
                 f"({len(drop_tx_ids)} transcripts)")
 
+        gp_structure = load_gp_structure(args.consensus_gp)
+        tx_biotype, tx_call, gene_biotype = classify_novel_biotypes(
+            gp_info_df, gene_to_txs, gene_descriptions, tx_novel_class,
+            gp_structure, drop_gene_ids=drop_gene_ids,
+        )
+
         # Step 7: update gp_info (dropping capped copies)
         update_gp_info(args.consensus_gp_info, args.output_gp_info,
-                       tx_descriptions, tx_novel_class, drop_tx_ids=drop_tx_ids)
+                       tx_descriptions, tx_novel_class, drop_tx_ids=drop_tx_ids,
+                       tx_biotype=tx_biotype, tx_call=tx_call)
 
         # Step 8: update GFF3 (dropping capped copies)
         update_gff3(args.consensus_gff3, args.output_gff3, gene_descriptions, tx_descriptions,
-                    drop_gene_ids=drop_gene_ids, drop_tx_ids=drop_tx_ids)
+                    drop_gene_ids=drop_gene_ids, drop_tx_ids=drop_tx_ids,
+                    gene_biotype=gene_biotype, tx_biotype=tx_biotype)
 
         # Step 9: emit a structurally consistent genePred if requested
         if args.output_gp:
