@@ -16,10 +16,13 @@ extra sequence clustering:
 
 Lineage-specific expansions found only via protein homology are labeled in
 ``novel_gene_description`` as ``paralog of GENE`` by ``annotate_novel_genes.py``.
-Those loci are *attributed back* to the matching reference gene (by common name)
-so copy-number / family matrices reflect real expansions (e.g. PSG, VN1R, GGT,
-IGSF3, FRG1, APOBEC3). Unresolved / lineage-specific novels (no ``paralog of``
-hit, or hit to a non-reference symbol) stay in ``novel_genes.tsv``.
+Miniprot-only recoveries are classified by ``call_miniprot_novel``: transcribed,
+missing-gene, local CNV, complete interchromosomal CNV, and strong de novo
+models count as protein-coding; 2-exon / dispersed / weak models stay
+``unknown_likely_coding`` and are not counted here. Remaining ``paralog of GENE``
+coding calls are attributed back
+to the matching reference gene (by common name). Unresolved novels stay in
+``novel_genes.tsv``.
 
 From copy number we call, per reference gene and per (heuristic) gene family:
 
@@ -64,6 +67,24 @@ import re
 import sqlite3
 import sys
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from cat.miniprot_novel_call import (
+        PROTEIN_CODING,
+        call_miniprot_novel,
+        has_rna_support,
+        parent_symbol_from_description,
+    )
+except Exception:  # pragma: no cover
+    PROTEIN_CODING = "protein_coding"
+    def call_miniprot_novel(*a, **k):
+        return PROTEIN_CODING, "unclassified"
+    def has_rna_support(attrs):
+        return False
+    def parent_symbol_from_description(desc):
+        d = (desc or "").strip()
+        return d[11:].split()[0].strip().upper() if d.lower().startswith("paralog of ") else ""
 
 # gp_info is small enough that stdlib csv is plenty; pandas only used for the
 # matrix pivot / heatmap where it is genuinely convenient.
@@ -140,7 +161,7 @@ def load_reference_pc(ref_db, biotype="protein_coding"):
 
 # ─── consensus parsing ─────────────────────────────────────────────────────────
 def load_gp_coords(gp_path):
-    """transcript_id -> (chrom, strand, txStart, txEnd) from a consensus genePred."""
+    """transcript_id -> (chrom, strand, txStart, txEnd, n_exons, cds_aa)."""
     coords = {}
     if not os.path.exists(gp_path):
         return coords
@@ -149,8 +170,22 @@ def load_gp_coords(gp_path):
             f = line.rstrip("\n").split("\t")
             if len(f) < 6:
                 continue
-            # genePred: name, chrom, strand, txStart, txEnd, cdsStart, cdsEnd, ...
-            coords[f[0]] = (f[1], f[2], int(f[3]), int(f[4]))
+            n_ex, cds_aa = 0, 0
+            if len(f) >= 10:
+                try:
+                    cds0, cds1 = int(f[5]), int(f[6])
+                    n_ex = int(f[7])
+                    starts = [int(x) for x in f[8].rstrip(",").split(",") if x]
+                    ends = [int(x) for x in f[9].rstrip(",").split(",") if x]
+                    cds_nt = 0
+                    for s, e in zip(starts, ends):
+                        a, b = max(s, cds0), min(e, cds1)
+                        if b > a:
+                            cds_nt += b - a
+                    cds_aa = cds_nt // 3
+                except ValueError:
+                    pass
+            coords[f[0]] = (f[1], f[2], int(f[3]), int(f[4]), n_ex, cds_aa)
     return coords
 
 
@@ -184,6 +219,10 @@ def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
     gene_meta = {}
     # gene_id -> novel locus accumulator (dedupe transcripts)
     novel_by_gene = {}
+    miniprot_by_gene = {}
+    proj_sym_chroms = defaultdict(set)
+    proj_sym_exons = defaultdict(int)
+    proj_sym_aa = defaultdict(int)
     with open(gp_info_path) as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         for row in reader:
@@ -197,22 +236,57 @@ def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
             common = (row.get("source_gene_common_name") or "").strip()
             desc = (row.get("novel_gene_description") or "").strip()
             nclass = (row.get("novel_class") or "").strip()
+            pon = (row.get("protein_only_novel") or "").strip().lower() in {"1", "true", "yes"}
+            src_l = str(source_gene)
+            is_miniprot_novel = (
+                pon
+                or src_l.startswith("MP-NOVEL-")
+                or src_l.startswith("MP-RECOVERED-")
+            )
+            c = coords.get(tx_id, ("NA", ".", 0, 0, 0, 0))
 
-            # Novel / de novo PC loci: no reference source_gene, but predicted coding.
-            # This covers de-novo (augPB/strg) novel genes AND protein-only novel
-            # genes (augMP, source_gene "MP-NOVEL-*", transcript_class putative_novel)
-            # promoted by consensus so lineage-specific genes are reported as novel.
+            if is_miniprot_novel:
+                rec = miniprot_by_gene.get(gene_id)
+                if rec is None:
+                    miniprot_by_gene[gene_id] = {
+                        "gene_id": gene_id,
+                        "transcript_id": tx_id,
+                        "chrom": c[0], "start": c[2], "end": c[3],
+                        "strand": c[1],
+                        "transcript_class": tclass, "alignment_mode": mode,
+                        "novel_gene_description": desc if desc not in ("", "N/A") else "",
+                        "novel_class": nclass if nclass not in ("", "N/A") else "",
+                        "n_transcripts": 1,
+                        "n_exons": c[4],
+                        "cds_aa": c[5],
+                        "rna": has_rna_support(row),
+                    }
+                else:
+                    rec["n_transcripts"] += 1
+                    rec["rna"] = rec.get("rna") or has_rna_support(row)
+                    rec["n_exons"] = max(rec.get("n_exons", 0), c[4])
+                    rec["cds_aa"] = max(rec.get("cds_aa", 0), c[5])
+                    if c[0] != "NA":
+                        if rec["chrom"] in ("", "NA"):
+                            rec["chrom"], rec["strand"] = c[0], c[1]
+                        rec["start"] = min(rec["start"], c[2]) if rec["start"] else c[2]
+                        rec["end"] = max(rec["end"], c[3])
+                    if desc and desc not in ("", "N/A") and not rec["novel_gene_description"]:
+                        rec["novel_gene_description"] = desc
+                    if nclass and nclass not in ("", "N/A") and not rec["novel_class"]:
+                        rec["novel_class"] = nclass
+                continue
+
+            # Novel / de novo PC loci (augPB/strg), not miniprot-only.
             is_novel = (not source_gene or src_biotype in ("", "N/A")
-                        or tclass == "putative_novel"
-                        or str(source_gene).startswith("MP-NOVEL-"))
+                        or tclass == "putative_novel")
             if is_novel:
                 if gene_biotype == select_biotype:
-                    c = coords.get(tx_id, ("NA", ".", 0, 0))
                     rec = novel_by_gene.get(gene_id)
                     if rec is None:
                         novel_by_gene[gene_id] = {
                             "gene_id": gene_id,
-                            "transcript_id": tx_id,  # exemplar
+                            "transcript_id": tx_id,
                             "chrom": c[0], "start": c[2], "end": c[3],
                             "strand": c[1],
                             "transcript_class": tclass, "alignment_mode": mode,
@@ -243,20 +317,57 @@ def parse_consensus(gp_info_path, gp_path, select_biotype="protein_coding",
             rec["classes"].add(tclass)
             if source_gene not in gene_meta:
                 gene_meta[source_gene] = {"common_name": common or source_gene}
+            if common:
+                name = common.strip().upper()
+                proj_sym_chroms[name].add(c[0])
+                proj_sym_exons[name] = max(proj_sym_exons[name], c[4])
+                proj_sym_aa[name] = max(proj_sym_aa[name], c[5])
 
     # attach coordinates per locus
     for source_gene, gmap in loci.items():
         for gene_id, rec in gmap.items():
             chroms, starts, ends, strands = [], [], [], []
             for tx_id in rec["tx"]:
-                c = coords.get(tx_id)
-                if c:
-                    chroms.append(c[0]); strands.append(c[1])
-                    starts.append(c[2]); ends.append(c[3])
+                cc = coords.get(tx_id)
+                if cc:
+                    chroms.append(cc[0]); strands.append(cc[1])
+                    starts.append(cc[2]); ends.append(cc[3])
             rec["chrom"] = chroms[0] if chroms else "NA"
             rec["strand"] = strands[0] if strands else "."
             rec["start"] = min(starts) if starts else 0
             rec["end"] = max(ends) if ends else 0
+            name = (gene_meta.get(source_gene, {}).get("common_name") or "").strip().upper()
+            if name and rec["chrom"] not in ("", "NA"):
+                proj_sym_chroms[name].add(rec["chrom"])
+            for tx_id in rec["tx"]:
+                cc = coords.get(tx_id)
+                if name and cc:
+                    proj_sym_exons[name] = max(proj_sym_exons[name], cc[4])
+                    proj_sym_aa[name] = max(proj_sym_aa[name], cc[5])
+
+    # Classify miniprot-only models; only protein_coding calls enter the PC set.
+    for gene_id, rec in miniprot_by_gene.items():
+        parent = parent_symbol_from_description(rec.get("novel_gene_description") or "")
+        parent_present = bool(parent) and parent in proj_sym_chroms
+        same_chrom = bool(parent) and rec.get("chrom") in proj_sym_chroms.get(parent, set())
+        bt, reason = call_miniprot_novel(
+            n_exons=rec.get("n_exons", 0),
+            cds_aa=rec.get("cds_aa", 0),
+            has_rna=bool(rec.get("rna")),
+            novel_class=rec.get("novel_class") or "",
+            parent_already_projected=parent_present if parent else None,
+            same_chrom_as_parent=same_chrom if parent_present else None,
+            parent_n_exons=proj_sym_exons.get(parent, 0) if parent_present else None,
+            parent_cds_aa=proj_sym_aa.get(parent, 0) if parent_present else None,
+        )
+        if bt != PROTEIN_CODING:
+            continue
+        rec["miniprot_novel_call"] = reason
+        rec.pop("n_exons", None)
+        rec.pop("cds_aa", None)
+        rec.pop("rna", None)
+        novel_by_gene[gene_id] = rec
+
     return loci, list(novel_by_gene.values()), gene_meta
 
 
