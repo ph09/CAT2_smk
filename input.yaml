@@ -20,7 +20,7 @@ protein_fasta: "test_data/GRCm38.mm10.subset.prot.fa"
 #       reference proteomes, merges + de-duplicates them, and uses the result as
 #       the miniprot input. Needs outbound internet on the machine running the
 #       controller (the download runs there, once, and is cached). If `protein_db`
-#       is set it takes precedence over `protein_fasta`. Example for a panprimate
+#       is set it takes precedence over `protein_fasta`. Example for a 
 #       run (pick a handful of well-spread representatives — dumping all species is
 #       slower with no recall gain since most genes are shared):
 #
@@ -48,10 +48,10 @@ protein_fasta: "test_data/GRCm38.mm10.subset.prot.fa"
 #                                  #   (e.g. proteins derived from the reference GFF3)
 #   dedup: true                    # collapse identical sequences (keeps miniprot fast)
 #   min_len: 20                    # drop proteins shorter than this
-#   out: "panprimate_data/protein_db.fa"   # built DB path (default: <work_dir>/protein_db/protein_db.fa)
+#   out: "test_install/protein_db.fa"   # built DB path (default: <work_dir>/protein_db/protein_db.fa)
 #
 # You can also build the DB by hand and point protein_fasta at it:
-#   python scripts/build_protein_db.py --out panprimate_data/protein_db.fa \
+#   python scripts/build_protein_db.py --out test_install/protein_db.fa \
 #       --clades "Cercopithecidae,Lemuridae,Callitrichidae" \
 #       --species "Homo sapiens,Mus musculus"
 ref_genome: "mm10"
@@ -166,19 +166,17 @@ global_near_best: 0.15
 #consensus_fragment_max_coverage: 30
 #consensus_fragment_max_identity: 30
 
-# Protein-only novel genes: lineage-specific genes found ONLY via protein/augMP
-# evidence (a miniprot model whose protein is not a reference transcript, e.g. a
-# non-human primate gene absent from a human reference). On by default: they are
-# relabeled putative_novel protein_coding with clean MP-NOVEL-<genome>-N ids,
-# redundant per-locus copies are collapsed, and (unless
-# protein_novel_keep_overlapping) only intergenic loci are kept. Set false to
-# leave them as mislabeled 'ortholog' with a synthetic id. Pair with a
-# multi-species protein_db (above) so augMP actually has non-reference proteins
-# to find.
+# Protein-only novel genes: miniprot models whose protein is not a reference
+# transcript. They stay in the annotation. call_miniprot_novel splits them:
+# RNA / missing-gene / local or complete interchrom CNV / strong de novo →
+# protein_coding; 2-exon, fragment paralogs, weak structure → unknown_likely_coding.
+# protein_novel_as_coding: true forces every miniprot novel to coding (high_recall).
 #keep_protein_only_novel: true
+#protein_novel_as_coding: false
 #protein_novel_min_coverage: 0.0    # extra miniprot coverage floor (percent) for these genes
 #protein_novel_min_identity: 0.0    # extra miniprot identity floor (percent)
 #protein_novel_keep_overlapping: false  # true = also keep ones overlapping a reference gene's CDS
+#rescue_augMP_novels: true          # keep UniProt-only empty-locus recoveries (then classify)
 
 # Consensus postprocess drop rule tuning (postprocess stays on; disable entirely
 # with consensus_postprocess: false). The low-support drop now protects loci
