@@ -12,6 +12,10 @@ import pandas as pd
 import multiprocessing as mp
 from functools import partial
 from pathlib import Path
+from cat.miniprot_novel_call import (
+    call_miniprot_novel,
+    has_rna_support,
+)
 import tools.fileOps
 import tools.intervals
 import tools.mathOps
@@ -186,9 +190,11 @@ def add_arguments(parser):
         default=True,
         help="Retain (and cleanly label) lineage-specific genes found ONLY in protein/augMP "
              "evidence, i.e. augMP models whose protein is not a reference transcript. Orphan "
-             "models are relabeled 'putative_novel' protein_coding with MP-NOVEL-<genome>-N "
-             "gene ids, redundant per-locus copies are collapsed, and (unless "
-             "--protein-novel-keep-overlapping) only intergenic loci are kept. On by default.",
+             "models are relabeled 'putative_novel' with MP-NOVEL-<genome>-N gene ids, redundant "
+             "per-locus copies are collapsed, and (unless --protein-novel-keep-overlapping) only "
+             "intergenic loci are kept. Biotype comes from call_miniprot_novel (RNA / long "
+             "multi-exon → protein_coding, else unknown_likely_coding) unless "
+             "--protein-novel-as-coding is set. On by default.",
     )
     parser.add_argument(
         "--no-keep-protein-only-novel",
@@ -262,9 +268,26 @@ def add_arguments(parser):
         dest="rescue_dropped_augMP",
         action="store_true",
         help="Recover high-quality augMP models that consensus selection dropped, at loci where "
-             "the consensus is otherwise EMPTY on that strand. augMP is frequently the only mode "
-             "that finds lineage-specific genes (it uses species-specific proteins), so this closes "
-             "a real recall gap. Requires multi-exon + ORF >= --rescue-augMP-min-cds-aa. Off by default.",
+             "the consensus is otherwise EMPTY on that strand. By default this only restores "
+             "models whose protein is a reference transcript (missing orthologs). UniProt-only "
+             "hits are not added as protein_coding genes unless --rescue-augMP-novels is also "
+             "set. Requires multi-exon + ORF >= --rescue-augMP-min-cds-aa. Off by default.",
+    )
+    parser.add_argument(
+        "--rescue-augMP-novels",
+        dest="rescue_augMP_novels",
+        action="store_true",
+        help="When recovering dropped augMP models, also keep proteins that are NOT reference "
+             "transcripts (UniProt / other-species hits at empty loci). Each is classified by "
+             "call_miniprot_novel: RNA or a long multi-exon model becomes protein_coding, "
+             "the rest unknown_likely_coding. On by default.",
+    )
+    parser.add_argument(
+        "--protein-novel-as-coding",
+        dest="protein_novel_as_coding",
+        action="store_true",
+        help="Force every protein-only novel (augMP orphan) model to protein_coding, skipping "
+             "call_miniprot_novel. Off by default; high_recall turns this on.",
     )
     parser.add_argument(
         "--rescue-augMP-min-exons",
@@ -1020,7 +1043,7 @@ def backfill_cnv_metrics(mrna_metrics_df, cds_metrics_df, valid_aln_ids, alignme
 def reclassify_protein_only_novel(final_consensus, tx_dict, ref_df, metrics, genome,
                                   mrna_metrics_df=None, min_coverage=0.0,
                                   min_identity=0.0, intergenic_only=True,
-                                  min_exons=2, min_cds_aa=100):
+                                  min_exons=2, min_cds_aa=100, as_coding=False):
     """Promote orphan augMP models (protein-only, no reference transcript) to a
     clean protein-only novel-gene class so lineage-specific genes found ONLY in
     protein/miniprot evidence survive and are reported as novel.
@@ -1043,9 +1066,11 @@ def reclassify_protein_only_novel(final_consensus, tx_dict, ref_df, metrics, gen
         proteins hitting one locus) to one representative (longest ORF),
       * when ``intergenic_only`` (default) drops any locus overlapping a
         reference-anchored CDS, keeping only genuinely novel intergenic loci,
-      * relabels survivors as ``putative_novel`` protein_coding with stable
-        ``MP-NOVEL-<genome>-N`` source ids (numbered by genomic position) and a
-        blank ``source_gene_biotype`` so they are counted as novel genes.
+      * relabels survivors as ``putative_novel`` with stable
+        ``MP-NOVEL-<genome>-N`` source ids. Biotype is decided by
+        ``call_miniprot_novel`` (RNA + long multi-exon → protein_coding;
+        otherwise unknown_likely_coding). DIAMOND in annotate_novel_genes
+        later promotes missing-gene / local-CNV models.
 
     Returns the (possibly shorter) consensus list.
     """
@@ -1179,8 +1204,18 @@ def reclassify_protein_only_novel(final_consensus, tx_dict, ref_df, metrics, gen
         gene_id = "MP-NOVEL-{}-{}".format(genome, novel_idx)
         attrs = final_consensus[rep][1]
         attrs['transcript_class'] = 'putative_novel'
-        attrs['gene_biotype'] = 'protein_coding'
-        attrs['transcript_biotype'] = 'protein_coding'
+        tx_obj = tx_dict[final_consensus[rep][0]]
+        n_ex = len(getattr(tx_obj, 'exon_intervals', []) or [])
+        cds_aa = getattr(tx_obj, 'cds_size', 0) // 3
+        bt, reason = call_miniprot_novel(
+            n_exons=n_ex,
+            cds_aa=cds_aa,
+            has_rna=has_rna_support(attrs),
+            as_coding=as_coding,
+        )
+        attrs['gene_biotype'] = bt
+        attrs['transcript_biotype'] = bt
+        attrs['miniprot_novel_call'] = reason
         attrs['source_gene'] = gene_id
         attrs['source_gene_biotype'] = 'N/A'
         attrs['source_gene_common_name'] = None
@@ -1196,40 +1231,31 @@ def reclassify_protein_only_novel(final_consensus, tx_dict, ref_df, metrics, gen
     metrics['Protein-only novel']['dropped_low_coverage'] = drop_counts['low_coverage']
     metrics['Protein-only novel']['dropped_low_identity'] = drop_counts['low_identity']
     metrics['Protein-only novel']['dropped_overlaps_reference'] = drop_counts['overlaps_reference']
+    # How many of the kept models were called coding vs unknown at consensus time
+    # (before DIAMOND). annotate_novel_genes may promote some unknowns later.
+    n_coding = 0
+    for i, (aln_id, attrs) in enumerate(new_consensus):
+        if attrs.get('protein_only_novel') == 'True' and attrs.get('gene_biotype') == 'protein_coding':
+            n_coding += 1
+    metrics['Protein-only novel']['called_protein_coding'] = n_coding
+    metrics['Protein-only novel']['called_unknown_likely_coding'] = n_kept - n_coding
     return new_consensus
 
 
 def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome,
                                mrna_metrics_df=None, min_exons=2, min_cds_aa=100,
                                min_coverage=0.0, min_identity=0.0,
-                               single_exon_min_cds_aa=300):
+                               single_exon_min_cds_aa=300, allow_novel=True,
+                               as_coding=False):
     """Recover high-quality augMP CDS models that consensus dropped, at loci that
     lack a same-strand protein-coding CDS in the consensus.
 
-    Rationale (validated vs RefSeq): most RefSeq PC genes we fail to recover are
-    still found by a raw mode -- for genes with no reference ortholog, augMP is
-    frequently the ONLY mode that finds them, because it uses species/lineage-
-    specific proteins from the expanded protein DB. Two failure modes are covered:
-
-      1. the locus is completely empty (a truly novel lineage-specific gene), and
-      2. the locus is occupied only by a NON-coding model (a pseudogene/lncRNA
-         projection with no ORF) that beat the CDS-bearing augMP model -- confirmed
-         on real genes (WASHC2A, MOXD2, KIR3DX1, PRSS45, ...). We treat a locus as
-         available whenever it has no same-strand protein-coding CDS, so the augMP
-         CDS model is added as a protein_coding gene alongside the non-coding call.
-
-    Any augMP model in ``tx_dict`` that was NOT selected, has an ORF >=
-    ``min_cds_aa`` residues, passes optional miniprot coverage/identity, is either
-    multi-exon (>= ``min_exons``) OR single-exon with a long ORF (>=
-    ``single_exon_min_cds_aa`` residues, to keep intronless genes like SMEK1 while
-    excluding short retrocopies), and lands on a locus with no same-strand PC CDS is
-    added back. Overlap with an existing same-strand PC gene is permitted only for
-    retrocopies (single-exon models, e.g. retrogenes nested in a host gene's
-    intron); multi-exon models overlapping an annotated PC gene are excluded as
-    likely fragments of that gene. Per-locus duplicates collapse to the longest ORF. Models whose
-    protein is a reference transcript are labelled recovered orthologs (source gene
-    = that reference gene, counting toward reference recall / paralogs); the rest
-    are labelled protein-only ``putative_novel``.
+    Reference-transcript proteins are restored as orthologs (real genes
+    consensus dropped: WASHC2A, MOXD2, …). Non-reference (UniProt) proteins
+    are kept when ``allow_novel`` (default) and classified by
+    ``call_miniprot_novel``: RNA or a long multi-exon model → protein_coding,
+    otherwise unknown_likely_coding. annotate_novel_genes later promotes
+    missing-gene / local-CNV models using DIAMOND.
 
     Returns the (possibly longer) consensus list.
     """
@@ -1336,6 +1362,10 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
         # excluding them.
         if _occupied(ci) and n_ex > 1:
             drop_counts['locus_occupied'] += 1; continue
+        base = _versionless(nc.strip_alignment_numbers(str(aln_id)))
+        if base not in ref_tx_ids and not allow_novel:
+            drop_counts['not_reference_transcript'] += 1
+            continue
         candidates.append((aln_id, tx_obj, ci))
 
     if not candidates:
@@ -1344,7 +1374,8 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
             {'recovered_genes': 0, 'recovered_orthologs': 0, 'recovered_novel': 0,
              'dropped_single_exon': drop_counts['single_exon'],
              'dropped_short_cds': drop_counts['short_cds'],
-             'dropped_locus_occupied': drop_counts['locus_occupied']})
+             'dropped_locus_occupied': drop_counts['locus_occupied'],
+             'dropped_not_reference_transcript': drop_counts['not_reference_transcript']})
         return final_consensus
 
     # Cluster candidates by CDS overlap on the same strand; keep the longest ORF.
@@ -1363,6 +1394,7 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
 
     n_orth = 0
     n_novel = 0
+    n_novel_coding = 0
     novel_idx = 0
     for cl in clusters:
         aln_id, tx_obj, ci = max(cl['members'], key=lambda m: getattr(m[1], 'cds_size', 0))
@@ -1370,13 +1402,15 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
         attrs = {
             'alignment_id': aln_id,
             'alignment_mode': 'augMP',
-            'gene_biotype': 'protein_coding',
-            'transcript_biotype': 'protein_coding',
             'score': 0,
             'augMP_recovered': 'True',
         }
         if base in ref_tx_ids:
             g, bt = tx_to_gene.get(base, (base, 'protein_coding'))
+            coding = (bt or 'protein_coding') == 'protein_coding'
+            bt_out = 'protein_coding' if coding else (bt or 'unknown_likely_coding')
+            attrs['gene_biotype'] = bt_out
+            attrs['transcript_biotype'] = bt_out
             attrs['source_gene'] = g
             attrs['source_gene_biotype'] = bt or 'protein_coding'
             attrs['source_gene_common_name'] = None
@@ -1385,12 +1419,25 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
         else:
             novel_idx += 1
             gene_id = "MP-RECOVERED-{}-{}".format(genome, novel_idx)
+            n_ex = len(getattr(tx_obj, 'exon_intervals', []) or [])
+            cds_aa = getattr(tx_obj, 'cds_size', 0) // 3
+            bt, reason = call_miniprot_novel(
+                n_exons=n_ex,
+                cds_aa=cds_aa,
+                has_rna=has_rna_support(attrs),
+                as_coding=as_coding,
+            )
+            attrs['gene_biotype'] = bt
+            attrs['transcript_biotype'] = bt
+            attrs['miniprot_novel_call'] = reason
             attrs['source_gene'] = gene_id
             attrs['source_gene_biotype'] = 'N/A'
             attrs['source_gene_common_name'] = None
             attrs['transcript_class'] = 'putative_novel'
             attrs['protein_only_novel'] = 'True'
             n_novel += 1
+            if bt == 'protein_coding':
+                n_novel_coding += 1
         final_consensus.append((aln_id, attrs))
 
     metrics.setdefault('augMP empty-locus recovery', {})
@@ -1398,9 +1445,11 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
         {'recovered_genes': n_orth + n_novel,
          'recovered_orthologs': n_orth,
          'recovered_novel': n_novel,
+         'recovered_novel_protein_coding': n_novel_coding,
          'dropped_single_exon': drop_counts['single_exon'],
          'dropped_short_cds': drop_counts['short_cds'],
-         'dropped_locus_occupied': drop_counts['locus_occupied']})
+         'dropped_locus_occupied': drop_counts['locus_occupied'],
+         'dropped_not_reference_transcript': drop_counts['not_reference_transcript']})
     return final_consensus
 
 
@@ -2171,10 +2220,10 @@ def generate_consensus(args):
 
     # Guarantee retention + clean labeling of lineage-specific genes found ONLY in
     # protein/augMP evidence (no reference transcript). On by default; disable with
-    # --no-keep-protein-only-novel. Runs after the reference rescues so the
-    # intergenic test sees the full reference footprint, and before the gene/PC
-    # counting + completeness below so survivors are counted as novel protein-coding
-    # genes in the final stats.
+    # --no-keep-protein-only-novel. Biotype is call_miniprot_novel (RNA / long
+    # multi-exon → protein_coding, else unknown_likely_coding) unless
+    # --protein-novel-as-coding. annotate_novel_genes later promotes missing-gene
+    # and local-CNV models using DIAMOND.
     if getattr(args, 'keep_protein_only_novel', True):
         before = len(final_consensus)
         final_consensus = reclassify_protein_only_novel(
@@ -2185,10 +2234,13 @@ def generate_consensus(args):
             intergenic_only=not getattr(args, 'protein_novel_keep_overlapping', False),
             min_exons=getattr(args, 'protein_novel_min_exons', 2),
             min_cds_aa=getattr(args, 'protein_novel_min_cds_aa', 100),
+            as_coding=getattr(args, 'protein_novel_as_coding', False),
         )
         pn = metrics.get('Protein-only novel', {})
         logger.info(
-            f"  Protein-only novel genes: kept {pn.get('kept', 0)} as putative_novel, "
+            f"  Protein-only novel genes: kept {pn.get('kept', 0)} as putative_novel "
+            f"({pn.get('called_protein_coding', 0)} protein_coding / "
+            f"{pn.get('called_unknown_likely_coding', 0)} unknown_likely_coding), "
             f"dropped {pn.get('dropped', 0)} (single_exon={pn.get('dropped_single_exon', 0)}, "
             f"short_cds={pn.get('dropped_short_cds', 0)}, low_cov={pn.get('dropped_low_coverage', 0)}, "
             f"low_id={pn.get('dropped_low_identity', 0)}, overlaps_ref={pn.get('dropped_overlaps_reference', 0)}); "
@@ -2210,14 +2262,19 @@ def generate_consensus(args):
             min_coverage=getattr(args, 'rescue_augMP_min_coverage', 0.0),
             min_identity=getattr(args, 'rescue_augMP_min_identity', 0.0),
             single_exon_min_cds_aa=getattr(args, 'rescue_augMP_single_exon_min_cds_aa', 300),
+            allow_novel=getattr(args, 'rescue_augMP_novels', True),
+            as_coding=getattr(args, 'protein_novel_as_coding', False),
         )
         am = metrics.get('augMP empty-locus recovery', {})
         logger.info(
             f"  augMP/augPB CDS recovery (PC-empty loci): added {am.get('recovered_genes', 0)} genes "
             f"({am.get('recovered_orthologs', 0)} recovered orthologs, "
-            f"{am.get('recovered_novel', 0)} protein-only novel); dropped "
+            f"{am.get('recovered_novel', 0)} protein-only novel "
+            f"({am.get('recovered_novel_protein_coding', 0)} called protein_coding); dropped "
             f"single_exon={am.get('dropped_single_exon', 0)}, short_cds={am.get('dropped_short_cds', 0)}, "
-            f"locus_has_PC_CDS={am.get('dropped_locus_occupied', 0)}; consensus {before} -> {len(final_consensus)}"
+            f"locus_has_PC_CDS={am.get('dropped_locus_occupied', 0)}, "
+            f"not_ref_tx={am.get('dropped_not_reference_transcript', 0)}; "
+            f"consensus {before} -> {len(final_consensus)}"
         )
 
     # Recover real protein-coding genes that inherited a non-coding biotype from a
