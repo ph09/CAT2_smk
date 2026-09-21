@@ -1605,19 +1605,20 @@ fi
         batches = [transcript_items[i:i + batch_size] for i in range(0, total, batch_size)]
         logger.info(f"Creating {len(batches)} transcript batches for SLURM processing (batch_size={batch_size})...")
 
-        # Write batch files (store transcript IDs per line)
+        # Write a genePred per batch so workers never load the full coding GP
+        # (augMP miniprot GPs are ~1 GB / 5M rows; that OOMs a 16G cgroup).
         for idx, batch in enumerate(batches):
-            job_file = jobs_dir / f"batch_{idx:04d}.txt"
+            job_file = jobs_dir / f"batch_{idx:04d}.gp"
             with open(job_file, 'w') as jf:
-                for tx_id, _ in batch:
-                    jf.write(tx_id + "\n")
+                for _tx_id, tx in batch:
+                    jf.write('\t'.join(tx.get_gene_pred()) + '\n')
 
         # OPTIMIZATION 2: Use a single consolidated output file instead of one per batch
         consolidated_output = results_dir / "all_results.gtf"
         
         # Create cluster array script with streaming output. Indexing is
         # 1-based at the scheduler level (works on SGE natively); the body
-        # shifts to 0-based IDX so the batch_NNNN.txt filename convention
+        # shifts to 0-based IDX so the batch_NNNN.gp filename convention
         # is preserved.
         array_script = slurm_root / "transcript_processing.slurm"
         array_count = len(batches)
@@ -1644,10 +1645,10 @@ export PYTHONPATH="{project_root}:${{PYTHONPATH:-}}"
 
 TASK_ID="${{{task_var}}}"
 IDX=$((TASK_ID - 1))
-JOB_FILE=$(printf "{jobs_dir}/batch_%04d.txt" "$IDX")
+JOB_FILE=$(printf "{jobs_dir}/batch_%04d.gp" "$IDX")
 RES_FILE=$(printf "{results_dir}/results_%04d.gtf" "$IDX")
 
-{python_exe} {os.path.abspath(__file__)} --worker_mode --worker_merged_gff {merged_for_slurm} --worker_coding_gp {os.path.abspath(self.args.coding_gp)} --worker_run_mode {mode} --worker_batch_file "$JOB_FILE" --worker_result_file "$RES_FILE"
+{python_exe} {os.path.abspath(__file__)} --worker_mode --worker_merged_gff {merged_for_slurm} --worker_coding_gp "$JOB_FILE" --worker_run_mode {mode} --worker_result_file "$RES_FILE"
 """)
 
         try:
@@ -2246,9 +2247,9 @@ def main():
     parser.add_argument("--worker_mode", action="store_true",
                        help="Internal: run transcript worker mode (called by SLURM array).")
     parser.add_argument("--worker_merged_gff", help="Merged GFF input for worker mode")
-    parser.add_argument("--worker_coding_gp", help="Coding GP path for worker mode")
+    parser.add_argument("--worker_coding_gp", help="Coding GP path for worker mode (full GP or a per-batch GP)")
+    parser.add_argument("--worker_batch_file", help="Optional transcript-ID list; if omitted, process every record in --worker_coding_gp")
     parser.add_argument("--worker_run_mode", help="Mode for worker (TM/TMR)")
-    parser.add_argument("--worker_batch_file", help="Batch file with transcript IDs for worker")
     parser.add_argument("--worker_result_file", help="Worker output GTF path")
     
     args = parser.parse_args()
@@ -2273,60 +2274,79 @@ def main():
     if args.augustus_tmr_gtf and (not args.augustus_hints_db or not args.tmr_cfg):
         parser.error("--augustus_hints_db and --tmr_cfg are required when --augustus_tmr_gtf is specified.")
     
-    # Worker mode: process a batch and exit
+    # Worker mode: process a batch and exit.
+    # Each task is given a small per-batch genePred (not the full coding GP).
+    # Loading the full augMP miniprot GP (~5M rows) in every 16G array task
+    # was OOM-killing the whole transcript-processing array.
     if args.worker_mode:
         import tools.transcripts
         import tools.intervals
-        # Read lines
+        from collections import defaultdict
+
+        lines_by_chrom = defaultdict(list)
+        tx_by_chrom = defaultdict(list)
         with open(args.worker_merged_gff, 'r') as f:
-            aug_lines = f.readlines()
-        tm_tx_dict = tools.transcripts.get_gene_pred_dict(args.worker_coding_gp)
-        # Munge per transcript
-        def munge_local(aug_lines, mode, tm_tx):
-            tx_entries = [x.split() for x in aug_lines if "\ttranscript\t" in x]
-            # Store entries with overlap size for selection
-            valid_tx_candidates = []
-            for x in tx_entries:
-                try:
-                    aug_interval = tools.intervals.ChromosomeInterval(x[0], int(x[3]), int(x[4]), x[6])
-                    if tm_tx.interval.overlap(aug_interval):
-                        # Calculate overlap size
-                        intersection = tm_tx.interval.intersection(aug_interval)
-                        overlap_size = (intersection.stop - intersection.start) if intersection else 0
-                        valid_tx_candidates.append((x[-1], overlap_size, int(x[3]), int(x[4])))
-                except (ValueError, IndexError):
+            for line in f:
+                if line.startswith('#') or not line.strip():
                     continue
-            
-            if len(valid_tx_candidates) == 0:
+                if "\ttranscript\t" in line:
+                    x = line.split()
+                    if len(x) < 7:
+                        continue
+                    try:
+                        aug_interval = tools.intervals.ChromosomeInterval(
+                            x[0], int(x[3]), int(x[4]), x[6]
+                        )
+                        tx_by_chrom[x[0]].append(
+                            (aug_interval, x[-1], int(x[3]), int(x[4]))
+                        )
+                    except (ValueError, IndexError):
+                        continue
+                chrom = line.split('\t', 1)[0]
+                lines_by_chrom[chrom].append(line)
+
+        wanted = None
+        if args.worker_batch_file:
+            with open(args.worker_batch_file, 'r') as bf:
+                wanted = {ln.strip() for ln in bf if ln.strip()}
+        tm_tx_dict = {}
+        for tx in tools.transcripts.gene_pred_iterator(args.worker_coding_gp):
+            if wanted is None or tx.name in wanted:
+                tm_tx_dict[tx.name] = tx
+                if wanted is not None and len(tm_tx_dict) >= len(wanted):
+                    break
+
+        def munge_local(mode, tm_tx):
+            chrom_lines = lines_by_chrom.get(tm_tx.chromosome, [])
+            valid_tx_candidates = []
+            for aug_interval, tx_key, tstart, tstop in tx_by_chrom.get(tm_tx.chromosome, []):
+                if tm_tx.interval.overlap(aug_interval):
+                    intersection = tm_tx.interval.intersection(aug_interval)
+                    overlap_size = (intersection.stop - intersection.start) if intersection else 0
+                    valid_tx_candidates.append((tx_key, overlap_size, tstart, tstop))
+            if not valid_tx_candidates:
                 return []
-            
-            # Select the best match: highest overlap size, then shorter transcript (more complete prediction)
-            # Sort by: -overlap_size (descending), then transcript_length (ascending)
             valid_tx_candidates.sort(key=lambda x: (-x[1], x[3] - x[2]))
             valid_tx = valid_tx_candidates[0][0]
             features = {"exon", "CDS", "start_codon", "stop_codon", "tts", "tss"}
             out = []
-            for line in aug_lines:
-                if line.startswith('#'):
+            for line in chrom_lines:
+                if valid_tx not in line:
                     continue
-                if valid_tx in line:
-                    parts = line.rstrip("\n").split("\t")
-                    if len(parts) < 9:
-                        continue
-                    chrom, source, feature, start, stop, score, strand, frame, attributes = parts
-                    if feature not in features:
-                        continue
-                    new_attr = f'transcript_id "aug{mode}-{tm_tx.name}"; gene_id "{tm_tx.name2}";'
-                    out.append([chrom, source, feature, start, stop, score, strand, frame, new_attr])
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 9:
+                    continue
+                chrom, source, feature, start, stop, score, strand, frame, attributes = parts
+                if feature not in features:
+                    continue
+                new_attr = f'transcript_id "aug{mode}-{tm_tx.name}"; gene_id "{tm_tx.name2}";'
+                out.append([chrom, source, feature, start, stop, score, strand, frame, new_attr])
             return out
+
         all_out = []
-        with open(args.worker_batch_file, 'r') as bf:
-            for tx_id in (ln.strip() for ln in bf if ln.strip()):
-                tx = tm_tx_dict.get(tx_id)
-                if tx is None:
-                    continue
-                all_out.extend(munge_local(aug_lines, args.worker_run_mode, tx))
-        os.makedirs(os.path.dirname(args.worker_result_file), exist_ok=True)
+        for tx in tm_tx_dict.values():
+            all_out.extend(munge_local(args.worker_run_mode, tx))
+        os.makedirs(os.path.dirname(args.worker_result_file) or '.', exist_ok=True)
         with open(args.worker_result_file, 'w') as outf:
             for rec in all_out:
                 outf.write("\t".join(map(str, rec)) + "\n")
