@@ -392,7 +392,7 @@ _RULE_DEFAULTS = {
     "augustus_run_tm_only": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
     "augustus_run_tm_pairwise_and_tmr_pairwise": {"controller_mem_gb": 4, "controller_time_h": 24, "timeout_hours": 48},
     "augustus_run_tm_pairwise_only": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
-    "augustus_run_mp": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
+    "augustus_run_mp": {"controller_mem_gb": 32, "controller_time_h": 12, "timeout_hours": 24},
     "run_augustus_pb": {"controller_mem_gb": 4, "controller_time_h": 12, "timeout_hours": 24},
     "build_protein_db": {"controller_mem_gb": 4, "controller_time_h": 6, "timeout_hours": 6},
     "fix_augmp_gene_names": {"controller_mem_gb": 4, "controller_time_h": 1, "timeout_hours": 1},
