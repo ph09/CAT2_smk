@@ -20,7 +20,7 @@ protein_fasta: "test_data/GRCm38.mm10.subset.prot.fa"
 #       reference proteomes, merges + de-duplicates them, and uses the result as
 #       the miniprot input. Needs outbound internet on the machine running the
 #       controller (the download runs there, once, and is cached). If `protein_db`
-#       is set it takes precedence over `protein_fasta`. Example for a 
+#       is set it takes precedence over `protein_fasta`. Example for a panprimate
 #       run (pick a handful of well-spread representatives — dumping all species is
 #       slower with no recall gain since most genes are shared):
 #
@@ -48,10 +48,10 @@ protein_fasta: "test_data/GRCm38.mm10.subset.prot.fa"
 #                                  #   (e.g. proteins derived from the reference GFF3)
 #   dedup: true                    # collapse identical sequences (keeps miniprot fast)
 #   min_len: 20                    # drop proteins shorter than this
-#   out: "test_install/protein_db.fa"   # built DB path (default: <work_dir>/protein_db/protein_db.fa)
+#   out: "panprimate_data/protein_db.fa"   # built DB path (default: <work_dir>/protein_db/protein_db.fa)
 #
 # You can also build the DB by hand and point protein_fasta at it:
-#   python scripts/build_protein_db.py --out test_install/protein_db.fa \
+#   python scripts/build_protein_db.py --out panprimate_data/protein_db.fa \
 #       --clades "Cercopithecidae,Lemuridae,Callitrichidae" \
 #       --species "Homo sapiens,Mus musculus"
 ref_genome: "mm10"
@@ -100,7 +100,7 @@ minisplice_calibration: "standalones/vi2-7k.kan.cali"
 # on the real per-alignment metrics is expected to prune).
 # miniprot:
 #   splice_model: 2            # -j  2=vertebrate/insect, 1=general, 0=none
-#   max_intron: "auto"         # "auto" => -I (3.6*sqrt(refLen)); or e.g. "500k" => -G500k
+#   max_intron: "200k"         # explicit -G max intron; "auto" => -I (~7.5 kb on primate chroms)
 #   min_secondary_ratio: 0.2   # -p  min secondary-to-primary score ratio (miniprot default 0.7)
 #   max_secondary: 100         # -N  consider at most N secondary alignments (default 30)
 #   out_n: 100                 # --outn  max alignments emitted per query (default 1000)
