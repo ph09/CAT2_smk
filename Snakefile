@@ -330,6 +330,26 @@ def get_gp_path_for_mode(mode, genome):
     }
     return str(path_map[mode])
 
+def protein_refine_inputs(wildcards):
+    """Consensus products plus miniprot PAF when augMP ran for this genome."""
+    g = wildcards.genome
+    wd = config["work_dir"]
+    ins = {
+        "gp": f"{wd}/consensus_gene_set/{g}_consensus.gp",
+        "gp_info": f"{wd}/consensus_gene_set/{g}_consensus.gp_info",
+        "gff3": f"{wd}/consensus_gene_set/{g}_consensus.gff3",
+        "fasta": f"{wd}/consensus_gene_set/{g}_consensus.fasta",
+        "protein_fasta": f"{wd}/consensus_gene_set/{g}_consensus_protein.fasta",
+        "metrics_json": f"{wd}/consensus_gene_set/{g}_consensus.json",
+        "genome_fa": f"{wd}/genome_files/{g}.fa",
+        "ref_gp": f"{wd}/reference/{REF_GENOME}.gp",
+        "ref_gp_attrs": f"{wd}/reference/{REF_GENOME}.gp_attrs",
+        "query_fa": PROTEIN_FASTA,
+    }
+    if PROTEIN_REFINE and g in AUGMP_GENOMES:
+        ins["paf"] = f"{wd}/miniprot/{g}_miniprot.paf"
+    return ins
+
 # Rule execution order
 ruleorder: prepare_reference_files > prepare_genome_files
 ruleorder: augustus_run_tm_and_tmr > augustus_run_tm_only
@@ -376,6 +396,7 @@ _RULE_DEFAULTS = {
     "stringtie_convert":         {"mem": "8G",   "cpus": 2,   "time": "02:00:00", "timeout_hours": 3},
     "stringtie_gp":              {"mem": "8G",   "cpus": 2,   "time": "02:00:00", "timeout_hours": 3},
     "generate_consensus":        {"mem": "256G", "cpus": 32,  "time": "12:00:00", "timeout_hours": 12},
+    "protein_refine":            {"mem": "64G",  "cpus": 4,   "time": "04:00:00", "timeout_hours": 6},
     "annotate_novel_genes":      {"mem": "32G",  "cpus": 16,  "time": "02:00:00", "timeout_hours": 2},
     "generate_hints":            {"mem": "256G", "cpus": 128, "time": "12:00:00", "max_concurrent_jobs": 50,
                                  "controller_time_h": 4, "timeout_hours": 24},
@@ -438,6 +459,7 @@ _LOCAL_DEFAULTS = {
     "stringtie_convert":       {"threads": 2,   "mem_gb": 8,   "time_h": 2},
     "stringtie_gp":            {"threads": 2,   "mem_gb": 8,   "time_h": 2},
     "generate_consensus":      {"threads": 32,  "mem_gb": 128, "time_h": 12},
+    "protein_refine":          {"threads": 4,   "mem_gb": 64,  "time_h": 4},
     "annotate_novel_genes":    {"threads": 16,  "mem_gb": 32,  "time_h": 2},
     "generate_hints":          {"threads": 128, "mem_gb": 256, "time_h": 12},
     "align_transcripts":       {"threads": 64,  "mem_gb": 128, "time_h": 24},
@@ -541,7 +563,7 @@ def snk_time_h(rule_name):
 # honest. miniprot defaults shown in brackets for reference.
 _MINIPROT_MAP_DEFAULTS = {
     "splice_model":        2,        # -j  vertebrate/insect splice model            [1]
-    "max_intron":          "auto",   # "auto" => -I (3.6*sqrt(refLen)); or e.g. "500k" => -G500k
+    "max_intron":          "200k",   # explicit -G; "auto" => -I (~7.5 kb on primate chroms, splits KRAB-ZF)
     "min_secondary_ratio": 0.2,      # -p  min secondary-to-primary score ratio      [0.7]
     "max_secondary":       100,      # -N  consider at most N secondary alignments   [30]
     "out_n":               100,      # --outn  max alignments emitted per query       [1000]
@@ -558,6 +580,7 @@ _MINIPROT_MAP_DEFAULTS = {
 # the whole point of the preset is to relax them; leave high_recall off and set
 # individual keys if you want fine-grained control instead.
 HIGH_RECALL = bool(config.get("high_recall", False))
+PROTEIN_REFINE = bool(config.get("protein_refine", True))
 _HIGH_RECALL_OVERRIDES = {
     # transMap filtering (filter_transmap.py)
     "tm_global_near_best":              0.30,   # keep alignments within 30% of best (vs 0.1)
@@ -1097,7 +1120,12 @@ def run_or_submit(script_body, job_script_path, outputs_to_check,
 
     if IS_CLUSTER:
         SCHEDULER.write_script(script_body, job_script_path)
-        job_id = SCHEDULER.submit(job_script_path)
+        try:
+            job_id = SCHEDULER.submit(job_script_path)
+        except Exception as exc:
+            msg = f"[{rule_name}] submit failed: {exc}"
+            _log_write(log_handle, msg)
+            raise RuntimeError(msg) from exc
         _log_write(log_handle, f"Submitted: {SCHEDULER.name} job {job_id}")
         elapsed = 0
         while elapsed < max_wait_s:
@@ -2647,6 +2675,8 @@ rule run_miniprot:
     priority: 90  # High priority to unblock augustus
     log:
         f"{config['work_dir']}/logs/miniprot/{{genome}}.log"
+    params:
+        max_intron=lambda wildcards: get_miniprot_opt("max_intron"),
     threads: 1 if IS_CLUSTER else get_local_res("run_miniprot", "threads")
     resources:
         mem_gb=snk_mem_gb("run_miniprot"),
@@ -4390,6 +4420,84 @@ fi
                     time.sleep(check_interval)
 
 
+rule protein_refine_consensus:
+    """Correct consensus CDS and names from exclusive miniprot protein hits.
+
+    Shrinks chimeric models, completes truncated KRAB–ZF (and similar) loci,
+    reassigns source_gene_common_name when another peptide is clearly better,
+    and rescues unused reference genes whose protein hit sits in a clean gap.
+    """
+    input:
+        unpack(protein_refine_inputs)
+    output:
+        gp=f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.gp",
+        gp_info=f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.gp_info",
+        gff3=f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.gff3",
+        fasta=f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.fasta",
+        protein_fasta=f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined_protein.fasta",
+        metrics_json=f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.json",
+        done=touch(f"{config['work_dir']}/{{genome}}_protein_refine.done"),
+    wildcard_constraints:
+        genome = ANNOTATION_GENOME_WC
+    log:
+        f"{config['work_dir']}/logs/consensus/{{genome}}_protein_refine.log"
+    threads: 1 if IS_CLUSTER else get_local_res("protein_refine", "threads")
+    resources:
+        mem_gb=snk_mem_gb("protein_refine"),
+        time_h=snk_time_h("protein_refine"),
+        job_id=lambda wildcards, attempt: f"protein-refine-submit-{wildcards.genome}-{attempt}"
+    run:
+        work_dir = config["work_dir"]
+        genome = wildcards.genome
+        job_script = f"{work_dir}/consensus_gene_set/{genome}_protein_refine_job.sh"
+        paf = getattr(input, "paf", "") or ""
+        copy_flag = ""
+        if (not PROTEIN_REFINE) or (not paf):
+            copy_flag = "--copy-through"
+        paf_arg = f"--miniprot-paf {paf}" if paf else ""
+        script_content = build_sbatch_header(
+            "protein_refine",
+            f"protein-refine-{genome}",
+            f"{work_dir}/logs/consensus/{genome}_protein_refine_slurm.out",
+            f"{work_dir}/logs/consensus/{genome}_protein_refine_slurm.err",
+        ) + f"""
+echo "protein_refine for: {genome}"
+echo "Start time: $(date)"
+python -m cat.protein_refine \\
+    --genome {genome} \\
+    --consensus-gp {input.gp} \\
+    --consensus-gp-info {input.gp_info} \\
+    --consensus-gff3 {input.gff3} \\
+    --consensus-fasta {input.fasta} \\
+    --consensus-protein-fasta {input.protein_fasta} \\
+    --consensus-metrics-json {input.metrics_json} \\
+    {paf_arg} \\
+    --protein-fasta {input.query_fa} \\
+    --ref-gp-attrs {input.ref_gp_attrs} \\
+    --ref-gp {input.ref_gp} \\
+    --fasta {input.genome_fa} \\
+    --output-gp {output.gp} \\
+    --output-gp-info {output.gp_info} \\
+    --output-gff3 {output.gff3} \\
+    --output-fasta {output.fasta} \\
+    --output-protein-fasta {output.protein_fasta} \\
+    --output-metrics-json {output.metrics_json} \\
+    {copy_flag}
+echo "protein_refine complete for {genome}"
+echo "End time: $(date)"
+"""
+        with open(log[0], "a") as log_file:
+            log_file.write(f"Submitting protein_refine job for {genome}...\n")
+            run_or_submit(
+                script_content,
+                job_script,
+                [output.gp, output.gp_info, output.gff3],
+                log_file,
+                "protein_refine",
+                max_wait_s=timeout_s("protein_refine"),
+            )
+
+
 rule annotate_novel_genes:
     """
     For each novel gene (transcript_class == 'putative_novel') in the consensus
@@ -4398,11 +4506,11 @@ rule annotate_novel_genes:
     files alongside the standard consensus outputs.
     """
     input:
-        protein_fasta   = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_protein.fasta",
-        gp_info         = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus.gp_info",
-        gff3            = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus.gff3",
-        gp              = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus.gp",
-        metrics_json    = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus.json",
+        protein_fasta   = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined_protein.fasta",
+        gp_info         = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.gp_info",
+        gff3            = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.gff3",
+        gp              = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.gp",
+        metrics_json    = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_refined.json",
         ref_gtf         = WORK_DIR / f"reference/{REF_GENOME}.gtf",
         ref_fasta       = WORK_DIR / f"genome_files/{REF_GENOME}.fa",
         ref_gp_attrs    = WORK_DIR / f"reference/{REF_GENOME}.gp_attrs",
