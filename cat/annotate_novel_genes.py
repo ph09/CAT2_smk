@@ -371,13 +371,19 @@ def update_gp_info(gp_info_file, output_gp_info, tx_descriptions, tx_novel_class
         keep = ~df.index.get_level_values('transcript_id').isin(drop_tx_ids)
         df = df[keep]
     tx_ids = df.index.get_level_values('transcript_id')
-    df.insert(
-        len(df.columns),
+
+    def _assign_column(name, values):
+        """Write a column, replacing it when consensus already produced it."""
+        if name in df.columns:
+            df[name] = values
+        else:
+            df.insert(len(df.columns), name, values)
+
+    _assign_column(
         'novel_gene_description',
         [tx_descriptions.get(tx_id, 'N/A') for tx_id in tx_ids]
     )
-    df.insert(
-        len(df.columns),
+    _assign_column(
         'novel_class',
         [tx_novel_class.get(tx_id, 'N/A') for tx_id in tx_ids]
     )
@@ -392,17 +398,10 @@ def update_gp_info(gp_info_file, output_gp_info, tx_descriptions, tx_novel_class
             bt = tx_biotype.get(tx_id)
             new_gb.append(bt if bt else gb)
             new_tb.append(bt if bt else tb)
-        if 'gene_biotype' in df.columns:
-            df['gene_biotype'] = new_gb
-        else:
-            df.insert(len(df.columns), 'gene_biotype', new_gb)
-        if 'transcript_biotype' in df.columns:
-            df['transcript_biotype'] = new_tb
-        else:
-            df.insert(len(df.columns), 'transcript_biotype', new_tb)
+        _assign_column('gene_biotype', new_gb)
+        _assign_column('transcript_biotype', new_tb)
     if tx_call:
-        df.insert(
-            len(df.columns),
+        _assign_column(
             'miniprot_novel_call',
             [tx_call.get(tx_id, 'N/A') for tx_id in tx_ids]
         )
