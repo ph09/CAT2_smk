@@ -497,7 +497,13 @@ class SlurmScheduler(Scheduler):
     def submit(self, script_path: str | os.PathLike) -> str:
         script_path = str(script_path)
         logger.info(f"sbatch {script_path}")
-        result = _submit_with_retries(["sbatch", script_path])
+        try:
+            result = _submit_with_retries(["sbatch", script_path])
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or e.stdout or "").strip() or f"rc={e.returncode}"
+            raise RuntimeError(f"sbatch failed after retries: {detail}") from e
+        except FileNotFoundError as e:
+            raise RuntimeError("sbatch not found on PATH; is this a SLURM host?") from e
         # Output format: "Submitted batch job 12345" (or with --parsable: just "12345" or "12345;cluster")
         token = result.stdout.strip().split()[-1]
         job_id = token.split(";")[0]
