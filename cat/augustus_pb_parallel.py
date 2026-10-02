@@ -15,7 +15,7 @@ from typing import List, Tuple, Dict, Optional
 import time
 import collections
 
-from cat.scheduler import get_scheduler
+from cat.scheduler import get_scheduler, run_array_job
 
 
 def _scheduler_from_args(args):
@@ -533,25 +533,16 @@ fi
 
         Returns True once the array drains from the queue. Per-task success
         is validated downstream via output-file inspection (portable across
-        SLURM/SGE flavors).
+        SLURM/SGE flavors). A small number of SLURM TIMEOUT/node failures are
+        retried in place so one slow chunk does not discard the rest.
         """
         logger.info(f"Submitting {self._scheduler.name} jobs...")
         try:
-            job_id = self._scheduler.submit(slurm_script_path)
-            logger.info(f"Submitted {self._scheduler.name} job array: {job_id}")
-
-            logger.info(f"Waiting for {self._scheduler.name} jobs to complete...")
-            while True:
-                if not self._scheduler.job_present(job_id):
-                    logger.info(f"{self._scheduler.name} jobs no longer in queue")
-                    break
-                time.sleep(60)
-
-            result = self._scheduler.verify_completed(job_id)
+            result = run_array_job(self._scheduler, slurm_script_path)
             if not result.ok:
-                logger.error(f"{self._scheduler.name} job array {job_id} failed: {result.detail}")
+                logger.error(f"{self._scheduler.name} job array failed: {result.detail}")
                 return False
-            logger.info(f"{self._scheduler.name} job array {job_id} completed")
+            logger.info(f"{self._scheduler.name} job array completed")
             return True
 
         except (subprocess.CalledProcessError, RuntimeError) as e:
