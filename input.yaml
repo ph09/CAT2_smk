@@ -490,7 +490,7 @@ slurm:
       setup_mem:               "16G"   # setup/joblist; omit to inherit jobs_mem
       setup_time:              "04:00:00"
       hints_time:              "12:00:00"
-      jobs_time:               "04:00:00"
+      jobs_time:               "12:00:00"
       transcripts_time:        "04:00:00"
       hints_concurrency:       50
       jobs_concurrency:        200
@@ -505,7 +505,7 @@ slurm:
       setup_mem:               "16G"   # setup/joblist; omit to inherit jobs_mem
       setup_time:              "04:00:00"
       hints_time:              "12:00:00"
-      jobs_time:               "04:00:00"
+      jobs_time:               "12:00:00"
       transcripts_time:        "04:00:00"
       hints_concurrency:       50
       jobs_concurrency:        200
