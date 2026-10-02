@@ -3,10 +3,13 @@ Functions to interface with the sqlite databases produced by various steps of th
 """
 from . import transcripts
 
+import logging
 import pandas as pd
 from sqlalchemy import Column, Integer, Text, Float, Boolean, func, create_engine, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+
+logger = logging.getLogger(__name__)
 
 ###
 # Data model
@@ -411,10 +414,23 @@ def load_alignment_evaluation(db_path):
     :param db_path: path to genome database
     :return: DataFrame
     """
+    empty = pd.DataFrame(columns=['TranscriptId', 'AlignmentId'])
     engine = _make_engine(db_path)
+    if not inspect(engine).has_table(TmEval.__tablename__):
+        logger.warning(
+            "Table %s not found in %s; consensus will proceed without transMap evaluation metrics",
+            TmEval.__tablename__, db_path,
+        )
+        return empty
     df = pd.read_sql_table(TmEval.__tablename__, engine)
+    if df is None or len(df) == 0:
+        return empty
     df = pd.pivot_table(df, index=['TranscriptId', 'AlignmentId'], columns='classifier', values='value')
-    return df.reset_index()
+    out = df.reset_index()
+    for col in ('TranscriptId', 'AlignmentId'):
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out
 
 
 def load_filter_evaluation(db_path):
@@ -423,8 +439,21 @@ def load_filter_evaluation(db_path):
     :param db_path: path to genome database
     :return: DataFrame
     """
+    empty = pd.DataFrame(columns=['GeneId', 'TranscriptId', 'AlignmentId'])
     engine = _make_engine(db_path)
-    return pd.read_sql_table(TmFilterEval.__tablename__, engine)
+    if not inspect(engine).has_table(TmFilterEval.__tablename__):
+        logger.warning(
+            "Table %s not found in %s; consensus will proceed without transMap filter evaluation",
+            TmFilterEval.__tablename__, db_path,
+        )
+        return empty
+    try:
+        df = pd.read_sql_table(TmFilterEval.__tablename__, engine)
+    except ValueError:
+        return empty
+    if df is None or len(df) == 0:
+        return empty
+    return df
 
 
 def load_pairwise_filter_evaluation(db_path):
