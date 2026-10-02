@@ -83,6 +83,16 @@ def validate_config():
 
     # 4. transcriptomic_data: entries should map to known genomes and its
     #    referenced BAM files must exist (they are required inputs to rules).
+    #    Snakemake deep-merges configfiles, so an overlay `transcriptomic_data: {}`
+    #    does not clear BAM lists. `validate_transcriptome_files: false` drops
+    #    those paths before the existence check (protein-only remaps that reuse
+    #    existing augPB/StringTie genePreds and do not read IsoSeq BAMs).
+    if not config.get("validate_transcriptome_files", True):
+        warnings.append(
+            "validate_transcriptome_files is false; transcriptomic BAM paths "
+            "will not be required"
+        )
+        config["transcriptomic_data"] = {}
     for g, streams in (config.get("transcriptomic_data") or {}).items():
         if g not in gset:
             warnings.append(f"transcriptomic_data has entry for unknown genome '{g}' (ignored)")
@@ -726,7 +736,9 @@ def _aug_slurm_args(rule_key):
         val = str(cfg[cfg_key])
         if cfg_key in partition_keys:
             if not val:
-                val = sge_queue
+                # Empty per-stage partition must still inherit slurm.partition
+                # (mustard default `short` is MaxTime=1h; setup/hints request 4–12h).
+                val = _slurm_partition(rule_key) or sge_queue
             if not val:
                 continue  # omit; CLI default is ""
         elif not val:
