@@ -24,7 +24,7 @@ import tools.nameConversions
 import tools.intervals
 from tools.hintsDatabaseInterface import get_rnaseq_hints, reflect_hints_db
 
-from cat.scheduler import get_scheduler
+from cat.scheduler import get_scheduler, run_array_job
 
 
 def _scheduler_from_args(args):
@@ -1069,26 +1069,11 @@ fi
         logger.info("Submitting SLURM jobs...")
         
         try:
-            # Submit the job
-            job_id = self._scheduler.submit(slurm_script_path)
-            logger.info(f"Submitted {self._scheduler.name} job array: {job_id}")
-
-            logger.info(f"Waiting for {self._scheduler.name} jobs to complete...")
-            while True:
-                if not self._scheduler.job_present(job_id):
-                    logger.info(f"All {self._scheduler.name} jobs no longer in queue")
-                    break
-                time.sleep(60)
-
-            # Per-task failure detection: SLURM reports via sacct (which
-            # includes DependencyNeverSatisfied → never-COMPLETED parent
-            # state). SGE skips this (qacct flavours diverge); callers that
-            # need per-task SGE accuracy should wire sentinel files.
-            result = self._scheduler.verify_completed(job_id)
+            result = run_array_job(self._scheduler, slurm_script_path)
             if not result.ok:
-                logger.error(f"{self._scheduler.name} job array {job_id} failed: {result.detail}")
+                logger.error(f"{self._scheduler.name} job array failed: {result.detail}")
                 return False
-            logger.info(f"{self._scheduler.name} job array {job_id} completed")
+            logger.info(f"{self._scheduler.name} job array completed")
             return True
 
         except (subprocess.CalledProcessError, RuntimeError) as e:
