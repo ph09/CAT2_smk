@@ -13,7 +13,7 @@ import stat
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -67,9 +67,72 @@ class JobResult:
     failed: int = 0
     total: int = 0
     detail: str = ""
+    failed_task_ids: list[str] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return self.ok
+
+
+_SLURM_RETRY_STATES = {"TIMEOUT", "NODE_FAIL", "PREEMPTED", "OUT_OF_MEMORY", "FAILED"}
+
+
+def _slurm_array_task_id(spec: str) -> Optional[str]:
+    """Extract the array index from a sacct JobID (``12345_145`` or ``12345_145.batch``)."""
+    if "_" not in spec:
+        return None
+    rest = spec.split("_", 1)[1]
+    task = rest.split(".", 1)[0]
+    return task if task.isdigit() else None
+
+
+def run_array_job(
+    scheduler: "Scheduler",
+    script_path: str,
+    *,
+    poll_s: int = 60,
+    max_retries: int = 2,
+    max_retry_tasks: int = 25,
+    retry_walltime: str = "12:00:00",
+) -> JobResult:
+    """Submit an array job, wait for it to drain, and retry a small set of failed tasks.
+
+    Augustus chunks are not checkpointed, so a SLURM TIMEOUT is a full restart of
+    that task. Retrying only the failed indices avoids throwing away hundreds of
+    completed chunks. ``retry_walltime`` is applied on retry so a 4h first pass
+    can still finish a slow chunk on mustard ``medium`` (MaxTime=12h).
+    """
+    extra_args: Optional[list[str]] = None
+    last = JobResult(ok=False, detail="array job was not submitted")
+    for attempt in range(max_retries + 1):
+        if extra_args and isinstance(scheduler, SlurmScheduler):
+            job_id = scheduler.submit(script_path, extra_args=extra_args)
+        else:
+            job_id = scheduler.submit(script_path)
+        logger.info(f"Submitted {scheduler.name} job array: {job_id}")
+        logger.info(f"Waiting for {scheduler.name} jobs to complete...")
+        while scheduler.job_present(job_id):
+            time.sleep(poll_s)
+        logger.info(f"{scheduler.name} jobs no longer in queue")
+        last = scheduler.verify_completed(job_id)
+        if last.ok:
+            return last
+        task_ids = list(last.failed_task_ids)
+        can_retry = (
+            isinstance(scheduler, SlurmScheduler)
+            and task_ids
+            and len(task_ids) <= max_retry_tasks
+            and attempt < max_retries
+        )
+        if not can_retry:
+            return last
+        spec = ",".join(task_ids)
+        logger.warning(
+            f"{scheduler.name} job array {job_id} failed: {last.detail}; "
+            f"retrying {len(task_ids)} task(s) with --time={retry_walltime} "
+            f"(attempt {attempt + 1}/{max_retries}): {spec}"
+        )
+        extra_args = [f"--array={spec}", f"--time={retry_walltime}"]
+    return last
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -494,11 +557,15 @@ class SlurmScheduler(Scheduler):
         return f"afterok:{job_id}"
 
     # ── submit ────────────────────────────────────────────────────────────
-    def submit(self, script_path: str | os.PathLike) -> str:
+    def submit(self, script_path: str | os.PathLike, extra_args: Optional[Sequence[str]] = None) -> str:
         script_path = str(script_path)
-        logger.info(f"sbatch {script_path}")
+        cmd = ["sbatch"]
+        if extra_args:
+            cmd.extend(extra_args)
+        cmd.append(script_path)
+        logger.info(" ".join(shlex.quote(x) for x in cmd))
         try:
-            result = _submit_with_retries(["sbatch", script_path])
+            result = _submit_with_retries(cmd)
         except subprocess.CalledProcessError as e:
             detail = (e.stderr or e.stdout or "").strip() or f"rc={e.returncode}"
             raise RuntimeError(f"sbatch failed after retries: {detail}") from e
@@ -640,6 +707,7 @@ class SlurmScheduler(Scheduler):
             return JobResult(ok=True, detail=f"sacct unavailable: {e}; assuming success")
 
         failed: list[str] = []
+        failed_task_ids: list[str] = []
         completed = 0
         total = 0
         for line in res.stdout.strip().splitlines():
@@ -647,6 +715,7 @@ class SlurmScheduler(Scheduler):
             if len(parts) < 3:
                 continue
             spec, state, exit_code = parts[0], parts[1], parts[2]
+            state_root = state.split()[0] if state else state
             if ".extern" in spec:
                 continue
             # The payload's real exit code lives on the ``.batch`` row. Parent
@@ -655,20 +724,26 @@ class SlurmScheduler(Scheduler):
             # not count .batch toward total/completed — array task rows are
             # the unit of work.
             if ".batch" in spec:
-                if not (state in _SLURM_SUCCESS_STATES and exit_code == "0:0"):
+                if not (state_root in _SLURM_SUCCESS_STATES and exit_code == "0:0"):
                     failed.append(f"{spec}(state={state},exit={exit_code})")
                 continue
             total += 1
-            if state in _SLURM_SUCCESS_STATES and exit_code == "0:0":
+            if state_root in _SLURM_SUCCESS_STATES and exit_code == "0:0":
                 completed += 1
             else:
                 failed.append(f"{spec}(state={state},exit={exit_code})")
+                tid = _slurm_array_task_id(spec)
+                if tid and state_root in _SLURM_RETRY_STATES and tid not in failed_task_ids:
+                    failed_task_ids.append(tid)
 
         if failed:
             detail = f"{len(failed)}/{total} task(s) failed: " + ", ".join(failed[:5])
             if len(failed) > 5:
                 detail += f", ... +{len(failed) - 5} more"
-            return JobResult(ok=False, completed=completed, failed=len(failed), total=total, detail=detail)
+            return JobResult(
+                ok=False, completed=completed, failed=len(failed), total=total,
+                detail=detail, failed_task_ids=failed_task_ids,
+            )
         return JobResult(ok=True, completed=completed, total=total)
 
 
