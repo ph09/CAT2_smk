@@ -8,6 +8,7 @@ import gc
 import logging
 import os
 import pickle
+import shutil
 import sys
 import tempfile
 import time
@@ -37,30 +38,9 @@ logger = logging.getLogger(__name__)
 # Pairs whose longer sequence exceeds this get their own chunk so parasail's
 # peak RSS (~30G+ for ~110 kb mRNAs) does not share a cgroup with 499 others.
 _HEAVY_SEQ_BP = 100_000
-
-
-def _mem_gb_for_chunks(chunks, base_mem_gb):
-    """Return configured memory; never exceed the YAML / CLI ceiling.
-
-    Heavy sequences are already isolated into one-pair chunks by
-    ``chunk_transcripts``. We used to raise requests to 128G/256G here, which
-    ignored ``slurm.rules.align_transcripts.mem`` and could leave jobs queued
-    forever on smaller clusters. Log a warning instead so operators can raise
-    the YAML limit if long transcripts actually OOM.
-    """
-    base = max(1, int(base_mem_gb))
-    max_len = max(max(len(x[1]), len(x[3])) for chunk in chunks for x in chunk)
-    if max_len >= 200_000 and base < 256:
-        logger.warning(
-            f"Longest aligned sequence is {max_len} bp but memory is capped at "
-            f"{base}G by config; raise slurm.rules.align_transcripts.mem if jobs OOM"
-        )
-    elif max_len >= _HEAVY_SEQ_BP and base < 128:
-        logger.warning(
-            f"Longest aligned sequence is {max_len} bp but memory is capped at "
-            f"{base}G by config; raise slurm.rules.align_transcripts.mem if jobs OOM"
-        )
-    return base
+# Parasail is single-threaded; a 110 kb global alignment can take ~9–12 h.
+_HEAVY_MEM_GB = 64
+_HEAVY_WALLTIME = "12:00:00"
 
 
 def chunk_transcripts(seq_list, chunk_size=500):
@@ -85,6 +65,44 @@ def chunk_transcripts(seq_list, chunk_size=500):
     for i in range(0, len(normal), chunk_size):
         chunks.append(normal[i:i + chunk_size])
     return chunks
+
+
+def _is_heavy_chunk(chunk):
+    return any(max(len(x[1]), len(x[3])) >= _HEAVY_SEQ_BP for x in chunk)
+
+
+def _n_heavy_prefix(chunks):
+    """Count the leading heavy singleton chunks produced by ``chunk_transcripts``."""
+    n = 0
+    for chunk in chunks:
+        if not _is_heavy_chunk(chunk):
+            break
+        n += 1
+    return n
+
+
+def _submit_chunk_array(scheduler, work_dir, body, *, name, array, cpus, mem_gb,
+                        walltime, max_jobs, partition):
+    log_out, log_err = scheduler.array_log_paths(work_dir / "output" / "cluster_logs", name)
+    header = scheduler.header(
+        job_name=name,
+        cpus=cpus,
+        mem=f"{mem_gb}G",
+        walltime=walltime,
+        log_out=log_out,
+        log_err=log_err,
+        partition=partition,
+        queue=partition,
+        array=array,
+        max_concurrent=max_jobs,
+    )
+    script_path = scheduler.write_script(header + body, work_dir / f"{name}.sh")
+    job_id = scheduler.submit(script_path)
+    logger.info(
+        f"Submitted {scheduler.name} array {name} job {job_id} "
+        f"tasks={array[0]}-{array[1]} mem={mem_gb}G time={walltime} cpus={cpus}"
+    )
+    return job_id
 
 
 def save_chunk(chunk, chunk_dir, chunk_id):
@@ -326,6 +344,11 @@ def run_cluster_alignment_pipeline(args):
 
         for aln_mode, out_path in [('mRNA', mrna_path), ('CDS', cds_path)]:
             logger.info(f"\nProcessing {aln_mode} alignments for {tx_mode}")
+            stable = Path(str(out_path) + ".complete")
+            if stable.exists() and stable.stat().st_size > 0:
+                logger.info(f"Reusing completed {aln_mode} alignments: {stable}")
+                shutil.copy2(stable, out_path)
+                continue
 
             sequences = get_alignment_sequences(
                 transcript_dict, ref_transcript_dict,
@@ -365,39 +388,65 @@ def run_cluster_alignment_pipeline(args):
                 save_chunk(chunk, str(chunk_dir), i)
 
             num_chunks = len(chunks)
-            mem_gb = _mem_gb_for_chunks(chunks, args.memory)
-            log_out, log_err = scheduler.array_log_paths(log_dir, "align")
-            header = scheduler.header(
-                job_name=f"align_{tx_mode}_{aln_mode}",
-                cpus=args.cpus,
-                mem=f"{mem_gb}G",
-                walltime=args.time,
-                log_out=log_out,
-                log_err=log_err,
-                partition=args.partition,
-                queue=args.partition,
-                array=(1, num_chunks),
-                max_concurrent=args.max_jobs,
-            )
+            n_heavy = _n_heavy_prefix(chunks)
+            if int(args.cpus) > 1:
+                logger.warning(
+                    f"align_transcripts cpus={args.cpus} ignored; parasail is "
+                    "single-threaded and extra CPUs serialize the array"
+                )
+            cpus = 1
             body = _build_body(scheduler, chunk_dir, output_dir, sentinel_dir)
-            script_path = scheduler.write_script(header + body, work_dir / "run_alignment.sh")
+            jobs = []  # (job_id, n_tasks, label)
 
-            job_id = scheduler.submit(script_path)
-            logger.info(f"Submitted {scheduler.name} array job {job_id}")
+            # Parasail is single-threaded. Requesting 64 CPUs/task serializes the
+            # array to one running task on shared partitions and a 110 kb pair
+            # then burns the whole 12h controller timeout. Split heavy singletons
+            # onto their own 12h/64G array so the other chunks can run in parallel.
+            if n_heavy:
+                heavy_mem = max(int(args.memory), _HEAVY_MEM_GB)
+                jid = _submit_chunk_array(
+                    scheduler, work_dir, body,
+                    name=f"align_{tx_mode}_{aln_mode}_heavy",
+                    array=(1, n_heavy),
+                    cpus=cpus,
+                    mem_gb=heavy_mem,
+                    walltime=_HEAVY_WALLTIME,
+                    max_jobs=args.max_jobs,
+                    partition=args.partition,
+                )
+                jobs.append((jid, n_heavy, "heavy"))
+            if n_heavy < num_chunks:
+                jid = _submit_chunk_array(
+                    scheduler, work_dir, body,
+                    name=f"align_{tx_mode}_{aln_mode}",
+                    array=(n_heavy + 1, num_chunks),
+                    cpus=cpus,
+                    mem_gb=int(args.memory),
+                    walltime=args.time,
+                    max_jobs=args.max_jobs,
+                    partition=args.partition,
+                )
+                jobs.append((jid, num_chunks - n_heavy, "normal"))
 
-            result = scheduler.wait(
-                job_id,
-                num_tasks=num_chunks,
-                timeout_s=args.timeout_hours * 3600,
-                sentinel_dir=sentinel_dir,
-            )
-            if not result.ok:
-                log_tail = scheduler.summarize_log_dir(log_dir, "align")
-                logger.error(f"{scheduler.name} job {job_id} failed: {result.detail}")
-                logger.error(f"Preserving work directory for diagnosis: {work_dir}")
-                logger.error(log_tail)
-                sys.exit(1)
-            logger.info(f"Job {job_id} succeeded: {result.completed}/{result.total} tasks")
+            for jid, n_tasks, label in jobs:
+                result = scheduler.wait(
+                    jid,
+                    num_tasks=n_tasks,
+                    timeout_s=args.timeout_hours * 3600,
+                    sentinel_dir=sentinel_dir,
+                )
+                if not result.ok:
+                    scheduler.cancel(jid)
+                    log_tail = scheduler.summarize_log_dir(log_dir, "align")
+                    logger.error(
+                        f"{scheduler.name} {label} job {jid} failed: {result.detail}"
+                    )
+                    logger.error(f"Preserving work directory for diagnosis: {work_dir}")
+                    logger.error(log_tail)
+                    sys.exit(1)
+                logger.info(
+                    f"Job {jid} ({label}) succeeded: {result.completed}/{result.total} tasks"
+                )
 
             num_lines = merge_results(str(result_dir), out_path, expected_chunks=num_chunks)
 
@@ -406,6 +455,8 @@ def run_cluster_alignment_pipeline(args):
                 logger.error(f"Expected ~{len(sequences)} alignments but got 0")
             elif num_lines < len(sequences) * 0.5:
                 logger.warning(f"WARNING: Only {num_lines}/{len(sequences)} alignments produced ({num_lines/len(sequences)*100:.1f}%)")
+            else:
+                shutil.copy2(out_path, stable)
 
             if args.cleanup:
                 logger.info(f"Cleaning up temporary directory: {work_dir}")
