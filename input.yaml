@@ -357,11 +357,11 @@ slurm:
       time:  "12:00:00"
       max_concurrent_jobs: 50
     align_transcripts:
-      mem:   "64G"
-      cpus:  64
+      mem:   "16G"
+      cpus:  1
       time:  "02:00:00"
       max_concurrent_jobs: 200
-      timeout_hours: 12
+      timeout_hours: 24
       chunk_size: 500
     evaluate_transcripts:
       mem:   "16G"
