@@ -668,6 +668,8 @@ class SlurmScheduler(Scheduler):
 
             time.sleep(check_interval_s)
 
+        logger.error(f"SLURM job {job_id} wait timed out after {timeout_s / 3600:.1f}h; cancelling")
+        self.cancel(job_id)
         return JobResult(ok=False, detail=f"timeout after {timeout_s / 3600:.1f}h")
 
     def cancel(self, job_id: str) -> None:
