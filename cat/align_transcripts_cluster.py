@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Pairs whose longer sequence exceeds this get their own chunk so parasail's
 # peak RSS (~30G+ for ~110 kb mRNAs) does not share a cgroup with 499 others.
-_HEAVY_SEQ_BP = 100_000
+_HEAVY_SEQ_BP = 40_000
 # Parasail is single-threaded; a 110 kb global alignment can take ~9–12 h.
 _HEAVY_MEM_GB = 64
 _HEAVY_WALLTIME = "12:00:00"
@@ -396,7 +396,7 @@ def run_cluster_alignment_pipeline(args):
                 )
             cpus = 1
             body = _build_body(scheduler, chunk_dir, output_dir, sentinel_dir)
-            jobs = []  # (job_id, n_tasks, label)
+            jobs = []  # (job_id, n_tasks, label, script_name)
 
             # Parasail is single-threaded. Requesting 64 CPUs/task serializes the
             # array to one running task on shared partitions and a 110 kb pair
@@ -404,9 +404,10 @@ def run_cluster_alignment_pipeline(args):
             # onto their own 12h/64G array so the other chunks can run in parallel.
             if n_heavy:
                 heavy_mem = max(int(args.memory), _HEAVY_MEM_GB)
+                heavy_name = f"align_{tx_mode}_{aln_mode}_heavy"
                 jid = _submit_chunk_array(
                     scheduler, work_dir, body,
-                    name=f"align_{tx_mode}_{aln_mode}_heavy",
+                    name=heavy_name,
                     array=(1, n_heavy),
                     cpus=cpus,
                     mem_gb=heavy_mem,
@@ -414,11 +415,12 @@ def run_cluster_alignment_pipeline(args):
                     max_jobs=args.max_jobs,
                     partition=args.partition,
                 )
-                jobs.append((jid, n_heavy, "heavy"))
+                jobs.append((jid, n_heavy, "heavy", heavy_name))
             if n_heavy < num_chunks:
+                normal_name = f"align_{tx_mode}_{aln_mode}"
                 jid = _submit_chunk_array(
                     scheduler, work_dir, body,
-                    name=f"align_{tx_mode}_{aln_mode}",
+                    name=normal_name,
                     array=(n_heavy + 1, num_chunks),
                     cpus=cpus,
                     mem_gb=int(args.memory),
@@ -426,9 +428,9 @@ def run_cluster_alignment_pipeline(args):
                     max_jobs=args.max_jobs,
                     partition=args.partition,
                 )
-                jobs.append((jid, num_chunks - n_heavy, "normal"))
+                jobs.append((jid, num_chunks - n_heavy, "normal", normal_name))
 
-            for jid, n_tasks, label in jobs:
+            for jid, n_tasks, label, script_name in jobs:
                 result = scheduler.wait(
                     jid,
                     num_tasks=n_tasks,
@@ -436,14 +438,50 @@ def run_cluster_alignment_pipeline(args):
                     sentinel_dir=sentinel_dir,
                 )
                 if not result.ok:
-                    scheduler.cancel(jid)
-                    log_tail = scheduler.summarize_log_dir(log_dir, "align")
-                    logger.error(
-                        f"{scheduler.name} {label} job {jid} failed: {result.detail}"
+                    retry_ids = list(result.failed_task_ids or [])
+                    script_path = work_dir / f"{script_name}.sh"
+                    can_retry = (
+                        retry_ids
+                        and len(retry_ids) <= 25
+                        and script_path.exists()
+                        and hasattr(scheduler, "submit")
                     )
-                    logger.error(f"Preserving work directory for diagnosis: {work_dir}")
-                    logger.error(log_tail)
-                    sys.exit(1)
+                    if can_retry:
+                        spec = ",".join(retry_ids)
+                        logger.warning(
+                            f"{scheduler.name} {label} job {jid} failed: {result.detail}; "
+                            f"retrying {len(retry_ids)} task(s) at {_HEAVY_MEM_GB}G/"
+                            f"{_HEAVY_WALLTIME}: {spec}"
+                        )
+                        try:
+                            retry_id = scheduler.submit(
+                                str(script_path),
+                                extra_args=[
+                                    f"--array={spec}",
+                                    f"--mem={_HEAVY_MEM_GB}G",
+                                    f"--time={_HEAVY_WALLTIME}",
+                                    "--cpus-per-task=1",
+                                ],
+                            )
+                        except TypeError:
+                            retry_id = None
+                        if retry_id:
+                            result = scheduler.wait(
+                                retry_id,
+                                num_tasks=len(retry_ids),
+                                timeout_s=args.timeout_hours * 3600,
+                                sentinel_dir=sentinel_dir,
+                            )
+                            jid = retry_id
+                    if not result.ok:
+                        scheduler.cancel(jid)
+                        log_tail = scheduler.summarize_log_dir(log_dir, script_name)
+                        logger.error(
+                            f"{scheduler.name} {label} job {jid} failed: {result.detail}"
+                        )
+                        logger.error(f"Preserving work directory for diagnosis: {work_dir}")
+                        logger.error(log_tail)
+                        sys.exit(1)
                 logger.info(
                     f"Job {jid} ({label}) succeeded: {result.completed}/{result.total} tasks"
                 )
