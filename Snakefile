@@ -410,7 +410,7 @@ _RULE_DEFAULTS = {
     "annotate_novel_genes":      {"mem": "32G",  "cpus": 16,  "time": "02:00:00", "timeout_hours": 2},
     "generate_hints":            {"mem": "256G", "cpus": 128, "time": "12:00:00", "max_concurrent_jobs": 50,
                                  "controller_time_h": 4, "timeout_hours": 24},
-    "align_transcripts":         {"mem": "16G",  "cpus": 1,   "time": "04:00:00", "max_concurrent_jobs": 200,
+    "align_transcripts":         {"mem": "32G",  "cpus": 1,   "time": "04:00:00", "max_concurrent_jobs": 200,
                                  "timeout_hours": 24, "chunk_size": 500, "controller_time_h": 24},
     "evaluate_transcripts":      {"mem": "16G",  "cpus": 1,   "time": "01:00:00", "max_concurrent_jobs": 20,
                                  "chunk_size": 500, "controller_mem_gb": 16, "controller_time_h": 24,
