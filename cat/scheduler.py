@@ -630,9 +630,21 @@ class SlurmScheduler(Scheduler):
                     task_states[spec] = state
 
             if is_array and task_states:
-                completed = sum(1 for s in task_states.values() if s in _SLURM_SUCCESS_STATES)
-                failed = sum(1 for s in task_states.values() if s in _SLURM_FAILED_STATES)
-                running = sum(1 for s in task_states.values() if s not in _SLURM_SUCCESS_STATES and s not in _SLURM_FAILED_STATES)
+                completed = 0
+                failed = 0
+                running = 0
+                failed_task_ids: list[str] = []
+                for spec, state in task_states.items():
+                    state_root = state.split()[0] if state else state
+                    if state_root in _SLURM_SUCCESS_STATES:
+                        completed += 1
+                    elif state_root in _SLURM_FAILED_STATES:
+                        failed += 1
+                        tid = _slurm_array_task_id(spec)
+                        if tid and tid not in failed_task_ids:
+                            failed_task_ids.append(tid)
+                    else:
+                        running += 1
                 total = len(task_states)
                 expected = int(num_tasks)
 
@@ -657,6 +669,7 @@ class SlurmScheduler(Scheduler):
                         return JobResult(
                             ok=False, completed=completed, failed=failed, total=total,
                             detail=f"{failed}/{total} array tasks failed",
+                            failed_task_ids=failed_task_ids,
                         )
                     return JobResult(ok=True, completed=completed, total=total)
             elif parent_state is not None:
