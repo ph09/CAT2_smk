@@ -357,7 +357,7 @@ slurm:
       time:  "12:00:00"
       max_concurrent_jobs: 50
     align_transcripts:
-      mem:   "16G"
+      mem:   "32G"
       cpus:  1
       time:  "02:00:00"
       max_concurrent_jobs: 200
