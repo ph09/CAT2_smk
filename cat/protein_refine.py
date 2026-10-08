@@ -5,9 +5,11 @@ Projection (transMap / augTM) can fuse neighbouring paralogs, drop long first
 introns, and carry a wrong ``source_gene_common_name``. Miniprot already mapped
 the protein DB; this pass uses those hits to:
 
-1. Reassign exclusive identities (one primary copy per reference gene symbol,
-   plus near-identical extras). CAT names lose if another peptide is clearly
-   better. Remaining models get unique-best names only when the margin is real.
+1. Reassign exclusive identities (one primary copy per reference gene symbol
+   **per genome**, plus near-identical extras). CAT names lose if another
+   peptide is clearly better. Remaining models get unique-best names only
+   when the margin is real. Extras must look like copies of the primary, not
+   sister paralogs that merely prefer an already-claimed name.
 2. Replace chimeric / truncated CDS with the owned full-protein miniprot locus.
 3. Rescue unused reference genes whose protein hits sit in a clean syntenic gap.
 
@@ -43,11 +45,15 @@ MIN_HIT_QCOV = 0.40
 MIN_PRIMARY_PID = 0.78
 MIN_NAMED_PID = 0.72
 MIN_PRIMARY_QCOV = 0.50
-MIN_EXTRA_PID = 0.80
+# Extras are recent copies of an already-chosen primary, not sister paralogs.
+# Applied to every protein-coding gene (no per-family cutoffs).
+MIN_EXTRA_PID = 0.92
+MIN_EXTRA_QCOV = 0.75
+EXTRA_PRIMARY_DELTA = 0.03
+EXTRA_SYMBOL_MARGIN = 0.04
 MIN_ORTHOLOG_PID = 0.68
 MIN_ORTHOLOG_QCOV = 0.40
-UNIQUE_MARGIN = 0.012
-UNIQUE_UNUSED_MARGIN = 0.008
+UNIQUE_UNUSED_MARGIN = 0.02
 CAT_OVERRIDE_MARGIN = 0.08
 FULL_PROTEIN_QCOV = 0.80
 MIN_PROTEIN_SPAN = 2_000
@@ -316,121 +322,161 @@ def best_gene_for_hit(h: Hit, gene_spans: list[tuple[int, int] | None], genes: l
     return None
 
 
-def assign_identities(
-    genes: list[dict],
+def _hits_by_symbol_at_gene(
+    g: dict,
+    gsp: tuple[int, int],
     hits: list[Hit],
     ref_symbols: set[str],
+    min_ov: int = 80,
+) -> dict[str, Hit]:
+    by_q: dict[str, Hit] = {}
+    chrom = g["chrom"]
+    for h in hits:
+        if h.chrom != chrom or h.symbol not in ref_symbols:
+            continue
+        if overlap_bp(gsp, h.span) < min_ov:
+            continue
+        prev = by_q.get(h.symbol)
+        if prev is None or h.pid * h.qcov > prev.pid * prev.qcov:
+            by_q[h.symbol] = h
+    return by_q
+
+
+def _accept_extra(h: Hit, by_q: dict[str, Hit], primary_pid: dict[str, float]) -> bool:
+    """True if *h* looks like a copy of its already-chosen primary, not a sister paralog."""
+    if h.pid < MIN_EXTRA_PID or h.qcov < MIN_EXTRA_QCOV:
+        return False
+    prim = primary_pid.get(h.symbol)
+    if prim is not None and h.pid < prim - EXTRA_PRIMARY_DELTA:
+        return False
+    rival = 0.0
+    for sym, hh in by_q.items():
+        if sym == h.symbol:
+            continue
+        rival = max(rival, hh.pid * hh.qcov)
+    return h.pid * h.qcov >= rival + EXTRA_SYMBOL_MARGIN
+
+
+def assign_identities(
+    genes: list[dict],
+    chrom_hits: dict[str, list[Hit]],
+    ref_symbols: set[str],
 ) -> tuple[dict[int, dict], list[Hit]]:
-    gene_spans: list[tuple[int, int] | None] = []
-    for g in genes:
-        gene_spans.append((int(g["start"]), int(g["end"])))
+    """One primary per symbol for the whole genome, then near-identical extras.
+
+    Working per chromosome made every contig a fresh namespace, so a human-specific
+    symbol could be called primary on every lemur scaffold. Primaries are now
+    claimed genome-wide (best pid wins). Extras must be near-identical to that
+    primary and uniquely best vs other symbols at the same locus.
+    """
+    groups = _group_by_chrom(genes)
+    gene_spans: list[tuple[int, int]] = [(int(g["start"]), int(g["end"])) for g in genes]
+
+    cat_cands = []
+    greedy_cands = []
+    for chrom, idxs in groups:
+        hits = chrom_hits.get(chrom, [])
+        local = [genes[i] for i in idxs]
+        local_spans: list[tuple[int, int] | None] = [gene_spans[i] for i in idxs]
+        for li, g in enumerate(local):
+            src = g.get("source_name") or ""
+            if src not in ref_symbols:
+                continue
+            gsp = local_spans[li]
+            best = None
+            rival = None
+            for h in hits:
+                if overlap_bp(gsp, h.span) < 100:
+                    continue
+                if h.symbol == src:
+                    if best is None or (h.pid, h.qcov) > (best.pid, best.qcov):
+                        best = h
+                elif rival is None or h.pid > rival.pid:
+                    rival = h
+            if best is None or best.pid < MIN_NAMED_PID:
+                continue
+            if rival is not None and rival.pid >= best.pid + CAT_OVERRIDE_MARGIN:
+                continue
+            gi = idxs[li]
+            cat_cands.append((best.pid, g["cds_size"], gi, best))
+        for h in hits:
+            if h.symbol not in ref_symbols:
+                continue
+            li = best_gene_for_hit(h, local_spans, local)
+            if li is None:
+                continue
+            gi = idxs[li]
+            src = genes[gi].get("source_name") or ""
+            boost = 0.05 if src == h.symbol else 0.0
+            greedy_cands.append(
+                (h.pid * h.qcov + boost, genes[gi]["cds_size"], h.pid, gi, h)
+            )
 
     used_gene: set[int] = set()
     used_query: set[str] = set()
     assign: dict[int, dict] = {}
+    primary_pid: dict[str, float] = {}
 
-    named = []
-    for gi, g in enumerate(genes):
-        src = g.get("source_name") or ""
-        if src not in ref_symbols:
+    cat_cands.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    for _pid, _cds, gi, h in cat_cands:
+        if gi in used_gene or h.symbol in used_query:
             continue
-        gsp = gene_spans[gi]
-        best = None
-        rival = None
-        for h in hits:
-            if h.chrom != g["chrom"]:
+        assign[gi] = {"symbol": h.symbol, "pid": h.pid, "qcov": h.qcov, "hit": h, "extra": False}
+        used_gene.add(gi)
+        used_query.add(h.symbol)
+        primary_pid[h.symbol] = h.pid
+
+    greedy_cands.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    for _sc, _cds, pid, gi, h in greedy_cands:
+        if gi in used_gene or h.symbol in used_query:
+            continue
+        if pid < MIN_PRIMARY_PID or h.qcov < MIN_PRIMARY_QCOV:
+            continue
+        assign[gi] = {"symbol": h.symbol, "pid": pid, "qcov": h.qcov, "hit": h, "extra": False}
+        used_gene.add(gi)
+        used_query.add(h.symbol)
+        primary_pid[h.symbol] = pid
+
+    for chrom, idxs in groups:
+        hits = chrom_hits.get(chrom, [])
+        for gi in idxs:
+            if gi in used_gene:
                 continue
-            if overlap_bp(gsp, h.span) < 100:
+            g = genes[gi]
+            by_q = _hits_by_symbol_at_gene(g, gene_spans[gi], hits, ref_symbols)
+            if not by_q:
                 continue
-            if h.symbol == src:
-                if best is None or (h.pid, h.qcov) > (best.pid, best.qcov):
-                    best = h
+            ranked = sorted(by_q.values(), key=lambda x: x.pid * x.qcov, reverse=True)
+            best = ranked[0]
+            extra = best.symbol in used_query
+            if extra:
+                if not _accept_extra(best, by_q, primary_pid):
+                    continue
             else:
-                if rival is None or h.pid > rival.pid:
-                    rival = h
-        if best is None or best.pid < MIN_NAMED_PID:
-            continue
-        if rival is not None and rival.pid >= best.pid + CAT_OVERRIDE_MARGIN:
-            continue
-        named.append((best.pid, g["cds_size"], gi, src, best))
-    named.sort(reverse=True)
-    for _pid, _cds, gi, query, h in named:
-        if gi in used_gene or query in used_query:
-            continue
-        assign[gi] = {"symbol": query, "pid": h.pid, "qcov": h.qcov, "hit": h, "extra": False}
-        used_gene.add(gi)
-        used_query.add(query)
-
-    scores = []
-    for h in hits:
-        if h.symbol not in ref_symbols:
-            continue
-        gi = best_gene_for_hit(h, gene_spans, genes)
-        if gi is None:
-            continue
-        src = genes[gi].get("source_name") or ""
-        boost = 0.05 if src == h.symbol else 0.0
-        scores.append((h.pid * h.qcov + boost, genes[gi]["cds_size"], h.pid, h.qcov, gi, h))
-    scores.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    for _sc, _cds, pid, qcov, gi, h in scores:
-        if gi in used_gene:
-            continue
-        query = h.symbol
-        if query not in used_query:
-            if pid < MIN_PRIMARY_PID or qcov < MIN_PRIMARY_QCOV:
-                continue
-            assign[gi] = {"symbol": query, "pid": pid, "qcov": qcov, "hit": h, "extra": False}
+                if best.pid < MIN_ORTHOLOG_PID or best.qcov < MIN_ORTHOLOG_QCOV:
+                    continue
+                margin = 1.0 if len(ranked) == 1 else (
+                    best.pid * best.qcov - ranked[1].pid * ranked[1].qcov
+                )
+                second_used = len(ranked) > 1 and ranked[1].symbol in used_query
+                if margin < UNIQUE_UNUSED_MARGIN and not second_used:
+                    continue
+                if margin < 0.004:
+                    continue
+            assign[gi] = {
+                "symbol": best.symbol,
+                "pid": best.pid,
+                "qcov": best.qcov,
+                "hit": best,
+                "extra": extra,
+            }
             used_gene.add(gi)
-            used_query.add(query)
-        else:
-            if pid < MIN_EXTRA_PID or qcov < MIN_PRIMARY_QCOV:
-                continue
-            assign[gi] = {"symbol": query, "pid": pid, "qcov": qcov, "hit": h, "extra": True}
-            used_gene.add(gi)
+            if not extra:
+                used_query.add(best.symbol)
+                primary_pid.setdefault(best.symbol, best.pid)
 
-    for gi, g in enumerate(genes):
-        if gi in used_gene:
-            continue
-        gsp = gene_spans[gi]
-        by_q: dict[str, Hit] = {}
-        for h in hits:
-            if h.chrom != g["chrom"] or h.symbol not in ref_symbols:
-                continue
-            if overlap_bp(gsp, h.span) < 80:
-                continue
-            prev = by_q.get(h.symbol)
-            if prev is None or h.pid * h.qcov > prev.pid * prev.qcov:
-                by_q[h.symbol] = h
-        if not by_q:
-            continue
-        ranked = sorted(by_q.values(), key=lambda h: h.pid * h.qcov, reverse=True)
-        best = ranked[0]
-        if best.pid < MIN_ORTHOLOG_PID or best.qcov < MIN_ORTHOLOG_QCOV:
-            continue
-        margin = 1.0
-        if len(ranked) > 1:
-            margin = best.pid * best.qcov - ranked[1].pid * ranked[1].qcov
-        extra = best.symbol in used_query
-        if extra:
-            if margin < UNIQUE_MARGIN or best.pid < 0.72:
-                continue
-        else:
-            second_used = len(ranked) > 1 and ranked[1].symbol in used_query
-            if margin < UNIQUE_UNUSED_MARGIN and not second_used:
-                continue
-            if margin < 0.004:
-                continue
-        assign[gi] = {
-            "symbol": best.symbol,
-            "pid": best.pid,
-            "qcov": best.qcov,
-            "hit": best,
-            "extra": extra,
-        }
-        used_gene.add(gi)
-        used_query.add(best.symbol)
-
-    orphans = synteny_orphans(genes, assign, hits, ref_symbols, used_query)
+    all_hits = [h for hits in chrom_hits.values() for h in hits]
+    orphans = synteny_orphans(genes, assign, all_hits, ref_symbols, used_query)
     return assign, orphans
 
 
@@ -740,15 +786,7 @@ def run(args) -> int:
     work = [pc_genes[i] for i in pick_representatives(pc_genes)]
     chrom_hits = hits_by_chrom(hits)
 
-    assign: dict[int, dict] = {}
-    orphans: list[Hit] = []
-    for chrom, idxs in _group_by_chrom(work):
-        local_genes = [work[i] for i in idxs]
-        local_hits = chrom_hits.get(chrom, [])
-        local_assign, local_orphans = assign_identities(local_genes, local_hits, ref_symbols)
-        for gi, a in local_assign.items():
-            assign[idxs[gi]] = a
-        orphans.extend(local_orphans)
+    assign, orphans = assign_identities(work, chrom_hits, ref_symbols)
     logger.info(
         "  assigned %s genes (%s extras); %s synteny rescues",
         len(assign),
