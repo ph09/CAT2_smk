@@ -24,6 +24,7 @@ from cat.miniprot_novel_call import (
     has_rna_support,
     parent_symbol_from_description,
 )
+from cat.protein_refine import DEMOTE_CALLS as REFINE_DEMOTE_CALLS
 
 logger = logging.getLogger(__name__)
 
@@ -107,13 +108,23 @@ def classify_novel_biotypes(gp_info_df, gene_to_txs, gene_descriptions, tx_novel
                 cds_aa = max(cds_aa, aa)
                 chroms.add(chrom)
         rna = False
+        refine_call = ''
         for tx_id in tx_list:
             try:
                 row = gp_info_df.loc[(gene_id, tx_id)]
                 if hasattr(row, 'to_dict'):
-                    rna = rna or has_rna_support(row.to_dict())
+                    d = row.to_dict()
+                    rna = rna or has_rna_support(d)
+                    refine_call = refine_call or str(d.get('protein_refine_call', '') or '')
             except Exception:
                 pass
+        if refine_call in REFINE_DEMOTE_CALLS:
+            gene_biotype[gene_id] = UNKNOWN_LIKELY_CODING
+            reasons[f'refine_{refine_call}'] += 1
+            for tx_id in tx_list:
+                tx_biotype[tx_id] = UNKNOWN_LIKELY_CODING
+                tx_call[tx_id] = f'refine_{refine_call}'
+            continue
         ncl = tx_novel_class.get(tx_list[0], '')
         parent = parent_symbol_from_description(gene_descriptions.get(gene_id, ''))
         parent_present = bool(parent) and parent in proj_chroms
