@@ -5,13 +5,16 @@ Projection (transMap / augTM) can fuse neighbouring paralogs, drop long first
 introns, and carry a wrong ``source_gene_common_name``. Miniprot already mapped
 the protein DB; this pass uses those hits to:
 
-1. Reassign exclusive identities (one primary copy per reference gene symbol
-   **per genome**, plus near-identical extras). CAT names lose if another
-   peptide is clearly better. Remaining models get unique-best names only
-   when the margin is real. Extras must look like copies of the primary, not
-   sister paralogs that merely prefer an already-claimed name.
-2. Replace chimeric / truncated CDS with the owned full-protein miniprot locus.
-3. Rescue unused reference genes whose protein hits sit in a clean syntenic gap.
+1. Confirm CAT names. A CAT name is corrected only when another peptide is
+   clearly better *and* that symbol is not carried anywhere else in the
+   genome, so corrections move names rather than adding copies.
+2. Name unnamed coding models only when they are real protein-coding copies:
+   intact ORF, near-full-length vs the matched protein, intron structure
+   consistent with the parent, unambiguous best symbol. Retrocopies,
+   fragments and broken ORFs stay unnamed and lose protein_coding.
+3. Replace chimeric / truncated CDS with the owned full-protein miniprot locus.
+4. Rescue reference genes absent from the genome whose protein hits sit in a
+   clean syntenic gap.
 
 Intended to run after ``generate_consensus`` and before ``annotate_novel_genes``.
 """
@@ -21,8 +24,10 @@ import argparse
 import json
 import logging
 import re
+import math
 import shutil
-from collections import defaultdict
+from bisect import bisect_left, bisect_right
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -45,22 +50,20 @@ MIN_HIT_QCOV = 0.40
 MIN_PRIMARY_PID = 0.78
 MIN_NAMED_PID = 0.72
 MIN_PRIMARY_QCOV = 0.50
-# Extras are recent copies of an already-chosen primary, not sister paralogs.
-# Applied to every protein-coding gene (no per-family cutoffs).
-MIN_EXTRA_PID = 0.92
-MIN_EXTRA_QCOV = 0.75
-EXTRA_PRIMARY_DELTA = 0.03
-EXTRA_SYMBOL_MARGIN = 0.04
 MIN_ORTHOLOG_PID = 0.68
-MIN_ORTHOLOG_QCOV = 0.40
-UNIQUE_UNUSED_MARGIN = 0.02
 CAT_OVERRIDE_MARGIN = 0.08
+MIN_COPY_PID = 0.80
+MIN_COPY_QCOV = 0.85
+MIN_COPY_AA_FRAC = 0.85
+MAX_COPY_AA_FRAC = 1.25
+MIN_COPY_EXON_FRAC = 0.70
+MIN_INTRON_BP = 50
+NAME_MARGIN = 0.02
+DEMOTE_CALLS = {"broken_orf", "fragment", "chimeric", "retrocopy"}
+RESCUE_CANDIDATES_PER_SYMBOL = 3
+RESCUE_MAX_NAMED_OVERLAP = 0.10
 FULL_PROTEIN_QCOV = 0.80
 MIN_PROTEIN_SPAN = 2_000
-MIN_RECOVER_SPAN = 2_000
-ASSIGN_MAX_GAP = 20_000
-SYNTENY_GAP_MIN = 8_000
-SYNTENY_GAP_MAX = 500_000
 
 
 def _na(val) -> bool:
@@ -82,14 +85,6 @@ def _as_float(val, default=0.0) -> float:
 def overlap_bp(a: tuple[int, int], b: tuple[int, int]) -> int:
     lo, hi = max(a[0], b[0]), min(a[1], b[1])
     return max(0, hi - lo + 1)
-
-
-def interval_gap(a: tuple[int, int], b: tuple[int, int]) -> int:
-    if a[1] < b[0]:
-        return b[0] - a[1]
-    if b[1] < a[0]:
-        return a[0] - b[1]
-    return 0
 
 
 def load_query_symbols(protein_fasta: str | None, gp_attrs: str | None) -> dict[str, str]:
@@ -166,10 +161,97 @@ def load_ref_gene_order(ref_gp: str | None, query_symbols: dict[str, str]) -> di
     return order
 
 
-class Hit:
-    __slots__ = ("chrom", "start", "end", "strand", "query", "symbol", "pid", "qcov")
+def real_exon_count(segs: list[tuple[int, int]]) -> int:
+    """Exons after merging blocks split by gaps too short to be real introns."""
+    segs = sorted(segs)
+    if not segs:
+        return 0
+    n = 1
+    for (_a0, a1), (b0, _b1) in zip(segs, segs[1:]):
+        if b0 - a1 >= MIN_INTRON_BP:
+            n += 1
+    return n
 
-    def __init__(self, chrom, start, end, strand, query, symbol, pid, qcov):
+
+def coding_exon_count(tx) -> int:
+    segs = []
+    for e in tx.exon_intervals:
+        s, t = max(e.start, tx.thick_start), min(e.stop, tx.thick_stop)
+        if t > s:
+            segs.append((s, t))
+    return real_exon_count(segs)
+
+
+def load_ref_structure(ref_gp: str | None, query_symbols: dict[str, str]) -> dict[str, tuple[int, int]]:
+    """Reference symbol → (cds_aa, coding_exons) of its longest coding isoform.
+
+    Completeness is judged against the gene, not the matched peptide, which
+    can itself be a short isoform or a UniProt fragment.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    if not ref_gp or not Path(ref_gp).exists():
+        return out
+    for tx in gene_pred_iterator(ref_gp):
+        if tx.cds_size <= 0:
+            continue
+        sym = query_symbols.get(tx.name) or query_symbols.get(tx.name.split(".")[0])
+        if not sym:
+            sym = tx.name2 if tx.name2 and tx.name2 not in NA else None
+        if not sym:
+            continue
+        rec = (tx.cds_size // 3, coding_exon_count(tx))
+        if rec > out.get(sym, (0, 0)):
+            out[sym] = rec
+    return out
+
+
+def parent_structure(sym: str, ref_struct: dict[str, tuple[int, int]]) -> tuple[int, int]:
+    return ref_struct.get(sym, (0, 0))
+
+
+def completeness(h, ref_struct: dict[str, tuple[int, int]]) -> float:
+    """Identity × fraction of the reference gene's peptide covered by the hit."""
+    p_aa = parent_structure(h.symbol, ref_struct)[0]
+    if not p_aa or not h.qlen:
+        return h.score
+    return h.pid * min(1.0, h.qcov * h.qlen / p_aa)
+
+
+def is_complete_copy(n_exons: int, aa: int, sym: str, ref_struct: dict[str, tuple[int, int]]) -> bool:
+    p_aa, p_ex = parent_structure(sym, ref_struct)
+    if not p_aa:
+        return False
+    if not MIN_COPY_AA_FRAC * p_aa <= aa <= MAX_COPY_AA_FRAC * p_aa:
+        return False
+    if p_ex >= 2 and n_exons < max(2, math.ceil(MIN_COPY_EXON_FRAC * p_ex)):
+        return False
+    return True
+
+
+def load_proteins(path: str | None, wanted: set[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path or not Path(path).exists():
+        return out
+    cur, buf = None, []
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                if cur is not None:
+                    out[cur] = "".join(buf)
+                tid = line[1:].split()[0]
+                cur = tid if tid in wanted else None
+                buf = []
+            elif cur is not None:
+                buf.append(line.strip())
+    if cur is not None:
+        out[cur] = "".join(buf)
+    return out
+
+
+class Hit:
+    __slots__ = ("chrom", "start", "end", "strand", "query", "symbol", "pid", "qcov", "qlen", "n_exons")
+
+    def __init__(self, chrom, start, end, strand, query, symbol, pid, qcov, qlen=0, n_exons=0):
         self.chrom = chrom
         self.start = int(start)
         self.end = int(end)
@@ -178,6 +260,12 @@ class Hit:
         self.symbol = symbol
         self.pid = float(pid)
         self.qcov = float(qcov)
+        self.qlen = int(qlen)
+        self.n_exons = int(n_exons)
+
+    @property
+    def score(self) -> float:
+        return self.pid * self.qcov
 
     @property
     def span(self) -> tuple[int, int]:
@@ -215,7 +303,7 @@ def iter_paf_hits(paf_path: str, query_symbols: dict[str, str], with_exons: bool
                 continue
             h = Hit(
                 rec["t_name"], rec["t_start"], rec["t_end"], rec["strand"],
-                rec["q_name"], sym, pid, qcov,
+                rec["q_name"], sym, pid, qcov, qlen, real_exon_count(exons),
             )
             if with_exons:
                 yield h, exons
@@ -270,6 +358,7 @@ def load_genes(gp_path: str, gp_info_path: str) -> tuple[list[dict], pd.DataFram
                 "source_name": "" if _na(rec.get("source_gene_common_name")) else str(rec["source_gene_common_name"]),
                 "transcript_class": str(rec.get("transcript_class") or ""),
                 "cds_size": tx.cds_size,
+                "coding_exons": coding_exon_count(tx),
             }
         )
     return genes, info
@@ -296,287 +385,301 @@ def hits_by_chrom(hits: list[Hit]) -> dict[str, list[Hit]]:
     return by
 
 
-def best_gene_for_hit(h: Hit, gene_spans: list[tuple[int, int] | None], genes: list[dict]) -> int | None:
-    hb = h.span
-    best_gi, best_ov, nearby = None, 0, []
-    for gi, gsp in enumerate(gene_spans):
-        if gsp is None:
-            continue
-        if genes[gi]["chrom"] != h.chrom:
-            continue
-        ov = overlap_bp(gsp, hb)
-        if ov > best_ov:
-            best_ov, best_gi = ov, gi
-        elif ov == 0:
-            strand = genes[gi].get("strand") or ""
-            if strand and h.strand and strand != h.strand:
-                continue
-            gap = interval_gap(gsp, hb)
-            if gap <= ASSIGN_MAX_GAP:
-                nearby.append((gap, gi))
-    if best_ov >= 100:
-        return best_gi
-    if nearby:
-        nearby.sort()
-        return nearby[0][1]
-    return None
+class LocusIndex:
+    """Hits on one chromosome, queried by overlap with a gene span."""
+
+    def __init__(self, hits: list[Hit]):
+        self.hits = sorted(hits, key=lambda h: h.start)
+        self.starts = [h.start for h in self.hits]
+        self.maxlen = max((h.length for h in self.hits), default=0)
+
+    def overlapping(self, span: tuple[int, int], min_ov: int) -> list[Hit]:
+        lo = bisect_left(self.starts, span[0] - self.maxlen)
+        hi = bisect_right(self.starts, span[1])
+        return [h for h in self.hits[lo:hi] if overlap_bp(span, h.span) >= min_ov]
 
 
-def _hits_by_symbol_at_gene(
-    g: dict,
-    gsp: tuple[int, int],
-    hits: list[Hit],
-    ref_symbols: set[str],
-    min_ov: int = 80,
-) -> dict[str, Hit]:
-    by_q: dict[str, Hit] = {}
-    chrom = g["chrom"]
+def best_by_symbol(hits: list[Hit], ref_struct: dict[str, tuple[int, int]]) -> dict[str, Hit]:
+    """Most complete hit per symbol; a short fragment query never beats the full protein."""
+    by: dict[str, tuple[float, float, Hit]] = {}
     for h in hits:
-        if h.chrom != chrom or h.symbol not in ref_symbols:
-            continue
-        if overlap_bp(gsp, h.span) < min_ov:
-            continue
-        prev = by_q.get(h.symbol)
-        if prev is None or h.pid * h.qcov > prev.pid * prev.qcov:
-            by_q[h.symbol] = h
-    return by_q
+        key = (completeness(h, ref_struct), h.pid)
+        prev = by.get(h.symbol)
+        if prev is None or key > prev[:2]:
+            by[h.symbol] = (*key, h)
+    return {s: v[2] for s, v in by.items()}
 
 
-def _accept_extra(h: Hit, by_q: dict[str, Hit], primary_pid: dict[str, float]) -> bool:
-    """True if *h* looks like a copy of its already-chosen primary, not a sister paralog."""
-    if h.pid < MIN_EXTRA_PID or h.qcov < MIN_EXTRA_QCOV:
+def orf_intact(g: dict, protein: str | None) -> bool:
+    if g["cds_size"] <= 0 or g["cds_size"] % 3:
         return False
-    prim = primary_pid.get(h.symbol)
-    if prim is not None and h.pid < prim - EXTRA_PRIMARY_DELTA:
+    if str(g["info"].get("frameshift", "")).lower() in {"true", "1"}:
         return False
-    rival = 0.0
-    for sym, hh in by_q.items():
-        if sym == h.symbol:
-            continue
-        rival = max(rival, hh.pid * hh.qcov)
-    return h.pid * h.qcov >= rival + EXTRA_SYMBOL_MARGIN
+    if protein is None:
+        return True
+    return protein.startswith("M") and protein.endswith("*") and "*" not in protein[:-1]
 
 
-def assign_identities(
-    genes: list[dict],
-    chrom_hits: dict[str, list[Hit]],
-    ref_symbols: set[str],
-) -> tuple[dict[int, dict], list[Hit]]:
-    """One primary per symbol for the whole genome, then near-identical extras.
+def coding_call(
+    g: dict,
+    by_sym: dict[str, Hit],
+    ref_struct: dict[str, tuple[int, int]],
+    protein: str | None,
+) -> tuple[str, Hit | None]:
+    """Decide whether an unnamed coding model is a real protein-coding copy.
 
-    Working per chromosome made every contig a fresh namespace, so a human-specific
-    symbol could be called primary on every lemur scaffold. Primaries are now
-    claimed genome-wide (best pid wins). Extras must be near-identical to that
-    primary and uniquely best vs other symbols at the same locus.
+    Returns (call, best_hit). Only ``real_copy`` gets a name; calls in
+    DEMOTE_CALLS lose protein_coding; ``no_homology``, ``noncoding_parent``,
+    ``low_identity`` and ``ambiguous`` are left as they are. A ``real_copy``
+    overlapping a locus that already carries its symbol later becomes
+    ``redundant`` in ``assign_names``.
+
+    Intron loss is judged on the gene model. A thin miniprot hit (fragment
+    peptide or a distant alignment that collapses exons) must not demote a
+    model that itself has parent-like intron structure.
     """
-    groups = _group_by_chrom(genes)
-    gene_spans: list[tuple[int, int]] = [(int(g["start"]), int(g["end"])) for g in genes]
+    if not by_sym:
+        return "no_homology", None
+    ranked = sorted(
+        by_sym.values(), key=lambda h: (completeness(h, ref_struct), h.pid), reverse=True
+    )
+    best = ranked[0]
+    p_aa, p_ex = parent_structure(best.symbol, ref_struct)
+    if not p_aa:
+        return "noncoding_parent", best
+    if not orf_intact(g, protein):
+        return "broken_orf", best
+    model_aa = g["cds_size"] // 3
+    covered = best.qcov * best.qlen if best.qlen else best.qcov * p_aa
+    if (
+        best.qcov < MIN_COPY_QCOV
+        or covered < MIN_COPY_AA_FRAC * p_aa
+        or model_aa < MIN_COPY_AA_FRAC * p_aa
+    ):
+        return "fragment", best
+    if model_aa > MAX_COPY_AA_FRAC * p_aa:
+        return "chimeric", best
+    min_ex = max(2, math.ceil(MIN_COPY_EXON_FRAC * p_ex))
+    if p_ex >= 2 and g["coding_exons"] < min_ex:
+        return "retrocopy", best
+    if best.pid < MIN_COPY_PID:
+        return "low_identity", best
+    if len(ranked) > 1 and (
+        completeness(best, ref_struct) - completeness(ranked[1], ref_struct) < NAME_MARGIN
+    ):
+        return "ambiguous", best
+    return "real_copy", best
 
-    cat_cands = []
-    greedy_cands = []
-    for chrom, idxs in groups:
-        hits = chrom_hits.get(chrom, [])
-        local = [genes[i] for i in idxs]
-        local_spans: list[tuple[int, int] | None] = [gene_spans[i] for i in idxs]
-        for li, g in enumerate(local):
-            src = g.get("source_name") or ""
-            if src not in ref_symbols:
-                continue
-            gsp = local_spans[li]
-            best = None
-            rival = None
-            for h in hits:
-                if overlap_bp(gsp, h.span) < 100:
-                    continue
-                if h.symbol == src:
-                    if best is None or (h.pid, h.qcov) > (best.pid, best.qcov):
-                        best = h
-                elif rival is None or h.pid > rival.pid:
-                    rival = h
-            if best is None or best.pid < MIN_NAMED_PID:
-                continue
-            if rival is not None and rival.pid >= best.pid + CAT_OVERRIDE_MARGIN:
-                continue
-            gi = idxs[li]
-            cat_cands.append((best.pid, g["cds_size"], gi, best))
-        for h in hits:
-            if h.symbol not in ref_symbols:
-                continue
-            li = best_gene_for_hit(h, local_spans, local)
-            if li is None:
-                continue
-            gi = idxs[li]
-            src = genes[gi].get("source_name") or ""
-            boost = 0.05 if src == h.symbol else 0.0
-            greedy_cands.append(
-                (h.pid * h.qcov + boost, genes[gi]["cds_size"], h.pid, gi, h)
-            )
 
-    used_gene: set[int] = set()
-    used_query: set[str] = set()
+def _assignment(symbol: str, hit: Hit, label: str) -> dict:
+    return {"symbol": symbol, "pid": hit.pid, "qcov": hit.qcov, "hit": hit, "label": label}
+
+
+def assign_names(
+    genes: list[dict],
+    index_by_chrom: dict[str, LocusIndex],
+    ref_symbols: set[str],
+    ref_struct: dict[str, tuple[int, int]],
+    proteins: dict[str, str],
+) -> tuple[dict[int, dict], dict[int, str], Counter]:
+    """Genome-wide naming: confirm CAT names, gate unnamed models.
+
+    Returns (assign, calls, present). ``present`` counts loci per symbol after
+    naming; corrections never target a symbol already present.
+    """
+    present: Counter = Counter(g["source_name"] for g in genes if g["source_name"])
     assign: dict[int, dict] = {}
-    primary_pid: dict[str, float] = {}
+    calls: dict[int, str] = {}
+    corrections = []
+    copies = []
 
-    cat_cands.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    for _pid, _cds, gi, h in cat_cands:
-        if gi in used_gene or h.symbol in used_query:
+    for gi, g in enumerate(genes):
+        idx = index_by_chrom.get(g["chrom"])
+        local = idx.overlapping((int(g["start"]), int(g["end"])), 100) if idx else []
+        local = [
+            h for h in local
+            if h.symbol in ref_symbols and (not g["strand"] or h.strand == g["strand"])
+        ]
+        by_sym = best_by_symbol(local, ref_struct)
+        src = g["source_name"]
+        if src:
+            own = by_sym.get(src)
+            rivals = [
+                h for s, h in by_sym.items()
+                if s != src and s in ref_struct and h.qcov >= MIN_PRIMARY_QCOV
+            ]
+            rival = max(rivals, key=lambda h: (h.pid, h.qcov), default=None)
+            own_pid = own.pid if own else 0.0
+            if rival and rival.pid >= MIN_PRIMARY_PID and rival.pid >= own_pid + CAT_OVERRIDE_MARGIN:
+                corrections.append((rival.pid, rival.qcov, gi, rival, own))
+            elif own and own.pid >= MIN_NAMED_PID:
+                assign[gi] = _assignment(src, own, "confirmed")
             continue
-        assign[gi] = {"symbol": h.symbol, "pid": h.pid, "qcov": h.qcov, "hit": h, "extra": False}
-        used_gene.add(gi)
-        used_query.add(h.symbol)
-        primary_pid[h.symbol] = h.pid
+        call, hit = coding_call(g, by_sym, ref_struct, proteins.get(g["transcript_id"]))
+        calls[gi] = call
+        if call == "real_copy":
+            copies.append((completeness(hit, ref_struct), hit.pid, gi, hit))
 
-    greedy_cands.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    for _sc, _cds, pid, gi, h in greedy_cands:
-        if gi in used_gene or h.symbol in used_query:
+    corrections.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    for _pid, _qcov, gi, rival, own in corrections:
+        src = genes[gi]["source_name"]
+        if present[rival.symbol] > 0:
+            if own and own.pid >= MIN_NAMED_PID:
+                assign[gi] = _assignment(src, own, "confirmed")
             continue
-        if pid < MIN_PRIMARY_PID or h.qcov < MIN_PRIMARY_QCOV:
+        assign[gi] = _assignment(rival.symbol, rival, "corrected")
+        present[rival.symbol] += 1
+        present[src] -= 1
+
+    named_spans: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+    for gi, g in enumerate(genes):
+        sym = assign[gi]["symbol"] if gi in assign else g["source_name"]
+        if sym:
+            named_spans[(sym, g["chrom"])].append((int(g["start"]), int(g["end"])))
+
+    copies.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    for _sc, _pid, gi, hit in copies:
+        g = genes[gi]
+        span = (int(g["start"]), int(g["end"]))
+        key = (hit.symbol, g["chrom"])
+        if any(overlap_bp(span, s) > 0 for s in named_spans[key]):
+            calls[gi] = "redundant"
             continue
-        assign[gi] = {"symbol": h.symbol, "pid": pid, "qcov": h.qcov, "hit": h, "extra": False}
-        used_gene.add(gi)
-        used_query.add(h.symbol)
-        primary_pid[h.symbol] = pid
+        named_spans[key].append(span)
+        label = "named_copy" if present[hit.symbol] > 0 else "named_missing"
+        assign[gi] = _assignment(hit.symbol, hit, label)
+        present[hit.symbol] += 1
 
-    for chrom, idxs in groups:
-        hits = chrom_hits.get(chrom, [])
-        for gi in idxs:
-            if gi in used_gene:
-                continue
-            g = genes[gi]
-            by_q = _hits_by_symbol_at_gene(g, gene_spans[gi], hits, ref_symbols)
-            if not by_q:
-                continue
-            ranked = sorted(by_q.values(), key=lambda x: x.pid * x.qcov, reverse=True)
-            best = ranked[0]
-            extra = best.symbol in used_query
-            if extra:
-                if not _accept_extra(best, by_q, primary_pid):
-                    continue
-            else:
-                if best.pid < MIN_ORTHOLOG_PID or best.qcov < MIN_ORTHOLOG_QCOV:
-                    continue
-                margin = 1.0 if len(ranked) == 1 else (
-                    best.pid * best.qcov - ranked[1].pid * ranked[1].qcov
-                )
-                second_used = len(ranked) > 1 and ranked[1].symbol in used_query
-                if margin < UNIQUE_UNUSED_MARGIN and not second_used:
-                    continue
-                if margin < 0.004:
-                    continue
-            assign[gi] = {
-                "symbol": best.symbol,
-                "pid": best.pid,
-                "qcov": best.qcov,
-                "hit": best,
-                "extra": extra,
-            }
-            used_gene.add(gi)
-            if not extra:
-                used_query.add(best.symbol)
-                primary_pid.setdefault(best.symbol, best.pid)
-
-    all_hits = [h for hits in chrom_hits.values() for h in hits]
-    orphans = synteny_orphans(genes, assign, all_hits, ref_symbols, used_query)
-    return assign, orphans
+    return assign, calls, present
 
 
-def synteny_orphans(
+def rescue_candidates(
+    hits: list[Hit],
+    present: Counter,
+    ref_struct: dict[str, tuple[int, int]],
+) -> list[Hit]:
+    """Complete, intron-consistent hits to reference genes absent from the genome.
+
+    Up to RESCUE_CANDIDATES_PER_SYMBOL per symbol, most complete first; the
+    exon-level placement check in ``place_rescues`` picks at most one.
+    """
+    by_sym: dict[str, list[Hit]] = defaultdict(list)
+    for h in hits:
+        if present.get(h.symbol, 0) > 0:
+            continue
+        p_aa, p_ex = parent_structure(h.symbol, ref_struct)
+        if not p_aa or h.pid < MIN_COPY_PID or h.qcov < MIN_COPY_QCOV:
+            continue
+        covered = h.qcov * h.qlen
+        if not MIN_COPY_AA_FRAC * p_aa <= covered <= MAX_COPY_AA_FRAC * p_aa:
+            continue
+        if p_ex >= 2 and h.n_exons < max(2, math.ceil(MIN_COPY_EXON_FRAC * p_ex)):
+            continue
+        by_sym[h.symbol].append(h)
+    out: list[Hit] = []
+    for sym, hs in by_sym.items():
+        hs.sort(key=lambda h: (completeness(h, ref_struct), h.pid), reverse=True)
+        out.extend(hs[:RESCUE_CANDIDATES_PER_SYMBOL])
+    out.sort(key=lambda h: (completeness(h, ref_struct), h.pid), reverse=True)
+    return out
+
+
+def _coding_segments(tx) -> list[tuple[int, int]]:
+    segs = []
+    for e in tx.exon_intervals:
+        s, t = max(e.start, tx.thick_start), min(e.stop, tx.thick_stop)
+        if t > s:
+            segs.append((s, t))
+    return segs
+
+
+def _segment_overlap(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> int:
+    return sum(max(0, min(x1, y1) - max(x0, y0)) for x0, x1 in a for y0, y1 in b)
+
+
+def place_rescues(
+    cands: list[Hit],
+    exon_lookup: dict[tuple, list[tuple[int, int]]],
     genes: list[dict],
     assign: dict[int, dict],
-    hits: list[Hit],
-    ref_symbols: set[str],
-    used_query: set[str],
-) -> list[Hit]:
-    """Unused symbols whose best hit sits in a clean gap between assigned neighbours."""
-    primary: dict[str, tuple[str, int, int]] = {}
-    for gi, a in assign.items():
-        if a.get("extra"):
-            continue
-        g = genes[gi]
-        primary[a["symbol"]] = (g["chrom"], int(g["start"]), int(g["end"]))
+    ref_struct: dict[str, tuple[int, int]],
+) -> tuple[list[tuple[Hit, GenePredTranscript]], set[int]]:
+    """Accept one rescue per absent symbol.
 
-    occupied: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    for gi, a in assign.items():
-        g = genes[gi]
-        occupied[g["chrom"]].append((int(g["start"]), int(g["end"])))
-
-    # Neighbour walk uses target genomic order of *assigned primaries*, not the
-    # human chromosome (which rearranges in NWM). A symbol is rescued only if
-    # some pair of already-named genes on the same contig leave a 8–500 kb gap
-    # containing a high-coverage hit to that unused symbol and nothing else.
-    prim_by_chrom: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
-    for sym, (chrom, s, e) in primary.items():
-        prim_by_chrom[chrom].append((s, e, sym))
-    for chrom in prim_by_chrom:
-        prim_by_chrom[chrom].sort()
-
-    orphans: list[Hit] = []
-    for h in sorted(hits, key=lambda x: (-x.pid, -x.qcov, -x.length)):
-        if h.symbol not in ref_symbols or h.symbol in used_query:
+    A rescue is blocked when more than RESCUE_MAX_NAMED_OVERLAP of its CDS
+    falls on coding exons of a named gene (same strand). Unnamed coding models
+    whose exons it overlaps are fragments of it and are superseded.
+    """
+    by_chrom: dict[str, list[int]] = defaultdict(list)
+    for gi, g in enumerate(genes):
+        by_chrom[g["chrom"]].append(gi)
+    segs_cache: dict[int, list[tuple[int, int]]] = {}
+    accepted: list[tuple[Hit, GenePredTranscript]] = []
+    taken: dict[tuple[str, str], list[list[tuple[int, int]]]] = defaultdict(list)
+    superseded: set[int] = set()
+    used: set[str] = set()
+    for h in cands:
+        if h.symbol in used:
             continue
-        if h.pid < MIN_NAMED_PID or h.qcov < FULL_PROTEIN_QCOV:
+        exons = exon_lookup.get((h.chrom, h.start, h.end, h.query))
+        if not exons:
             continue
-        if h.length < MIN_RECOVER_SPAN:
-            continue
-        if any(interval_gap(h.span, oc) == 0 for oc in occupied.get(h.chrom, [])):
-            continue
-        loc = prim_by_chrom.get(h.chrom) or []
-        in_clean_gap = False
-        for i in range(len(loc) - 1):
-            _s1, e1, _left = loc[i]
-            s2, _e2, _right = loc[i + 1]
-            gap_lo, gap_hi = e1, s2
-            gap = gap_hi - gap_lo
-            if gap < SYNTENY_GAP_MIN or gap > SYNTENY_GAP_MAX:
-                continue
-            mid = (h.start + h.end) // 2
-            if gap_lo < mid < gap_hi:
-                in_clean_gap = True
-                break
-        if not in_clean_gap:
-            continue
-        orphans.append(h)
-        used_query.add(h.symbol)
-        occupied[h.chrom].append(h.span)
-    return orphans
-
-
-def choose_protein_span(gene: dict, hit: Hit, hits: list[Hit]) -> Hit:
-    """Owned full-protein hit: rank by (qcov, span, pid), not identity first."""
-    gs, ge = int(gene["start"]), int(gene["end"])
-    chrom = gene["chrom"]
-    query = hit.symbol
-    cands = [
-        h
-        for h in hits
-        if h.chrom == chrom
-        and h.symbol == query
-        and h.pid >= MIN_ORTHOLOG_PID
-        and (
-            overlap_bp((gs, ge), h.span) >= 50
-            or interval_gap((gs, ge), h.span) <= 40_000
+        tx = GenePredTranscript(
+            gp_line_from_exons(f"MPR-{_safe(h.symbol)}-{h.start}", h.chrom, h.strand, exons, h.symbol).split("\t")
         )
-    ]
+        if not is_complete_copy(coding_exon_count(tx), tx.cds_size // 3, h.symbol, ref_struct):
+            continue
+        segs = _coding_segments(tx)
+        if any(_segment_overlap(segs, t) > 0 for t in taken[(h.chrom, h.strand)]):
+            continue
+        named_ov = 0
+        unnamed = []
+        for gi in by_chrom.get(h.chrom, []):
+            g = genes[gi]
+            if g["strand"] != h.strand or overlap_bp((int(g["start"]), int(g["end"])), h.span) == 0:
+                continue
+            if gi not in segs_cache:
+                segs_cache[gi] = _coding_segments(g["tx"])
+            ov = _segment_overlap(segs, segs_cache[gi])
+            if ov == 0:
+                continue
+            if gi in assign or g["source_name"]:
+                named_ov += ov
+            else:
+                unnamed.append(gi)
+        if named_ov > RESCUE_MAX_NAMED_OVERLAP * tx.cds_size:
+            continue
+        accepted.append((h, tx))
+        superseded.update(unnamed)
+        taken[(h.chrom, h.strand)].append(segs)
+        used.add(h.symbol)
+    return accepted, superseded
+
+
+def choose_protein_span(
+    gene: dict, hit: Hit, idx: LocusIndex | None, ref_struct: dict[str, tuple[int, int]]
+) -> Hit:
+    """Owned full-protein hit: rank by completeness vs the reference gene, then span."""
+    gs, ge = int(gene["start"]), int(gene["end"])
+    nearby = idx.overlapping((gs - 40_000, ge + 40_000), 1) if idx else []
+    cands = [h for h in nearby if h.symbol == hit.symbol and h.pid >= MIN_ORTHOLOG_PID]
     if not cands:
         cands = [hit]
     full = [h for h in cands if h.qcov >= FULL_PROTEIN_QCOV and h.length >= MIN_PROTEIN_SPAN]
     pool = full or cands
-    return max(pool, key=lambda h: (h.qcov, h.length, h.pid))
+    return max(pool, key=lambda h: (completeness(h, ref_struct), h.length, h.pid))
 
 
 def overlaps_other_gene(
     span: tuple[int, int],
-    chrom: str,
     self_gi: int,
     genes: list[dict],
-    assign: dict[int, dict],
+    same_chrom: list[int],
 ) -> bool:
-    for gj, a in assign.items():
-        if gj == self_gi or a.get("extra") and genes[gj]["gene_id"] == genes[self_gi]["gene_id"]:
+    for gj in same_chrom:
+        if gj == self_gi:
             continue
         g = genes[gj]
-        if g["chrom"] != chrom:
-            continue
         if overlap_bp(span, (int(g["start"]), int(g["end"]))) >= 100:
             return True
     return False
@@ -610,16 +713,20 @@ def gp_line_from_exons(name: str, chrom: str, strand: str, exons: list[tuple[int
 def apply_structure(
     genes: list[dict],
     assign: dict[int, dict],
-    hits: list[Hit],
+    index_by_chrom: dict[str, LocusIndex],
     exon_lookup: dict[tuple, list[tuple[int, int]]],
+    ref_struct: dict[str, tuple[int, int]],
 ) -> tuple[int, int]:
     n_shrink = n_expand = 0
+    genes_by_chrom: dict[str, list[int]] = defaultdict(list)
+    for gi, g in enumerate(genes):
+        genes_by_chrom[g["chrom"]].append(gi)
     for gi, a in sorted(assign.items(), key=lambda kv: (genes[kv[0]]["chrom"], genes[kv[0]]["start"])):
         g = genes[gi]
-        chosen = choose_protein_span(g, a["hit"], hits)
+        chosen = choose_protein_span(g, a["hit"], index_by_chrom.get(g["chrom"]), ref_struct)
         if chosen.qcov < FULL_PROTEIN_QCOV or chosen.length < MIN_PROTEIN_SPAN:
             continue
-        if overlaps_other_gene(chosen.span, g["chrom"], gi, genes, assign):
+        if overlaps_other_gene(chosen.span, gi, genes, genes_by_chrom[g["chrom"]]):
             continue
         key = (chosen.chrom, chosen.start, chosen.end, chosen.query)
         exons = exon_lookup.get(key)
@@ -675,7 +782,8 @@ def info_row_for_orphan(template: dict, gene_id: str, tx_id: str, hit: Hit, geno
 def write_outputs(
     genes: list[dict],
     info: pd.DataFrame,
-    assign: dict[int, dict],
+    assign: dict[str, dict],
+    calls: dict[str, str],
     orphans: list[tuple[dict, Hit]],
     keep_tx: set[str],
     args,
@@ -696,14 +804,21 @@ def write_outputs(
         rec["transcript_id"] = g["transcript_id"]
         a = assign.get(g["gene_id"])
         if a is not None:
-            rec["source_gene_common_name"] = a["symbol"]
-            rec["source_gene"] = a["symbol"]
-            rec["transcript_class"] = "ortholog"
-            rec["gene_biotype"] = "protein_coding"
-            rec["transcript_biotype"] = "protein_coding"
-            rec["protein_refine"] = "extra" if a["extra"] else "primary"
+            rec["protein_refine"] = a["label"]
+            if a["label"] != "confirmed":
+                rec["source_gene_common_name"] = a["symbol"]
+                rec["source_gene"] = a["symbol"]
+                rec["transcript_class"] = "ortholog"
+                rec["gene_biotype"] = "protein_coding"
+                rec["transcript_biotype"] = "protein_coding"
         else:
-            rec.setdefault("protein_refine", "unchanged")
+            rec["protein_refine"] = "unchanged"
+        call = calls.get(g["gene_id"])
+        rec["protein_refine_call"] = call or "N/A"
+        if call in DEMOTE_CALLS:
+            for col in ("gene_biotype", "transcript_biotype"):
+                if rec.get(col) == "protein_coding":
+                    rec[col] = "unknown_likely_coding"
         out_info_rows.append(rec)
         attrs = {k: rec[k] for k in rec}
         gene_dict[g["chrom"]].setdefault(g["gene_id"], []).append((g["tx"], attrs))
@@ -785,27 +900,44 @@ def run(args) -> int:
     ]
     work = [pc_genes[i] for i in pick_representatives(pc_genes)]
     chrom_hits = hits_by_chrom(hits)
+    index_by_chrom = {c: LocusIndex(hs) for c, hs in chrom_hits.items()}
+    ref_struct = load_ref_structure(args.ref_gp, query_symbols)
+    proteins = load_proteins(
+        args.consensus_protein_fasta,
+        {g["transcript_id"] for g in work if not g["source_name"]},
+    )
 
-    assign, orphans = assign_identities(work, chrom_hits, ref_symbols)
+    assign, calls, present = assign_names(work, index_by_chrom, ref_symbols, ref_struct, proteins)
+    cands = rescue_candidates(hits, present, ref_struct)
+    labels = Counter(a["label"] for a in assign.values())
+    call_counts = Counter(calls.values())
+    logger.info("  names: %s", ", ".join(f"{k}={v}" for k, v in sorted(labels.items())))
     logger.info(
-        "  assigned %s genes (%s extras); %s synteny rescues",
-        len(assign),
-        sum(1 for a in assign.values() if a["extra"]),
-        len(orphans),
+        "  unnamed-model calls: %s",
+        ", ".join(f"{k}={v}" for k, v in call_counts.most_common()),
+    )
+    logger.info(
+        "  rescue candidates: %s hits for %s absent symbols",
+        len(cands), len({h.symbol for h in cands}),
     )
 
     needed = set()
     for wi, a in assign.items():
-        chosen = choose_protein_span(work[wi], a["hit"], chrom_hits.get(work[wi]["chrom"], []))
+        chosen = choose_protein_span(work[wi], a["hit"], index_by_chrom.get(work[wi]["chrom"]), ref_struct)
         needed.add((chosen.chrom, chosen.start, chosen.end, chosen.query))
-    for h in orphans:
+    for h in cands:
         needed.add((h.chrom, h.start, h.end, h.query))
     exon_lookup = fetch_exons(args.miniprot_paf, query_symbols, needed)
     logger.info("  exon records fetched: %s / %s", len(exon_lookup), len(needed))
 
-    # Map assign indices from `work` back onto `work` genes (already those objects).
-    n_shrink, n_expand = apply_structure(work, assign, hits, exon_lookup)
+    n_shrink, n_expand = apply_structure(work, assign, index_by_chrom, exon_lookup, ref_struct)
     logger.info("  shrunk %s chimeric; expanded %s truncated", n_shrink, n_expand)
+
+    rescues, superseded = place_rescues(cands, exon_lookup, work, assign, ref_struct)
+    logger.info(
+        "  rescued %s absent genes; superseded %s unnamed fragment models",
+        len(rescues), len(superseded),
+    )
 
     # Broadcast names onto every transcript of an assigned gene.
     by_gid = defaultdict(list)
@@ -828,27 +960,27 @@ def run(args) -> int:
                 keep_tx.discard(g["transcript_id"])
                 n_drop_iso += 1
 
+    for wi in superseded:
+        for gi in by_gid[work[wi]["gene_id"]]:
+            keep_tx.discard(all_genes[gi]["transcript_id"])
+
     orphan_rows = []
-    for h in orphans:
-        key = (h.chrom, h.start, h.end, h.query)
-        exons = exon_lookup.get(key)
-        if not exons:
-            continue
-        tx_id = f"MPR-{_safe(h.symbol)}-{h.start}"
+    for h, tx in rescues:
+        tx_id = tx.name
         gene_id = tx_id
-        line = gp_line_from_exons(tx_id, h.chrom, h.strand, exons, h.symbol)
-        tx = GenePredTranscript(line.split("\t"))
         template = info.iloc[0].to_dict() if len(info) else {}
         rec = info_row_for_orphan(template, gene_id, tx_id, h, args.genome)
         rec["_tx"] = tx
         rec["protein_refine"] = "rescued"
+        rec["protein_refine_call"] = "rescued"
         orphan_rows.append((rec, h))
 
     stats = {
         "genome": args.genome,
-        "n_assigned": len(assign),
-        "n_extra": sum(1 for a in assign.values() if a["extra"]),
+        "names": dict(labels),
+        "unnamed_model_calls": dict(call_counts),
         "n_rescued": len(orphan_rows),
+        "n_superseded": len(superseded),
         "n_shrink": n_shrink,
         "n_expand": n_expand,
         "n_drop_isoform": n_drop_iso,
@@ -864,16 +996,10 @@ def run(args) -> int:
             pass
 
     assign_by_gid = {work[wi]["gene_id"]: a for wi, a in assign.items()}
-    write_outputs(all_genes, info, assign_by_gid, orphan_rows, keep_tx, args, stats)
+    calls_by_gid = {work[wi]["gene_id"]: c for wi, c in calls.items()}
+    write_outputs(all_genes, info, assign_by_gid, calls_by_gid, orphan_rows, keep_tx, args, stats)
     logger.info("  wrote %s", args.output_gp)
     return 0
-
-
-def _group_by_chrom(genes: list[dict]) -> list[tuple[str, list[int]]]:
-    by = defaultdict(list)
-    for i, g in enumerate(genes):
-        by[g["chrom"]].append(i)
-    return [(c, by[c]) for c in sorted(by)]
 
 
 def _safe(sym: str) -> str:
