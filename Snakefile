@@ -110,22 +110,22 @@ def validate_config():
     if config.get("annotate_ancestors", False):
         ancestor_modes = config.get("ancestor_modes") or []
         for m in ancestor_modes:
-            if m not in ("transMap", "transMap_pairwise", "txTM", "augMP"):
+            if m not in ("transMap", "transMap_pairwise", "txTM", "augMP", "miniprot"):
                 errors.append(
                     f"ancestor_modes contains unsupported mode '{m}' "
-                    "(allowed: transMap, transMap_pairwise, txTM, augMP)"
+                    "(allowed: transMap, transMap_pairwise, txTM, augMP, miniprot)"
                 )
-        if "augMP" in ancestor_modes:
+        if "augMP" in ancestor_modes or "miniprot" in ancestor_modes:
             if not config.get("augustus", False):
                 errors.append(
-                    "ancestor_modes includes 'augMP' but augustus is disabled; "
-                    "augMP (miniprot) requires the Augustus/miniprot path"
+                    "ancestor_modes includes 'augMP'/'miniprot' but augustus is disabled; "
+                    "both require the Augustus/miniprot path"
                 )
-            if "transMap" not in ancestor_modes:
-                errors.append(
-                    "ancestor_modes includes 'augMP' which requires 'transMap' "
-                    "(Augustus MP uses the transMap PSL as alignment context)"
-                )
+        if "augMP" in ancestor_modes and "transMap" not in ancestor_modes:
+            errors.append(
+                "ancestor_modes includes 'augMP' which requires 'transMap' "
+                "(Augustus MP uses the transMap PSL as alignment context)"
+            )
 
     for w in warnings:
         print(f"CONFIG WARNING: {w}", file=sys.stderr)
@@ -188,7 +188,7 @@ if not PROTEIN_FASTA:
     PROTEIN_FASTA = f"{config['work_dir']}/protein_db/protein_db.fa"
 
 # Pipeline modes and constraints
-VALID_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM", "augPB", "strg"]
+VALID_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "miniprot", "txTM", "augPB", "strg"]
 VALID_ALIGNMENT_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM"]
 
 # Active alignment modes (filtered based on config)
@@ -205,8 +205,8 @@ if config.get("txTM", False):
 
 # Ancestor genome annotation (internal Cactus HAL nodes).
 # Alignment-only plus miniprot/augMP (no RNA-seq / Augustus PB / StringTie).
-ANCESTOR_MODES_DEFAULT = ["transMap", "transMap_pairwise", "txTM", "augMP"]
-VALID_ANCESTOR_MODES = ["transMap", "transMap_pairwise", "txTM", "augMP"]
+ANCESTOR_MODES_DEFAULT = ["transMap", "transMap_pairwise", "txTM", "augMP", "miniprot"]
+VALID_ANCESTOR_MODES = ["transMap", "transMap_pairwise", "txTM", "augMP", "miniprot"]
 
 def _genome_wc(genomes):
     return "|".join(genomes) if genomes else "never_match"
@@ -239,13 +239,13 @@ if ANCESTOR_GENOMES:
             ALL_GENOMES.append(g)
 
 ANNOTATION_GENOMES = TARGET_GENOMES + ANCESTOR_GENOMES
-ANCESTOR_ALIGNMENT_MODES = [m for m in ANCESTOR_MODES if m in VALID_ANCESTOR_MODES]
+ANCESTOR_ALIGNMENT_MODES = [m for m in ANCESTOR_MODES if m in VALID_ALIGNMENT_MODES]
 ALL_ALIGNMENT_MODES = list(dict.fromkeys(ACTIVE_ALIGNMENT_MODES + ANCESTOR_ALIGNMENT_MODES))
 TXTM_GENOMES = ([g for g in TARGET_GENOMES if config.get("txTM", False)] +
                 [g for g in ANCESTOR_GENOMES if "txTM" in ANCESTOR_MODES])
 # miniprot / augMP: every Augustus leaf, plus ancestors when augMP is requested.
 AUGMP_GENOMES = list(AUGUSTUS_GENOMES)
-if ANCESTOR_GENOMES and "augMP" in ANCESTOR_MODES:
+if ANCESTOR_GENOMES and ("augMP" in ANCESTOR_MODES or "miniprot" in ANCESTOR_MODES):
     for g in ANCESTOR_GENOMES:
         if g not in AUGMP_GENOMES:
             AUGMP_GENOMES.append(g)
@@ -312,6 +312,7 @@ def mode_gp_paths(genome, work_dir=None):
         'augTMR':             f"{wd}/augustus/{genome}_augTMR.gp",
         'augTMR_pairwise':    f"{wd}/augustus/{genome}_augTMR_pairwise.gp",
         'augMP':              f"{wd}/augustus/{genome}_augMP.gp",
+        'miniprot':           f"{wd}/miniprot/{genome}_miniprot_consensus.gp",
         'txTM':               f"{wd}/txTM/{genome}_txTM.gp",
         'augPB':              f"{wd}/augustus_pb/{genome}_augPB.gp",
         'strg':               f"{wd}/stringtie/{genome}_strg.gp",
@@ -334,6 +335,7 @@ def get_gp_path_for_mode(mode, genome):
         'augTM_pairwise': WORK_DIR / f"augustus/{genome}_augTM_pairwise.gp",
         'augTMR_pairwise': WORK_DIR / f"augustus/{genome}_augTMR_pairwise.gp",
         'augMP': WORK_DIR / f"augustus/{genome}_augMP.gp",
+        'miniprot': WORK_DIR / f"miniprot/{genome}_miniprot_consensus.gp",
         'txTM': WORK_DIR / f"txTM/{genome}_txTM.gp",
         'augPB': WORK_DIR / f"augustus_pb/{genome}_augPB.gp",
         'strg': WORK_DIR / f"stringtie/{genome}_strg.gp"
@@ -597,7 +599,7 @@ _HIGH_RECALL_OVERRIDES = {
     "tm_filter_overlapping":            False,  # do not collapse overlapping paralogous genes
     "tm_min_cover":                     0.0,    # pslCDnaFilter -minCover
     "tm_min_span":                      0.0,    # pslCDnaFilter -minSpan
-    "tm_max_ref_span":                  20,     # allow larger target spans vs reference
+    "tm_max_ref_span":                  5,      # drop tandem-array fusions (TSPY 30× parent)
     "tm_paralog_rescue_min_coverage":  0.20,    # rescue paralog-collapse victims down to 20% cov
     # txTM consensus gating
     "txTM_min_coverage":                0.0,
@@ -630,6 +632,10 @@ _HIGH_RECALL_OVERRIDES = {
     "protein_novel_keep_overlapping":   True,   # keep novel overlapping projected features too
     "protein_novel_as_coding":          True,   # label protein-only novels as protein_coding
     "rescue_augMP_novels":              True,   # keep UniProt-only empty-locus recoveries
+    # Raw miniprot models in consensus (augMP can collapse real multi-exon loci).
+    "consensus_miniprot":               True,
+    "miniprot_consensus_min_coverage":  0.80,
+    "miniprot_consensus_min_identity":  0.80,
     # expressed non-coding -> protein_coding rescue (recall). On by default; in
     # high_recall also allow single-exon and shorter ORFs to maximise recovery.
     "rescue_expressed_noncoding_to_pc": True,
@@ -1276,6 +1282,19 @@ rule all:
         setup_done = rules.setup_pipeline_directories.output.setup_done,
         consensus_files = consensus_files
 
+rule all_novel_annotated:
+    """Span-cap → consensus → refine → novel for every annotated genome.
+
+    Use this instead of ``all`` when remaking the gene set without plots or
+    Augustus. ``all`` stops at ``{genome}_consensus.gp`` and does not pull
+    protein refine or novel annotation.
+    """
+    input:
+        expand(
+            str(WORK_DIR / "consensus_gene_set/{genome}_consensus_novel_annotated.gp"),
+            genome=ANNOTATION_GENOMES,
+        )
+
 rule all_with_cleanup:
     """Complete pipeline with cleanup of log files and done markers."""
     input:
@@ -1552,7 +1571,10 @@ rule transmap_map_psl:
     wildcard_constraints:
         genome = ANNOTATION_GENOME_WC
     output:
-        tm_psl=temp(f"{config['work_dir']}/transMap/{{genome}}.psl"),
+        # Keep the raw PSL. Marking it temp() deletes it after filter and then
+        # -R transmap_filter remakes mapping plus every Augustus/align consumer
+        # of filtered.gp.
+        tm_psl=f"{config['work_dir']}/transMap/{{genome}}.psl",
         tm_gp=f"{config['work_dir']}/transMap/{{genome}}.gp"
     threads: 1 if IS_CLUSTER else get_local_res("transmap_map_psl", "threads")
     resources:
@@ -1689,7 +1711,7 @@ rule transmap_evaluate:
         ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
         fasta=f"{config['work_dir']}/genome_files/{{genome}}.fa"
     output:
-        db_done=temp(f"{config['work_dir']}/databases/{{genome}}.tm_eval.done"),
+        db_done=f"{config['work_dir']}/databases/{{genome}}.tm_eval.done",
         resolved_df=temp(f"{config['work_dir']}/transMap/{{genome}}_resolved_df_2.pkl")
     wildcard_constraints:
         genome = ANNOTATION_GENOME_WC
@@ -1959,7 +1981,7 @@ rule transmap_pairwise_map_psl:
     wildcard_constraints:
         genome = ANNOTATION_GENOME_WC
     output:
-        tm_psl=temp(f"{config['work_dir']}/transMap_pairwise/{{genome}}.psl"),
+        tm_psl=f"{config['work_dir']}/transMap_pairwise/{{genome}}.psl",
         tm_gp=f"{config['work_dir']}/transMap_pairwise/{{genome}}.gp"
     threads: 1 if IS_CLUSTER else get_local_res("transmap_pairwise_map_psl", "threads")
     resources:
@@ -2016,6 +2038,41 @@ echo "End time: $(date)"
                 "transmap_pairwise_map_psl",
                 max_wait_s=timeout_s("transmap_pairwise_map_psl")
             )
+
+rule transmap_pairwise_span_cap:
+    """Drop pairwise transMap rows whose span exceeds N× the reference transcript.
+
+    Consensus reads the unfiltered pairwise GP so extra CNV copies survive
+    overlapping-gene collapse. That file also contains tandem-array fusions
+    (TSPY 30×). Cap those here; leave compact extras (AMY) alone.
+    """
+    input:
+        tm_gp=f"{config['work_dir']}/transMap_pairwise/{{genome}}.gp",
+        ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp"
+    output:
+        gp=f"{config['work_dir']}/transMap_pairwise/{{genome}}_span_capped.gp",
+        metrics_json=f"{config['work_dir']}/transMap_pairwise/{{genome}}_span_capped.json"
+    wildcard_constraints:
+        genome = ANNOTATION_GENOME_WC
+    params:
+        max_ref_span=rcfg("tm_max_ref_span", 5),
+        script="cat.filter_transmap"
+    log:
+        f"{config['work_dir']}/logs/transmap_pairwise_span_cap/{{genome}}.log"
+    resources:
+        mem_gb=4,
+        time_h=1,
+        job_id=lambda wildcards, attempt: f"tm-span-cap-{wildcards.genome}-{attempt}"
+    shell:
+        """
+        python -m {params.script} --span-cap-only \
+            --tm-gp {input.tm_gp} \
+            --ref-gp {input.ref_gp} \
+            --filtered-gp {output.gp} \
+            --metrics-json {output.metrics_json} \
+            --max-ref-span {params.max_ref_span} \
+            > {log} 2>&1
+        """
 
 rule transmap_pairwise_filter:
     """
@@ -3196,8 +3253,8 @@ rule miniprot_paf_to_genepred:
     input:
         paf=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.paf"
     output:
-        gp=maybe_temp(f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp"),
-        psl=maybe_temp(f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl")
+        gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp",
+        psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl"
     wildcard_constraints:
         genome = AUGMP_GENOME_WC
     log:
@@ -3230,7 +3287,8 @@ rule miniprot_gp_to_hints:
     PAF, and so genomes that already have aln2hints output keep those files.
     """
     input:
-        gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp"
+        # Reconverting PAF must not rebuild Augustus; hints already exist.
+        gp=ancient(f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp")
     output:
         hints=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_hints.gff"
     wildcard_constraints:
@@ -3670,7 +3728,10 @@ rule isoseq_construct_structures:
 def get_active_modes_for_wildcards(wildcards):
     genome = wildcards.genome
     if genome in ANCESTOR_GENOMES:
-        return [m for m in ANCESTOR_MODES if m in VALID_ANCESTOR_MODES]
+        modes = [m for m in ANCESTOR_MODES if m in VALID_ANCESTOR_MODES]
+        if not rcfg("consensus_miniprot", True):
+            modes = [m for m in modes if m != "miniprot"]
+        return modes
 
     modes = ['transMap', 'transMap_pairwise'] # transMap and transMap_pairwise are always active for target genomes
 
@@ -3684,6 +3745,8 @@ def get_active_modes_for_wildcards(wildcards):
             modes.append('augTMR')
             modes.append('augTMR_pairwise')
         modes.append('augMP')
+        if rcfg("consensus_miniprot", True) and genome in AUGMP_GENOMES:
+            modes.append('miniprot')
     if config.get("augustus_pb", False) and genome in config.get("isoseq_genomes", []):
         modes.append('augPB')
     if config.get("stringtie", False) and genome in config.get("isoseq_genomes", []) and genome in config.get("stringtie_genomes", TARGET_GENOMES):
@@ -3701,7 +3764,7 @@ def get_align_transcript_outputs(wildcards):
     """Determines the expected output PSL files for the align_transcripts rule."""
     work_dir = config["work_dir"]
     output_dir=f"{work_dir}/transcript_alignment"
-    active_modes = get_active_modes_for_wildcards(wildcards)
+    active_modes = get_alignment_modes_for_genome(wildcards)
     
     psl_files = []
     for mode in active_modes:
@@ -3838,8 +3901,8 @@ rule evaluate_transcripts:
         db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
     output:
         # Create a done file for each mode to signal completion
-        done_file=temp(f"{config['work_dir']}/databases/{{genome}}_{{alignment_mode}}_evaluation.done"),
-        resolved_df=temp(f"{config['work_dir']}/databases/{{genome}}_{{alignment_mode}}_resolved_df.pkl")
+        done_file=f"{config['work_dir']}/databases/{{genome}}_{{alignment_mode}}_evaluation.done",
+        resolved_df=f"{config['work_dir']}/databases/{{genome}}_{{alignment_mode}}_resolved_df.pkl"
     wildcard_constraints:
         genome=ANNOTATION_GENOME_WC,
         alignment_mode=f"({'|'.join(ALL_ALIGNMENT_MODES)})"
@@ -3957,16 +4020,16 @@ def get_consensus_inputs(wildcards):
         'ref_gp': f"{work_dir}/reference/{config['ref_genome']}.gp",
         'tm_eval_done': f"{work_dir}/databases/{genome}.tm_eval.done",
         'eval_done': f"{work_dir}/logs/{genome}_evaluation.done",
-        # Pairwise map + filter must finish before consensus; consensus uses unfiltered .gp
-        # (filter --filter-overlapping-genes drops many ref PC genes e.g. at collapsed loci).
-        'transmap_pairwise_gp': f"{work_dir}/transMap_pairwise/{genome}.gp",
+        # Pairwise map + filter must finish before consensus. Use the span-capped
+        # unfiltered GP (not _filtered.gp: overlapping-gene filter drops paralogs).
+        'transmap_pairwise_gp': f"{work_dir}/transMap_pairwise/{genome}_span_capped.gp",
         'transmap_pairwise_filtered': f"{work_dir}/transMap_pairwise/{genome}_filtered.gp",
     }
 
     # Map each mode to its specific genePred file path
     gp_path_map = mode_gp_paths(genome, work_dir)
-    # Consensus intentionally consumes the *unfiltered* pairwise GP (not _filtered.gp).
-    gp_path_map['transMap_pairwise'] = f"{work_dir}/transMap_pairwise/{genome}.gp"
+    # Consensus reads unfiltered pairwise after the 5× reference-span cap.
+    gp_path_map['transMap_pairwise'] = f"{work_dir}/transMap_pairwise/{genome}_span_capped.gp"
     gp_list = [gp_path_map[mode] for mode in active_modes]
     transmap_pairwise_gp = gp_path_map['transMap_pairwise']
     if transmap_pairwise_gp not in gp_list:
@@ -4005,6 +4068,8 @@ def get_consensus_inputs(wildcards):
     # augMP like other modes. Applies to both leaves and ancestors.
     if "augMP" in active_modes:
         done_files.append(f"{work_dir}/databases/{genome}_augMP_psl_metrics.done")
+    if "miniprot" in active_modes:
+        done_files.append(f"{work_dir}/databases/{genome}_miniprot_psl_metrics.done")
     inputs["psl_metrics_done"] = done_files
     
     return inputs
@@ -4127,10 +4192,10 @@ rule generate_augMP_psl:
     """
     input:
         gp=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.gp",
-        miniprot_psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl",
+        miniprot_psl=ancient(f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl"),
         augmp_fix=f"{config['work_dir']}/databases/{{genome}}_augMP_gene_names_fixed.done",
     output:
-        psl=maybe_temp(f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl"),
+        psl=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl",
         # Sentinel so store_psl_metrics_augMP cannot run on a stale 0-byte PSL file.
         generated=f"{config['work_dir']}/databases/{{genome}}_augMP_psl_generated.done",
     wildcard_constraints:
@@ -4167,10 +4232,10 @@ rule filter_augMP:
     align_transcripts, evaluate_transcripts, store_psl_metrics_augMP and consensus.
     """
     input:
-        raw_gp=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.gp",
-        raw_psl=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl",
-        generated=f"{config['work_dir']}/databases/{{genome}}_augMP_psl_generated.done",
-        augmp_fix=f"{config['work_dir']}/databases/{{genome}}_augMP_gene_names_fixed.done",
+        raw_gp=ancient(f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.gp"),
+        raw_psl=ancient(f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl"),
+        generated=ancient(f"{config['work_dir']}/databases/{{genome}}_augMP_psl_generated.done"),
+        augmp_fix=ancient(f"{config['work_dir']}/databases/{{genome}}_augMP_gene_names_fixed.done"),
     output:
         gp=f"{config['work_dir']}/augustus/{{genome}}_augMP.gp",
         psl=f"{config['work_dir']}/augustus/{{genome}}_augMP.psl",
@@ -4229,6 +4294,74 @@ rule store_psl_metrics_augMP:
             --mode augMP \
             --ref-gp {input.ref_gp}
         echo "stored_augMP_psl_metrics n_psl=$n_psl" > {output.done}
+        """
+
+
+rule filter_miniprot:
+    """Collapse raw miniprot genePreds for consensus (same de-dup as filter_augMP).
+
+    augMP can collapse a real multi-exon protein hit into a short local ORF
+    (softmasking / conflicting hints). Feeding the filtered miniprot models
+    themselves lets consensus keep those loci. Names are prefixed ``miniprot-``
+    so they are distinct from Augustus ``augMP-`` IDs. Not an alignment mode:
+    protein-space PSL from the converter is stored directly, no BLAT.
+    """
+    input:
+        raw_gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.gp",
+        raw_psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot.psl",
+    output:
+        gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_consensus.gp",
+        psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_consensus.psl",
+    wildcard_constraints:
+        genome = AUGMP_GENOME_WC
+    params:
+        max_per_locus=rcfg("augMP_filter_max_models_per_locus", 25),
+        structure_round=config.get("augMP_filter_structure_round_bp", 10),
+        single_round=config.get("augMP_filter_single_exon_round_bp", 50),
+        min_cov=rcfg("miniprot_consensus_min_coverage", 0.80),
+        min_id=rcfg("miniprot_consensus_min_identity", 0.80),
+    log:
+        f"{config['work_dir']}/logs/filter_miniprot/{{genome}}.log"
+    shell:
+        """
+        python -m cat.filter_augMP \
+            --in-gp {input.raw_gp} \
+            --in-psl {input.raw_psl} \
+            --out-gp {output.gp} \
+            --out-psl {output.psl} \
+            --max-models-per-locus {params.max_per_locus} \
+            --structure-round-bp {params.structure_round} \
+            --single-exon-round-bp {params.single_round} \
+            --min-coverage {params.min_cov} \
+            --min-identity {params.min_id} \
+            --name-prefix miniprot- > {log} 2>&1
+        """
+
+
+rule store_psl_metrics_miniprot:
+    """Store protein-space AlnCoverage/AlnIdentity for consensus miniprot models."""
+    input:
+        psl=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_consensus.psl",
+        gp=f"{config['work_dir']}/miniprot/{{genome}}_miniprot_consensus.gp",
+        db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
+        ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
+        prior_augmp=lambda w: (
+            f"{config['work_dir']}/databases/{w.genome}_augMP_psl_metrics.done"
+            if w.genome in AUGMP_GENOMES else f"{config['work_dir']}/.setup_done"
+        ),
+    output:
+        done=f"{config['work_dir']}/databases/{{genome}}_miniprot_psl_metrics.done"
+    wildcard_constraints:
+        genome = AUGMP_GENOME_WC
+    shell:
+        """
+        set -euo pipefail
+        python -m cat.store_psl_metrics \
+            --db-path {input.db_path} \
+            --psl {input.psl} \
+            --mode miniprot \
+            --ref-gp {input.ref_gp}
+        echo "stored_miniprot_psl_metrics" > {output.done}
         """
 
 rule generate_consensus:
