@@ -29,7 +29,10 @@ Stages (each keeps the best-scoring representative, so nothing real is lost):
      Distinct copies have distinct intron chains, so all copies survive.
   2. Single-exon models: dedup per locus (rounded coords), keep the best, subject
      to an optional coverage floor -- but a locus is never emptied.
-  3. Per-locus backstop cap: after de-dup, if a single overlap-merged locus still
+  3. Spanning chimeras: drop a model whose CDS overlaps two high-quality,
+     non-overlapping genes contained inside it (e.g. DDI2+RSC1A1). A large
+     gene with a nested intron ORF is kept.
+  4. Per-locus backstop cap: after de-dup, if a single overlap-merged locus still
      holds more than --max-models-per-locus structurally-distinct models (only
      happens on pathological regions), keep the top-N by score. Generous by
      default so genuine tandem arrays survive.
@@ -43,6 +46,7 @@ be the surviving representative of their locus.
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import sys
 from pathlib import Path
@@ -228,6 +232,93 @@ def _cap_cluster(cluster, max_per_locus):
     return sorted(cluster, key=lambda m: m.score, reverse=True)[:max_per_locus]
 
 
+def _cds_intervals(m):
+    out = []
+    for s, e in zip(m.exon_starts, m.exon_ends):
+        a, b = max(s, m.cds_start), min(e, m.cds_end)
+        if b > a:
+            out.append((a, b))
+    return out
+
+
+def _interval_overlap(a, b):
+    return sum(max(0, min(x1, y1) - max(x0, y0)) for x0, x1 in a for y0, y1 in b)
+
+
+def drop_spanning_chimeras(models, min_coverage=0.80, min_identity=0.80,
+                           min_cds=450, same_locus_frac=0.05, min_cds_frac=0.30):
+    """Drop a model that fuses two complete genes sitting inside it.
+
+    A container is chimeric when its CDS overlaps two high-quality, non-
+    overlapping contained models. A large gene with a nested intron ORF is
+    kept: that inner model does not overlap the outer CDS. Same-structure
+    pileups are ignored when a child shares both endpoints with the parent.
+    """
+    by_cs = collections.defaultdict(list)
+    for m in models:
+        by_cs[(m.chrom, m.strand)].append(m)
+    drop = set()
+    for group in by_cs.values():
+        group.sort(key=lambda m: (m.tx_start, m.tx_end))
+        starts = [m.tx_start for m in group]
+        cds_cache = {}
+        for i, a in enumerate(group):
+            if a.name in drop:
+                continue
+            a_span = a.tx_end - a.tx_start
+            if a_span <= 0:
+                continue
+            lo = bisect.bisect_left(starts, a.tx_start)
+            hi = bisect.bisect_right(starts, a.tx_end)
+            kids = []
+            for j in range(lo, hi):
+                if j == i:
+                    continue
+                b = group[j]
+                if b.name in drop or b.tx_end > a.tx_end:
+                    continue
+                if b.coverage < min_coverage or b.identity < min_identity:
+                    continue
+                if b.cds_len < min_cds:
+                    continue
+                # Near-duplicate of the container, not a second gene.
+                if (abs(b.tx_start - a.tx_start) <= same_locus_frac * a_span
+                        and abs(b.tx_end - a.tx_end) <= same_locus_frac * a_span):
+                    continue
+                kids.append(b)
+            if len(kids) < 2:
+                continue
+            if a.name not in cds_cache:
+                cds_cache[a.name] = _cds_intervals(a)
+            a_cds = cds_cache[a.name]
+            if not a_cds:
+                continue
+            covered = []
+            for b in kids:
+                if b.name not in cds_cache:
+                    cds_cache[b.name] = _cds_intervals(b)
+                b_cds = cds_cache[b.name]
+                if not b_cds:
+                    continue
+                ov = _interval_overlap(a_cds, b_cds)
+                if ov >= min_cds_frac * b.cds_len:
+                    covered.append(b)
+            covered.sort(key=lambda m: m.tx_start)
+            fused = False
+            for x, left in enumerate(covered):
+                for right in covered[x + 1:]:
+                    if right.tx_start >= left.tx_end:
+                        fused = True
+                        break
+                if fused:
+                    break
+            if fused:
+                drop.add(a.name)
+    if not drop:
+        return models
+    return [m for m in models if m.name not in drop]
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -255,6 +346,20 @@ def main():
                          "model of each locus is always kept) [0.0].")
     ap.add_argument("--disabled", action="store_true",
                     help="Pass-through: copy input to output without filtering.")
+    ap.add_argument("--name-prefix", default="",
+                    help="Prepend to kept model names in GP/PSL (e.g. miniprot-).")
+    ap.add_argument("--min-coverage", type=float, default=0.0,
+                    help="Drop models below this protein-space coverage before de-dup [0].")
+    ap.add_argument("--min-identity", type=float, default=0.0,
+                    help="Drop models below this protein-space identity before de-dup [0].")
+    ap.add_argument("--keep-spanning-chimeras", action="store_true",
+                    help="Do not drop models whose CDS fuses two contained genes.")
+    ap.add_argument("--chimera-min-coverage", type=float, default=0.80,
+                    help="Coverage floor for a contained gene when detecting "
+                         "spanning chimeras [0.80].")
+    ap.add_argument("--chimera-min-identity", type=float, default=0.80,
+                    help="Identity floor for a contained gene when detecting "
+                         "spanning chimeras [0.80].")
     args = ap.parse_args()
 
     args.out_gp.parent.mkdir(parents=True, exist_ok=True)
@@ -276,6 +381,17 @@ def main():
     metrics = parse_psl_metrics(args.in_psl)
     print(f"  loaded PSL metrics for {len(metrics):,} models", file=sys.stderr)
     assign_scores(models, metrics)
+    if args.min_coverage > 0 or args.min_identity > 0:
+        before_q = len(models)
+        models = [
+            m for m in models
+            if m.coverage >= args.min_coverage and m.identity >= args.min_identity
+        ]
+        print(
+            f"  quality floor cov>={args.min_coverage} id>={args.min_identity}: "
+            f"{before_q:,} -> {len(models):,}",
+            file=sys.stderr,
+        )
 
     multi = [m for m in models if m.exon_count > 1]
     single = [m for m in models if m.exon_count <= 1]
@@ -289,6 +405,17 @@ def main():
           f"(distinct loci)", file=sys.stderr)
 
     kept = kept_multi + kept_single
+    if not args.keep_spanning_chimeras:
+        before_chimera = len(kept)
+        kept = drop_spanning_chimeras(
+            kept,
+            min_coverage=args.chimera_min_coverage,
+            min_identity=args.chimera_min_identity,
+        )
+        if len(kept) < before_chimera:
+            print(f"  spanning chimeras: {before_chimera:,} -> {len(kept):,} "
+                  f"(dropped {before_chimera - len(kept):,} fusions of two genes)",
+                  file=sys.stderr)
     before_backstop = len(kept)
     kept = backstop_locus_cap(kept, args.max_models_per_locus)
     if len(kept) < before_backstop:
@@ -296,11 +423,17 @@ def main():
               f"{before_backstop:,} -> {len(kept):,}", file=sys.stderr)
 
     kept_names = {m.name for m in kept}
+    prefix = args.name_prefix or ""
     # Preserve original file order for reproducibility.
     with args.out_gp.open("w") as out:
         for m in models:
             if m.name in kept_names:
-                out.write(m.raw + "\n")
+                raw = m.raw
+                if prefix:
+                    cols = raw.split("\t")
+                    cols[0] = prefix + cols[0]
+                    raw = "\t".join(cols)
+                out.write(raw + "\n")
 
     if args.out_psl is not None:
         n_psl = 0
@@ -310,7 +443,11 @@ def main():
                     for line in fh:
                         f = line.rstrip("\n").split("\t")
                         if len(f) >= 10 and f[9] in kept_names:
-                            out.write(line)
+                            if prefix:
+                                f[9] = prefix + f[9]
+                                out.write("\t".join(f) + "\n")
+                            else:
+                                out.write(line)
                             n_psl += 1
         print(f"  wrote {n_psl:,} filtered PSL rows to {args.out_psl}", file=sys.stderr)
 
