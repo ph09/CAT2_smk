@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument(
         "--mode",
         required=True,
-        choices=["txTM", "transMap", "transMap_pairwise", "augMP"],
+        choices=["txTM", "transMap", "transMap_pairwise", "augMP", "miniprot"],
         help="Alignment mode whose mRNA metrics table should be updated",
     )
     ap.add_argument("--ref-gp", required=True, help="Reference GenePredExt for tx→gene mapping")
@@ -77,7 +77,10 @@ def main() -> None:
     psl_path = Path(args.psl)
     ref_gp_path = Path(args.ref_gp)
 
-    table = f"mRNA_{args.mode}_Metrics"
+    tables = [f"mRNA_{args.mode}_Metrics"]
+    if args.mode == "miniprot":
+        # No BLAT CDS evaluation; reuse protein-space coverage/identity.
+        tables.append(f"CDS_{args.mode}_Metrics")
 
     ref_name2 = _load_ref_name2(ref_gp_path)
 
@@ -99,7 +102,7 @@ def main() -> None:
     # downstream consensus already handles modes with no records.
     if not rows:
         print(f"WARNING: no PSL records for mode {args.mode}: {psl_path} "
-              f"(creating empty {table} table)", file=sys.stderr)
+              f"(creating empty {', '.join(tables)} table(s))", file=sys.stderr)
 
     # De-duplicate ids to keep temp table small.
     ids = sorted(set(ids))
@@ -114,37 +117,34 @@ def main() -> None:
             con.execute("PRAGMA journal_mode=WAL")
             cur = con.cursor()
 
-            # Ensure table exists with expected columns (matches current DB schema).
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {table} (
-                    AlignmentId  TEXT,
-                    GeneId       TEXT,
-                    TranscriptId TEXT,
-                    classifier   TEXT,
-                    value        TEXT
-                )
-                """
-            )
-            cur.execute(f"CREATE INDEX IF NOT EXISTS ix_{table}_AlignmentId ON {table}(AlignmentId)")
-
             cur.execute("DROP TABLE IF EXISTS _tmp_aln_ids")
             cur.execute("CREATE TEMP TABLE _tmp_aln_ids(id TEXT PRIMARY KEY)")
             cur.executemany("INSERT INTO _tmp_aln_ids(id) VALUES (?)", [(i,) for i in ids])
 
-            # Remove any existing PSL-derived coverage/identity rows for these AlignmentIds.
-            cur.execute(
-                f"""
-                DELETE FROM {table}
-                WHERE classifier IN ('AlnCoverage', 'AlnIdentity')
-                  AND AlignmentId IN (SELECT id FROM _tmp_aln_ids)
-                """
-            )
-
-            cur.executemany(
-                f"INSERT INTO {table} (AlignmentId, GeneId, TranscriptId, classifier, value) VALUES (?, ?, ?, ?, ?)",
-                rows,
-            )
+            for table in tables:
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        AlignmentId  TEXT,
+                        GeneId       TEXT,
+                        TranscriptId TEXT,
+                        classifier   TEXT,
+                        value        TEXT
+                    )
+                    """
+                )
+                cur.execute(f"CREATE INDEX IF NOT EXISTS ix_{table}_AlignmentId ON {table}(AlignmentId)")
+                cur.execute(
+                    f"""
+                    DELETE FROM {table}
+                    WHERE classifier IN ('AlnCoverage', 'AlnIdentity')
+                      AND AlignmentId IN (SELECT id FROM _tmp_aln_ids)
+                    """
+                )
+                cur.executemany(
+                    f"INSERT INTO {table} (AlignmentId, GeneId, TranscriptId, classifier, value) VALUES (?, ?, ?, ?, ?)",
+                    rows,
+                )
             con.commit()
             con.close()
             break
