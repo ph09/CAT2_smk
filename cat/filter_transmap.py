@@ -2,10 +2,11 @@ import argparse
 import collections
 import hashlib
 import json
-import os
-import tempfile
-import shutil
 import logging
+import os
+import shutil
+import sys
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 import pandas as pd
@@ -20,6 +21,12 @@ import tools.sqlInterface
 import tools.transcripts
 
 pd.options.mode.chained_assignment = None
+
+# Extra transMap placements of the same GRCh38 gene (AMY, TSPY, …). Kept only
+# when the extra locus looks like a real extra copy, not a retrocopy or remnant.
+EXTRA_COPY_MIN_COVERAGE = 0.85
+EXTRA_COPY_MIN_AA_FRAC = 0.85
+EXTRA_COPY_MAX_SPAN_FRAC = 2.5
 
 
 def run_filtering(tm_psl, ref_psl, tm_gp, db_path, psl_tgt, global_near_best, filter_overlapping_genes,
@@ -39,8 +46,8 @@ def run_filtering(tm_psl, ref_psl, tm_gp, db_path, psl_tgt, global_near_best, fi
     else:
         cleanup_temp = False
     
-    unfiltered = tools.psl.get_alignment_dict(tm_psl)
-    unfiltered_tx_dict = tools.transcripts.get_gene_pred_dict(tm_gp)
+    unfiltered = tools.psl.get_alignment_dict(tm_psl, make_unique=True)
+    unfiltered_tx_dict = unique_gene_pred_dict(tm_gp)
     ref_psl_dict = tools.psl.get_alignment_dict(ref_psl)
     size_filtered, num_too_long = ref_span(unfiltered, ref_psl_dict, max_span=max_ref_span)
     tmp_size_filtered = os.path.join(temp_dir, 'size_filtered.psl')
@@ -208,24 +215,32 @@ def run_filtering(tm_psl, ref_psl, tm_gp, db_path, psl_tgt, global_near_best, fi
     unfiltered_by_gene = tools.transcripts.group_transcripts_by_name2(putative_rescue_txs)
 
     rescued_txs = []
+    extra_copy_txs = []
     for gene_id, group in merged_collapse_filtered.groupby('gene_id'):
         assert len(set(group['#cluster'])) == 1
         tx_intervals = []
+        primaries = []
         for _, s in group.iterrows():
             tx_intervals.append(tools.intervals.ChromosomeInterval(s.chrom, s.txStart, s.txEnd, s.strand))
+            tx = unfiltered_tx_dict.get(s.gene)
+            if tx is not None:
+                primaries.append(tx)
         tx_intervals = tools.intervals.hull_of_intervals(tx_intervals)
         assert tx_intervals is not None
         gene_interval = tx_intervals[0]
         for tx in unfiltered_by_gene[gene_id]:
             if tx.interval.overlap(gene_interval):
                 rescued_txs.append(tx.name)
-    combined_txs = rescued_txs + list(merged_collapse_filtered.gene)
+            elif is_complete_extra_copy(tx, primaries, unfiltered.get(tx.name)):
+                extra_copy_txs.append(tx.name)
+    combined_txs = rescued_txs + extra_copy_txs + list(merged_collapse_filtered.gene)
     combined_tx_df = pd.DataFrame(combined_txs, columns=['AlignmentId'])
     combined_tx_df['score'] = [scores[x] for x in combined_tx_df.AlignmentId]
     combined_tx_df['TranscriptId'] = [tools.nameConversions.strip_alignment_numbers(x) for x in combined_tx_df.AlignmentId]
     combined_tx_df['GeneId'] = [transcript_gene_map[x] for x in combined_tx_df.TranscriptId]
-    combined_tx_df = combined_tx_df.sort_values('score')
-    combined_tx_df = combined_tx_df.groupby('TranscriptId', as_index=False).first()
+    combined_tx_df = pick_best_per_locus(combined_tx_df, unfiltered_tx_dict)
+    if extra_copy_txs:
+        metrics['Extra Copies'] = {'kept_alignments': len(extra_copy_txs)}
     # Ensure GeneId columns are the same type (string) before merging
     # This is especially important when merged_df is empty (common in transMap_pairwise)
     combined_tx_df['GeneId'] = combined_tx_df['GeneId'].astype(str)
@@ -256,7 +271,120 @@ def run_filtering(tm_psl, ref_psl, tm_gp, db_path, psl_tgt, global_near_best, fi
     if cleanup_temp and os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
 
-    return resolved_df.set_index(['GeneId', 'TranscriptId'])
+    return resolved_df.set_index(['GeneId', 'TranscriptId', 'AlignmentId'])
+
+def unique_gene_pred_dict(gp_file) -> dict:
+    """Number duplicate transMap genePred names the same way PSL ``make_unique`` does.
+
+    transMapPslToGenePred writes one row per mapped locus but keeps the
+    reference transcript ID, so a dict keyed by name would keep only the last
+    AMY1B extra and drop the rest.
+    """
+    counts = collections.Counter()
+    out = {}
+    for tx in tools.transcripts.gene_pred_iterator(gp_file):
+        numbered = f"{tx.name}-{counts[tx.name]}"
+        counts[tx.name] += 1
+        tx.name = numbered
+        out[numbered] = tx
+    return out
+
+
+def is_complete_extra_copy(tx, primary_txs, aln=None) -> bool:
+    """True when ``tx`` is a full extra locus of a gene, not a remnant or retrocopy.
+
+    transMap of AMY1B/TSPY1 lands on every tandem unit. The filter used to keep
+    only the best cluster per GRCh38 gene, which deletes those extra copies
+    before consensus. Require parent-like exons, CDS length, and genomic span
+    so GAPDH retrocopies and 7-exon AMY leftovers stay out.
+    """
+    if aln is not None and getattr(aln, "coverage", 1.0) < EXTRA_COPY_MIN_COVERAGE:
+        return False
+    if not primary_txs:
+        return False
+    prim_ex = max((getattr(p, "block_count", 0) or 0) for p in primary_txs)
+    prim_cds = max((getattr(p, "cds_size", 0) or 0) for p in primary_txs)
+    prim_span = max((p.stop - p.start) for p in primary_txs)
+    n_ex = getattr(tx, "block_count", 0) or 0
+    cds = getattr(tx, "cds_size", 0) or 0
+    span = tx.stop - tx.start
+    if prim_ex >= 3 and n_ex < 2:
+        return False
+    if prim_cds and cds < EXTRA_COPY_MIN_AA_FRAC * prim_cds:
+        return False
+    if prim_span and span > EXTRA_COPY_MAX_SPAN_FRAC * prim_span:
+        return False
+    return True
+
+
+def pick_best_per_locus(df: pd.DataFrame, tx_dict: dict) -> pd.DataFrame:
+    """One alignment per transcript per non-overlapping locus.
+
+    The old ``groupby(TranscriptId).first()`` forced 1:1 orthology and is what
+    dropped the inverted AMY1 copies after cluster filter had already removed
+    them from the primary set.
+    """
+    if df.empty:
+        return df
+    df = df.sort_values("score", ascending=False)
+    keep = []
+    placed: dict[str, list[tuple[str, int, int]]] = collections.defaultdict(list)
+    for row in df.itertuples(index=False):
+        tx = tx_dict.get(row.AlignmentId)
+        if tx is None:
+            keep.append(row)
+            continue
+        spans = placed[row.TranscriptId]
+        if any(
+            chrom == tx.chromosome and min(e, tx.stop) - max(s, tx.start) > 50
+            for chrom, s, e in spans
+        ):
+            continue
+        spans.append((tx.chromosome, tx.start, tx.stop))
+        keep.append(row)
+    return pd.DataFrame(keep, columns=df.columns)
+
+
+def ref_gp_spans(ref_gp) -> dict:
+    """Reference transcript name → genomic span (txEnd - txStart)."""
+    spans = {}
+    with open(ref_gp) as fh:
+        for line in fh:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 5:
+                continue
+            spans[p[0]] = int(p[4]) - int(p[3])
+    return spans
+
+
+def write_span_capped_gp(tm_gp, ref_gp, out_gp, max_frac=5.0):
+    """Drop genePred rows whose target span exceeds ``max_frac`` × the ref transcript.
+
+    Used on the unfiltered pairwise GP that consensus reads, so tandem-array
+    transMap fusions (TSPY 30×) never become consensus candidates. Extra copies
+    with a normal span (AMY) are kept.
+    """
+    ref_spans = ref_gp_spans(ref_gp)
+    kept = dropped = 0
+    examples = []
+    with open(tm_gp) as inf, open(out_gp, "w") as outf:
+        for line in inf:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 5:
+                outf.write(line)
+                continue
+            name = tools.nameConversions.strip_alignment_numbers(p[0])
+            span = int(p[4]) - int(p[3])
+            ref = ref_spans.get(name)
+            if ref and ref > 0 and span > max_frac * ref:
+                dropped += 1
+                if len(examples) < 8:
+                    examples.append(f"{p[0]} {span}bp vs {ref}bp")
+                continue
+            outf.write(line)
+            kept += 1
+    return {"kept": kept, "dropped": dropped, "examples": examples}
+
 
 def ref_span(aln_dict, ref_aln_dict, max_span=5):
     grouped = collections.defaultdict(list)
@@ -481,6 +609,23 @@ def main():
     """
     Main entry point for the transMap filtering script.
     """
+    if "--span-cap-only" in sys.argv:
+        cap = argparse.ArgumentParser(description="Drop genePred rows longer than N× the reference transcript.")
+        cap.add_argument("--span-cap-only", action="store_true")
+        cap.add_argument("--tm-gp", required=True)
+        cap.add_argument("--ref-gp", required=True)
+        cap.add_argument("--filtered-gp", required=True)
+        cap.add_argument("--max-ref-span", type=float, default=5)
+        cap.add_argument("--metrics-json", default=None)
+        args = cap.parse_args()
+        metrics = write_span_capped_gp(args.tm_gp, args.ref_gp, args.filtered_gp, args.max_ref_span)
+        if args.metrics_json:
+            tools.fileOps.ensure_file_dir(Path(args.metrics_json))
+            with open(args.metrics_json, "w") as outf:
+                json.dump(metrics, outf, indent=2)
+        logging.info("span-cap: kept %s dropped %s", metrics["kept"], metrics["dropped"])
+        return
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tm-psl", required=True, help="Input transMap PSL file.")
     parser.add_argument("--ref-psl", required=True, help="Reference 'fake' PSL file.")
