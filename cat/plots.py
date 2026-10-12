@@ -402,7 +402,7 @@ def tx_modes_plot(consensus_data, ordered_genomes, tx_mode_plot_tgt):
     ordered_groups = ['transMap', 'transMap+TM', 'transMap+TMR', 'transMap+TM+TMR',
                       'TM', 'TMR', 'TM+TMR',
                       'augTM', 'augTMR', 'augPB',
-                      'PB', 'strg', 'txTM', 'augMP', 'exRef', 'other']
+                      'PB', 'strg', 'txTM', 'augMP', 'miniprot', 'exRef', 'other']
     ordered_groups = OrderedDict([[frozenset(x.split('+')), x] for x in ordered_groups])
 
     def split_fn(s):
