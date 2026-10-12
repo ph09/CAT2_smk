@@ -56,6 +56,8 @@ def strip_alignment_numbers(aln_id):
     :param aln_id: name string
     :return: string
     """
+    if aln_id.startswith("miniprot-"):
+        aln_id = aln_id[len("miniprot-"):]
     return remove_alignment_number(remove_augustus_alignment_number(aln_id))
 
 
@@ -123,6 +125,16 @@ def aln_id_is_augustus_mp(aln_id):
     return aln_id.startswith('augMP-')
 
 
+def aln_id_is_miniprot(aln_id):
+    return str(aln_id).startswith('miniprot-')
+
+
+def aln_id_is_protein_mode(aln_id):
+    """augMP (Augustus-refined) or raw miniprot protein alignments."""
+    a = str(aln_id)
+    return a.startswith('augMP-') or a.startswith('miniprot-')
+
+
 def aln_id_is_txTM(aln_id):
     return aln_id.startswith('txTM-')
 
@@ -148,6 +160,8 @@ def alignment_type(aln_id):
         return 'augTMR'
     elif aln_id_is_augustus_mp(aln_id):
         return 'augMP'
+    elif aln_id_is_miniprot(aln_id):
+        return 'miniprot'
     elif aln_id_is_augustus_tm(aln_id):
         return 'augTM'
     elif aln_id_is_pb(aln_id):
