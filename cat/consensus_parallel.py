@@ -43,6 +43,7 @@ OVERLAP_RESOLUTION_SOURCE_PRIORITY = {
     'augTM_pairwise': 1,
     'augTMR_pairwise': 1,
     'augMP': 0,
+    'miniprot': 0,
 }
 
 # Reference gene biotypes eligible for non-PC rescue (transMap / txTM only).
@@ -59,11 +60,11 @@ def _is_ref_noncoding_gene(gene_id, gene_biotype_map):
 
 
 def _is_augmp_attrs(attrs):
-    if attrs.get('alignment_mode') == 'augMP':
+    if attrs.get('alignment_mode') in ('augMP', 'miniprot'):
         return True
     for key in ('alignment_id', 'source_transcript', 'transcript_id'):
         val = attrs.get(key)
-        if val and tools.nameConversions.aln_id_is_augustus_mp(str(val)):
+        if val and tools.nameConversions.aln_id_is_protein_mode(str(val)):
             return True
     return False
 
@@ -956,7 +957,7 @@ def normalize_alignment_id(aln_id, mode):
         base = re.sub(r'_cp\d*$', '', aln_id)
         base = re.sub(r'_\d+$', '', base)
         return base
-    elif mode in ['augTM', 'augTMR', 'augMP']:
+    elif mode in ['augTM', 'augTMR', 'augMP', 'miniprot']:
         # Strip the prefix
         if aln_id.startswith('augTM-'):
             return aln_id[6:]  # len('augTM-') = 6
@@ -964,6 +965,8 @@ def normalize_alignment_id(aln_id, mode):
             return aln_id[7:]  # len('augTMR-') = 7
         elif aln_id.startswith('augMP-'):
             return aln_id[6:]  # len('augMP-') = 6
+        elif aln_id.startswith('miniprot-'):
+            return aln_id[len('miniprot-'):]
         return aln_id
     elif mode in ('augPB', 'strg'):
         # Keep denovo IDs as-is
@@ -1014,6 +1017,10 @@ def identify_mode(aln_id, gp_file=None):
         return 'augPB'
     elif aln_id.startswith('strg-'):
         return 'strg'
+    elif aln_id.startswith('miniprot-'):
+        return 'miniprot'
+    elif aln_id.startswith('augMP-'):
+        return 'augMP'
     elif aln_id.startswith('augTMR-'):
         # Check if it's pairwise by looking at the file path
         if gp_file and 'augTMR_pairwise' in gp_file:
@@ -1189,6 +1196,10 @@ def generate_consensus(args):
             mode = 'augTM_pairwise'
         elif 'augTMR' in gp_file:
             mode = 'augTMR'
+        elif 'augMP' in gp_file:
+            mode = 'augMP'
+        elif 'miniprot' in gp_file:
+            mode = 'miniprot'
         elif 'augTM' in gp_file:
             mode = 'augTM'
         elif 'augPB' in gp_file:
@@ -1516,6 +1527,8 @@ def generate_consensus(args):
         
         eval_dfs = []
         for tx_mode in tx_modes_with_metrics:
+            if tx_mode == 'miniprot':
+                continue
             df = load_evaluations_from_db(args.db_path, tx_mode)
             df = df[df.index.isin(valid_aln_ids)]
             eval_dfs.append(df)
@@ -2299,7 +2312,7 @@ def process_chromosome(chrom, chrom_tx_ids, tx_dict, support_df, mrna_metrics_df
     # augMP transcripts often have no reference/attrs biotype annotation. If they have a CDS, treat them
     # as protein_coding so they are not excluded from the coding pool solely due to missing biotype.
     augmp_fixed_biotype = 0
-    augmp_mask = support_ref_tm_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_augustus_mp)
+    augmp_mask = support_ref_tm_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_protein_mode)
     for idx in support_ref_tm_df[augmp_mask].index:
         aln_id = support_ref_tm_df.at[idx, 'AlignmentId']
         tx_obj = tx_dict.get(aln_id)
@@ -2432,7 +2445,7 @@ def process_chromosome(chrom, chrom_tx_ids, tx_dict, support_df, mrna_metrics_df
     # protein). We deliberately keep those as NaN here — the score / fragment
     # filtering downstream will honestly mark them low-confidence — rather
     # than falsely promoting them to perfect 100 % metrics.
-    augmp_mask_now = coding_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_augustus_mp)
+    augmp_mask_now = coding_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_protein_mode)
     non_augmp_mask = ~augmp_mask_now
     augmp_na_before = 0
     if 'AlnCoverage_mRNA' in coding_df.columns:
@@ -2979,7 +2992,7 @@ def filter_augMP_by_coverage(
 
     augmp_aln_ids = {
         aln for aln, src in alignment_source_map.items()
-        if src == 'augMP' or tools.nameConversions.aln_id_is_augustus_mp(aln)
+        if src in ('augMP', 'miniprot') or tools.nameConversions.aln_id_is_protein_mode(aln)
     }
     if not augmp_aln_ids:
         return coding_df, non_coding_df
@@ -2990,14 +3003,14 @@ def filter_augMP_by_coverage(
         if len(df) == 0 or 'AlnCoverage_mRNA' not in df.columns:
             return df
         is_augmp = df['AlignmentId'].apply(
-            lambda aid: aid in augmp_aln_ids or tools.nameConversions.aln_id_is_augustus_mp(aid)
+            lambda aid: aid in augmp_aln_ids or tools.nameConversions.aln_id_is_protein_mode(aid)
         )
         if not is_augmp.any():
             return df
         cov = df['AlnCoverage_mRNA']
         has_anchor = df['AlignmentId'].apply(
             lambda aid: augMP_has_transmap_anchor(aid, transmap_anchor_ids)
-            if (aid in augmp_aln_ids or tools.nameConversions.aln_id_is_augustus_mp(aid))
+            if (aid in augmp_aln_ids or tools.nameConversions.aln_id_is_protein_mode(aid))
             else False
         )
         anchored_augmp = is_augmp & has_anchor
@@ -3152,7 +3165,7 @@ def select_consensus_with_cnv(scored_df, tx_dict, alignment_source_map, multi_lo
     aln_id_to_row = {}
     # Track source priority (lower is better): transMap=0, txTM=1, augTM=2, augMP=2, augPB=9
     source_priority = {'transMap': 0, 'transMap_pairwise': 0, 'txTM': 1,
-                      'augTM': 2, 'augTMR': 2, 'augMP': 2, 'augPB': 9, 'strg': 9}
+                      'augTM': 2, 'augTMR': 2, 'augMP': 2, 'miniprot': 2, 'augPB': 9, 'strg': 9}
     for idx, row in scored_df.iterrows():
         aln_id = row['AlignmentId']
         mode = alignment_source_map.get(aln_id, 'transMap')
@@ -3179,7 +3192,7 @@ def select_consensus_with_cnv(scored_df, tx_dict, alignment_source_map, multi_lo
             locus_alignment_ids = [aln_id]
             # Check if there are other sources at this locus (look at original_gene_id)
             # For now, just calculate score from this alignment's mode
-            if mode in ['txTM', 'transMap', 'augTM', 'augTMR', 'augMP']:
+            if mode in ['txTM', 'transMap', 'augTM', 'augTMR', 'augMP', 'miniprot']:
                 core_score = total_score  # This mode is a core source
             else:
                 core_score = 0  # augPB doesn't count for CNV threshold
@@ -4096,7 +4109,7 @@ def filter_gene_fragments(deduplicated_consensus, tx_dict, ref_gene_coords, metr
     
     for (source_gene, chrom, mode), tx_list in genes_by_source.items():
         # Skip augMP - user requested exemption
-        if mode == 'augMP':
+        if mode in ('augMP', 'miniprot'):
             continue
         
         # Skip denovo modes - they can have novel genes not in reference
@@ -4550,8 +4563,8 @@ def resolve_conflicting_source_genes(
             # overlap each other in the reference (collapsed paralog / array projections).
             _MODE_PRIORITY = [
                 'transMap', 'transMap_pairwise', 'txTM', 'augTM',
-                'augTM_pairwise', 'augMP', 'augPB', 'strg',
-            ]  # earlier = preferred; augMP last among projection modes
+                'augTM_pairwise', 'augMP', 'miniprot', 'augPB', 'strg',
+            ]  # earlier = preferred; protein modes last among projection modes
             def _mode_rank(modes_set):
                 if not modes_set:
                     return len(_MODE_PRIORITY)
@@ -4634,18 +4647,10 @@ def resolve_conflicting_source_genes(
                 is_readthrough_j = False
                 
                 if readthrough_gene_set:
-                    # First check if gene ID is in the readthrough set (from reference database)
+                    # Only ExtraTags readthrough_gene, not every hyphenated symbol.
+                    # SPECC1L-ADORA2A as a name must not shield a wrong locus winner.
                     is_readthrough_i = normalized_i in readthrough_gene_set
                     is_readthrough_j = normalized_j in readthrough_gene_set
-                
-                # Also check gene names - readthrough genes often have hyphenated names
-                # But only if not already identified by database
-                if not is_readthrough_i and not is_readthrough_j:
-                    name_i = tx_list_i[0][2].get('source_gene_common_name', '')
-                    name_j = tx_list_j[0][2].get('source_gene_common_name', '')
-                    # Readthrough genes like GENE1-GENE2 have hyphens (but not pseudogenes like GENE1P-GENE2P)
-                    is_readthrough_i = '-' in str(name_i) and 'P-' not in str(name_i) if name_i else False
-                    is_readthrough_j = '-' in str(name_j) and 'P-' not in str(name_j) if name_j else False
                 
                 # If one is a readthrough gene, skip conflict resolution - they should coexist
                 if is_readthrough_i or is_readthrough_j:
