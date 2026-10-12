@@ -120,6 +120,8 @@ def generate_consensus(args):
                 alignment_source_map[t.name] = 'augTM'
             elif 'augMP' in gp_file:
                 alignment_source_map[t.name] = 'augMP'
+            elif 'miniprot' in gp_file:
+                alignment_source_map[t.name] = 'miniprot'
             elif 'augPB' in gp_file:
                 alignment_source_map[t.name] = 'augPB'
             elif '_strg' in gp_file:
@@ -142,7 +144,7 @@ def generate_consensus(args):
     tm_eval_df = load_transmap_evals(args.db_path)
     # pd.set_option('max_columns', None)
     # Determine which modes are available for this genome
-    txms = ['transMap', 'augTM', 'augTMR', 'augMP', 'txTM']
+    txms = ['transMap', 'augTM', 'augTMR', 'augMP', 'miniprot', 'txTM']
     
     # Check if augPB data exists for this genome by looking for augPB transcripts
     has_augpb = any(_is_denovo(tx_id) for tx_id in tx_dict.keys())
@@ -153,10 +155,13 @@ def generate_consensus(args):
     has_augmp = any(tx_id.startswith('augMP-') for tx_id in tx_dict.keys())
     if not has_augmp and 'augMP' in txms:
         txms.remove('augMP')
+    has_miniprot = any(str(tx_id).startswith('miniprot-') for tx_id in tx_dict.keys())
+    if not has_miniprot and 'miniprot' in txms:
+        txms.remove('miniprot')
     
-    tx_modes = [x for x in txms if x in ['transMap', 'augTM', 'augTMR', 'augMP', 'txTM', 'augPB', 'strg']]
-    # denovo and augMP don't have metrics tables, so exclude them from metrics loading
-    tx_modes_with_metrics = [x for x in tx_modes if x not in ['augPB', 'strg', 'augMP']]
+    tx_modes = [x for x in txms if x in ['transMap', 'augTM', 'augTMR', 'augMP', 'miniprot', 'txTM', 'augPB', 'strg']]
+    # denovo modes don't have metrics tables; protein modes use PSL-derived tables.
+    tx_modes_with_metrics = [x for x in tx_modes if x not in ['augPB', 'strg']]
     # Get tm df but don't drop AlignmentId yet
     tm_eval = tools.sqlInterface.load_alignment_evaluation(args.db_path)
     tm_filter_eval = tools.sqlInterface.load_filter_evaluation(args.db_path)
@@ -608,7 +613,7 @@ def combine_and_filter_dfs(tx_dict, support_df, mrna_metrics_df, cds_metrics_df,
     # which can leave TranscriptBiotype/GeneBiotype null and cause them to be treated as non-coding.
     # If the projected model has a CDS, treat it as protein_coding for filtering/scoring.
     augmp_fixed = 0
-    augmp_mask = support_ref_tm_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_augustus_mp)
+    augmp_mask = support_ref_tm_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_protein_mode)
     for idx in support_ref_tm_df[augmp_mask].index:
         aln_id = support_ref_tm_df.at[idx, 'AlignmentId']
         if aln_id in tx_dict:
@@ -785,7 +790,7 @@ def combine_and_filter_dfs(tx_dict, support_df, mrna_metrics_df, cds_metrics_df,
     # augMP does not have evaluation/metrics rows in the DB, so support columns can be 0/NaN even
     # for real loci. Allow augMP coding transcripts through this filter; downstream conflict
     # resolution + scoring still determine whether they survive in the final gene set.
-    augmp_non_txTM = non_txTM_coding_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_augustus_mp)
+    augmp_non_txTM = non_txTM_coding_df['AlignmentId'].apply(tools.nameConversions.aln_id_is_protein_mode)
     filt = filt | augmp_non_txTM
     non_txTM_coding_df = non_txTM_coding_df[filt]
     
@@ -1682,9 +1687,20 @@ def write_consensus_gff3(consensus_gene_dict, consensus_gff3):
 
     def find_feature_support(attrs, feature, i):
         try:
-            vals = list(map(bool, attrs[feature].split(',')))
+            raw = attrs[feature]
         except KeyError:
             return 'N/A'
+        # gp_info columns that are all-empty become float NaN after a pandas read.
+        if not isinstance(raw, str):
+            try:
+                if raw is None or pd.isna(raw):
+                    return 'N/A'
+            except (TypeError, ValueError):
+                return 'N/A'
+            raw = str(raw)
+        if not raw or raw.lower() in ('nan', 'none'):
+            return 'N/A'
+        vals = list(map(bool, raw.split(',')))
         return vals[i] if i < len(vals) else False
 
     def get_gene_name(attrs):
