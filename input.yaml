@@ -347,6 +347,11 @@ slurm:
       mem:   "128G"
       cpus:  32
       time:  "12:00:00"
+    protein_refine:
+      mem:   "64G"
+      cpus:  4
+      time:  "12:00:00"
+      timeout_hours: 14
     annotate_novel_genes:
       mem:   "32G"
       cpus:  16
