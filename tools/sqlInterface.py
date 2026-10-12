@@ -67,6 +67,11 @@ class MrnaAugMpEval(EvaluationColumns, Base):
     """Table for evaluations of mRNA alignments of transcripts derived from AugustusMP"""
     __tablename__ = 'mRNA_augMP_Evaluation'
 
+
+class MrnaMiniprotEval(EvaluationColumns, Base):
+    """Placeholder evaluation table for raw miniprot models (no BLAT evaluate step)."""
+    __tablename__ = 'mRNA_miniprot_Evaluation'
+
 class MrnaTxTmEval(EvaluationColumns, Base):
     """Table for evaluations of mRNA alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
     __tablename__ = 'mRNA_txTM_Evaluation'
@@ -89,6 +94,11 @@ class CdsAugTmrEval(EvaluationColumns, Base):
 class CdsAugMpEval(EvaluationColumns, Base):
     """Table for evaluations of CDS alignments of transcripts derived from AugustusMP"""
     __tablename__ = 'CDS_augMP_Evaluation'
+
+
+class CdsMiniprotEval(EvaluationColumns, Base):
+    """Placeholder evaluation table for raw miniprot models (no BLAT evaluate step)."""
+    __tablename__ = 'CDS_miniprot_Evaluation'
 
 class CdsTxTmEval(EvaluationColumns, Base):
     """Table for evaluations of CDS alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
@@ -175,6 +185,11 @@ class MrnaAugMpMetrics(MetricsColumns, Base):
     """Table for evaluations of mRNA alignments of transcripts derived from AugustusMP"""
     __tablename__ = 'mRNA_augMP_Metrics'
 
+
+class MrnaMiniprotMetrics(MetricsColumns, Base):
+    """Table for protein-space coverage/identity of raw miniprot consensus models."""
+    __tablename__ = 'mRNA_miniprot_Metrics'
+
 class MrnaTxTmMetrics(MetricsColumns, Base):
     """Table for evaluations of mRNA alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
     __tablename__ = 'mRNA_txTM_Metrics'
@@ -212,6 +227,11 @@ class CdsAugTmrPairwiseMetrics(MetricsColumns, Base):
 class CdsAugMpMetrics(MetricsColumns, Base):
     """Table for evaluations of CDS alignments of transcripts derived from AugustusMP"""
     __tablename__ = 'CDS_augMP_Metrics'
+
+
+class CdsMiniprotMetrics(MetricsColumns, Base):
+    """Table for protein-space coverage/identity of raw miniprot consensus models."""
+    __tablename__ = 'CDS_miniprot_Metrics'
 
 class CdsTxTmMetrics(MetricsColumns, Base):
     """Table for evaluations of CDS alignments of transcripts derived from txTM (in-house transcript-level transMap; formerly the external Liftoff tool)"""
@@ -279,6 +299,7 @@ def start_session(db_path):
 tables = {'CDS': {'augTM': {'metrics': CdsAugTmMetrics, 'evaluation': CdsAugTmEval},
                   'augTMR': {'metrics': CdsAugTmrMetrics, 'evaluation': CdsAugTmrEval},
                   'augMP': {'metrics': CdsAugMpMetrics, 'evaluation': CdsAugMpEval},
+                  'miniprot': {'metrics': CdsMiniprotMetrics, 'evaluation': CdsMiniprotEval},
                   'transMap': {'metrics': CdsTmMetrics, 'evaluation': CdsTmEval},
                   'transMap_pairwise': {'metrics': CdsTmPairwiseMetrics, 'evaluation': CdsTmEval},
                   'augTM_pairwise': {'metrics': CdsAugTmPairwiseMetrics, 'evaluation': CdsAugTmEval},
@@ -287,6 +308,7 @@ tables = {'CDS': {'augTM': {'metrics': CdsAugTmMetrics, 'evaluation': CdsAugTmEv
           'mRNA': {'augTM': {'metrics': MrnaAugTmMetrics, 'evaluation': MrnaAugTmEval},
                    'augTMR': {'metrics': MrnaAugTmrMetrics, 'evaluation': MrnaAugTmrEval},
                    'augMP': {'metrics': MrnaAugMpMetrics, 'evaluation': MrnaAugMpEval},
+                   'miniprot': {'metrics': MrnaMiniprotMetrics, 'evaluation': MrnaMiniprotEval},
                    'transMap': {'metrics': MrnaTmMetrics, 'evaluation': MrnaTmEval},
                    'transMap_pairwise': {'metrics': MrnaTmPairwiseMetrics, 'evaluation': MrnaTmEval},
                    'augTM_pairwise': {'metrics': MrnaAugTmPairwiseMetrics, 'evaluation': MrnaAugTmEval},
