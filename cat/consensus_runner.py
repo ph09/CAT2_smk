@@ -649,7 +649,7 @@ def normalize_alignment_id(aln_id, mode):
         base = re.sub(r'_cp\d*$', '', aln_id)
         base = re.sub(r'_\d+$', '', base)
         return base
-    elif mode in ['augTM', 'augTM_pairwise', 'augTMR', 'augTMR_pairwise', 'augMP']:
+    elif mode in ['augTM', 'augTM_pairwise', 'augTMR', 'augTMR_pairwise', 'augMP', 'miniprot']:
         # Strip the prefix
         if aln_id.startswith('augTM-'):
             return aln_id[6:]  # len('augTM-') = 6
@@ -657,6 +657,8 @@ def normalize_alignment_id(aln_id, mode):
             return aln_id[7:]  # len('augTMR-') = 7
         elif aln_id.startswith('augMP-'):
             return aln_id[6:]  # len('augMP-') = 6
+        elif aln_id.startswith('miniprot-'):
+            return aln_id[len('miniprot-'):]
         return aln_id
     elif mode == 'augPB':
         # Keep augPB IDs as-is for now
@@ -1094,7 +1096,7 @@ def reclassify_protein_only_novel(final_consensus, tx_dict, ref_df, metrics, gen
 
     orphan_idx = []
     for i, (aln_id, attrs) in enumerate(final_consensus):
-        if attrs.get('alignment_mode') != 'augMP' and not nc.aln_id_is_augustus_mp(str(aln_id)):
+        if attrs.get('alignment_mode') not in ('augMP', 'miniprot') and not nc.aln_id_is_protein_mode(str(aln_id)):
             continue
         if attrs.get('transcript_class') in ('fragment', 'processed_pseudogene'):
             continue
@@ -1273,8 +1275,14 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
         ref_tx_ids = set(base)
         gid = ref_df['GeneId'] if 'GeneId' in ref_df.columns else base
         gbt = ref_df['GeneBiotype'] if 'GeneBiotype' in ref_df.columns else None
-        for b, g, bt in zip(base, gid, (gbt if gbt is not None else [None] * len(base))):
-            tx_to_gene[b] = (g, bt)
+        gnm = ref_df['GeneName'] if 'GeneName' in ref_df.columns else None
+        none_bt = [None] * len(base)
+        for b, g, bt, nm in zip(
+            base, gid,
+            (gbt if gbt is not None else none_bt),
+            (gnm if gnm is not None else none_bt),
+        ):
+            tx_to_gene[b] = (g, bt, nm)
 
     cov_map = {}
     if mrna_metrics_df is not None and 'AlignmentId' in getattr(mrna_metrics_df, 'columns', []):
@@ -1332,7 +1340,7 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
         if aln_id in selected_ids:
             continue
         # augMP (protein evidence) or augPB (IsoSeq denovo): both carry a real ORF.
-        if not (nc.aln_id_is_augustus_mp(str(aln_id)) or nc.aln_id_is_pb(str(aln_id))):
+        if not (nc.aln_id_is_protein_mode(str(aln_id)) or nc.aln_id_is_pb(str(aln_id))):
             continue
         if tx_obj is None or getattr(tx_obj, 'cds_size', 0) <= 0:
             continue
@@ -1406,14 +1414,17 @@ def rescue_augMP_at_empty_loci(final_consensus, tx_dict, ref_df, metrics, genome
             'augMP_recovered': 'True',
         }
         if base in ref_tx_ids:
-            g, bt = tx_to_gene.get(base, (base, 'protein_coding'))
+            g, bt, nm = tx_to_gene.get(base, (base, 'protein_coding', None))
             coding = (bt or 'protein_coding') == 'protein_coding'
             bt_out = 'protein_coding' if coding else (bt or 'unknown_likely_coding')
             attrs['gene_biotype'] = bt_out
             attrs['transcript_biotype'] = bt_out
             attrs['source_gene'] = g
             attrs['source_gene_biotype'] = bt or 'protein_coding'
-            attrs['source_gene_common_name'] = None
+            if nm is None or pd.isna(nm) or str(nm).strip() in ('', 'N/A', 'nan', 'None'):
+                attrs['source_gene_common_name'] = None
+            else:
+                attrs['source_gene_common_name'] = str(nm)
             attrs['transcript_class'] = 'ortholog'
             n_orth += 1
         else:
@@ -1509,7 +1520,7 @@ def rescue_expressed_noncoding_to_pc(final_consensus, tx_dict, metrics,
         import bisect as _bis
         raw = collections.defaultdict(list)
         for aid, tx in tx_dict.items():
-            if not nc.aln_id_is_augustus_mp(str(aid)):
+            if not nc.aln_id_is_protein_mode(str(aid)):
                 continue
             ci = getattr(tx, 'coding_interval', None)
             if ci is None or ci.start is None or ci.stop is None or ci.stop <= ci.start:
