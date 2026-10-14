@@ -187,6 +187,16 @@ else:
 if not PROTEIN_FASTA:
     PROTEIN_FASTA = f"{config['work_dir']}/protein_db/protein_db.fa"
 
+# Per-genome override: `protein_fasta_by_genome: {genome: fasta}`. Lets a clade
+# poorly covered by the shared set (e.g. lemurs vs a haplorhine-heavy UniProt
+# set) get extra close-relative proteins without changing -- and so without
+# re-running miniprot for -- every other genome.
+_PROTEIN_FASTA_BY_GENOME = config.get("protein_fasta_by_genome") or {}
+
+
+def protein_fasta_for(genome):
+    return _PROTEIN_FASTA_BY_GENOME.get(genome, PROTEIN_FASTA)
+
 # Pipeline modes and constraints
 VALID_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "miniprot", "txTM", "augPB", "strg"]
 VALID_ALIGNMENT_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM"]
@@ -356,7 +366,7 @@ def protein_refine_inputs(wildcards):
         "genome_fa": f"{wd}/genome_files/{g}.fa",
         "ref_gp": f"{wd}/reference/{REF_GENOME}.gp",
         "ref_gp_attrs": f"{wd}/reference/{REF_GENOME}.gp_attrs",
-        "query_fa": PROTEIN_FASTA,
+        "query_fa": protein_fasta_for(g),
     }
     if PROTEIN_REFINE and g in AUGMP_GENOMES:
         ins["paf"] = f"{wd}/miniprot/{g}_miniprot.paf"
@@ -2734,7 +2744,7 @@ rule run_miniprot:
         genome_fasta=f"{config['work_dir']}/genome_files/{{genome}}.fa",
         genome_index=f"{config['work_dir']}/genome_files/{{genome}}.mpi",
         chrom_sizes=f"{config['work_dir']}/genome_files/{{genome}}.chrom.sizes",
-        protein_ref=PROTEIN_FASTA,
+        protein_ref=lambda wc: protein_fasta_for(wc.genome),
         minisplice_model=config["minisplice_model"],
         minisplice_calibration=config["minisplice_calibration"]
     output:
@@ -4659,6 +4669,7 @@ rule annotate_novel_genes:
         ref_gtf         = WORK_DIR / f"reference/{REF_GENOME}.gtf",
         ref_fasta       = WORK_DIR / f"genome_files/{REF_GENOME}.fa",
         ref_gp_attrs    = WORK_DIR / f"reference/{REF_GENOME}.gp_attrs",
+        evidence_fa     = lambda wc: protein_fasta_for(wc.genome),
     output:
         gff3    = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_novel_annotated.gff3",
         gp_info = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_novel_annotated.gp_info",
@@ -4720,6 +4731,7 @@ python -m cat.annotate_novel_genes \\
     --evalue                  {novel_evalue} \\
     --min-identity            {novel_min_id} \\
     --min-query-cover         {novel_min_qcov} \\
+    --evidence-protein-fasta  {input.evidence_fa} \\
     2>&1 | tee -a {log[0]}
 
 echo "Novel gene annotation complete for {genome}"
