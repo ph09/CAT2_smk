@@ -58,7 +58,8 @@ def load_gp_structure(gp_path):
 
 
 def classify_novel_biotypes(gp_info_df, gene_to_txs, gene_descriptions, tx_novel_class,
-                            gp_structure, drop_gene_ids=None):
+                            gp_structure, drop_gene_ids=None, tx_evidence=None,
+                            tx_intact=None):
     """Apply call_miniprot_novel now that DIAMOND has labeled paralog vs lineage.
 
     Returns (tx_biotype, tx_call, gene_biotype) dicts. Projected protein_coding
@@ -67,6 +68,7 @@ def classify_novel_biotypes(gp_info_df, gene_to_txs, gene_descriptions, tx_novel
     CNV vs dispersed hit).
     """
     drop_gene_ids = drop_gene_ids or set()
+    tx_intact = tx_intact or {}
     proj_chroms = collections.defaultdict(set)
     proj_exons = collections.defaultdict(int)
     proj_aa = collections.defaultdict(int)
@@ -126,6 +128,13 @@ def classify_novel_biotypes(gp_info_df, gene_to_txs, gene_descriptions, tx_novel
                 tx_call[tx_id] = f'refine_{refine_call}'
             continue
         ncl = tx_novel_class.get(tx_list[0], '')
+        # Best close-relative evidence among this gene's intact isoforms.
+        ev = None
+        if tx_evidence is not None:
+            for tx_id in tx_list:
+                hit = tx_evidence.get(tx_id)
+                if hit and tx_intact.get(tx_id) and (ev is None or hit[0] > ev[0]):
+                    ev = hit
         parent = parent_symbol_from_description(gene_descriptions.get(gene_id, ''))
         parent_present = bool(parent) and parent in proj_chroms
         same_chrom = bool(parent) and bool(chroms & proj_chroms.get(parent, set()))
@@ -138,6 +147,10 @@ def classify_novel_biotypes(gp_info_df, gene_to_txs, gene_descriptions, tx_novel
             same_chrom_as_parent=same_chrom if parent_present else None,
             parent_n_exons=proj_exons.get(parent, 0) if parent_present else None,
             parent_cds_aa=proj_aa.get(parent, 0) if parent_present else None,
+            evidence_pid=ev[0] if ev else None,
+            evidence_qcov=ev[1] if ev else None,
+            evidence_scov=ev[2] if ev else None,
+            peptide_intact=bool(ev),
         )
         gene_biotype[gene_id] = bt
         reasons[reason] += 1
@@ -310,6 +323,53 @@ def parse_diamond_hits(diamond_tsv):
 
     logger.info(f"Parsed {len(hits)} best hits from DIAMOND output")
     return hits
+
+
+def best_evidence_hits(query_fasta, evidence_fasta, tmpdir, threads, evalue):
+    """Best hit per query against the genome's protein DB, with subject coverage.
+
+    Returns transcript_id -> (pident, qcov, scov, sseqid). Used for the
+    close-relative rule in call_miniprot_novel: a full-length, high-identity
+    match to a same-clade protein the human reference lacks.
+    """
+    db = str(Path(tmpdir) / 'evidence_proteins')
+    build_diamond_db(evidence_fasta, db, threads)
+    out = Path(tmpdir) / 'evidence_hits.tsv'
+    cmd = [
+        'diamond', 'blastp',
+        '--query', str(query_fasta), '--db', db, '--out', str(out),
+        '--outfmt', '6', 'qseqid', 'sseqid', 'pident', 'qcovhsp', 'scovhsp', 'bitscore',
+        '--threads', str(threads), '--evalue', str(evalue),
+        '--max-target-seqs', '5', '--sensitive', '--quiet',
+    ]
+    logger.info(f"Running DIAMOND blastp vs evidence proteins {evidence_fasta}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"DIAMOND blastp (evidence) failed:\n{result.stderr}")
+    best = {}
+    if out.exists():
+        with open(out) as fh:
+            for line in fh:
+                q, sid, pid, qcov, scov, bits = line.rstrip('\n').split('\t')
+                rec = (float(bits), float(pid), float(qcov), float(scov), sid)
+                if q not in best or rec[0] > best[q][0]:
+                    best[q] = rec
+    logger.info(f"Evidence hits for {len(best)} novel transcripts")
+    return {q: (r[1], r[2], r[3], r[4]) for q, r in best.items()}
+
+
+def intact_peptides(consensus_protein_fasta, tx_ids):
+    """transcript_id -> True when the peptide has no internal stop."""
+    seqs = collections.defaultdict(list)
+    cur = None
+    with open(consensus_protein_fasta) as fh:
+        for line in fh:
+            if line.startswith('>'):
+                cur = line[1:].split()[0]
+                cur = cur if cur in tx_ids else None
+            elif cur:
+                seqs[cur].append(line.strip())
+    return {t: '*' not in ''.join(v).rstrip('*') for t, v in seqs.items()}
 
 
 # ── Novel protein extraction ──────────────────────────────────────────────────
@@ -642,6 +702,12 @@ def main():
                              'reference homolog) are never capped. 0 disables [0].')
 
     # DIAMOND parameters (permissive defaults)
+    parser.add_argument('--evidence-protein-fasta', default=None,
+                        help='Protein DB used for this genome (e.g. the miniprot '
+                             'query set). Enables the close-relative rule: novel '
+                             'genes with no reference homolog become protein_coding '
+                             'when intact and >=90%% identical over >=90%% of a '
+                             'protein here.')
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--evalue', type=float, default=1e-3,
                         help='E-value cutoff for DIAMOND blastp (default: 1e-3).')
@@ -808,10 +874,20 @@ def main():
                 f"dropped {len(drop_gene_ids)} novel paralog genes "
                 f"({len(drop_tx_ids)} transcripts)")
 
+        tx_evidence = None
+        tx_intact = None
+        if args.evidence_protein_fasta:
+            tx_evidence = best_evidence_hits(
+                novel_prot_fasta, args.evidence_protein_fasta, tmpdir,
+                args.threads, args.evalue,
+            )
+            tx_intact = intact_peptides(args.consensus_protein_fasta, novel_tx_ids)
+
         gp_structure = load_gp_structure(args.consensus_gp)
         tx_biotype, tx_call, gene_biotype = classify_novel_biotypes(
             gp_info_df, gene_to_txs, gene_descriptions, tx_novel_class,
             gp_structure, drop_gene_ids=drop_gene_ids,
+            tx_evidence=tx_evidence, tx_intact=tx_intact,
         )
 
         # Step 7: update gp_info (dropping capped copies)
