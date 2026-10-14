@@ -35,6 +35,7 @@ import pandas as pd
 
 from cat.convert_miniprot_to_genepred import (
     _exon_frames,
+    paf_identity,
     parse_cigar_to_exons,
     parse_paf_row,
 )
@@ -687,11 +688,13 @@ def iter_paf_hits(paf_path: str, query_symbols: dict[str, str], with_exons: bool
             cg = rec["tags"].get("cg", "")
             if not cg:
                 continue
-            exons, matched_aa, aligned_aa, _fs = parse_cigar_to_exons(cg, rec["t_start"])
+            exons, _matched_aa, aligned_aa, _fs = parse_cigar_to_exons(
+                cg, rec["t_start"], rec["t_end"], rec["strand"]
+            )
             if not exons:
                 continue
             qcov = aligned_aa / qlen
-            pid = matched_aa / aligned_aa if aligned_aa else 0.0
+            pid = paf_identity(rec)
             if qcov < MIN_HIT_QCOV or pid < MIN_HIT_PID:
                 continue
             sym = symbol_for_query(rec["q_name"], query_symbols)
@@ -1717,8 +1720,22 @@ def place_rescues(
                     ) or not orf_intact({"cds_size": rebuilt.cds_size, "info": {}}, prot):
                         return
                     tx = rebuilt
-        elif not is_complete_copy(n_ex, aa, h.symbol, ref_struct, require_exons=False):
-            return
+        else:
+            if not is_complete_copy(n_ex, aa, h.symbol, ref_struct, require_exons=False):
+                return
+            # A rescue is a new protein-coding gene, so its CDS must translate
+            # without internal stops (Sec recoded). A missing start is allowed,
+            # as in peptide_qc. Rejecting here lets the symbol's next candidate
+            # hit be tried.
+            if seq_dict and tx.chromosome in seq_dict:
+                try:
+                    prot = protein_from_transcript(
+                        tx, seq_dict, seleno=h.symbol in (seleno_symbols or ())
+                    )
+                except (KeyError, AssertionError, ValueError, RuntimeError, TypeError):
+                    prot = None
+                if prot is not None and "*" in prot.rstrip("*"):
+                    return
         segs = _coding_segments(tx)
         if any(
             rescue_blocked_by_named(segs, tx.cds_size, t_segs, t_cds)
