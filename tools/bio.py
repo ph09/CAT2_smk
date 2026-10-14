@@ -63,6 +63,11 @@ class FastaDict:
     def keys(self):
         return list(self._fasta.references)
 
+    def get(self, chrom, default=None):
+        if chrom not in self:
+            return default
+        return self[chrom]
+
     def close(self):
         self._fasta.close()
 
