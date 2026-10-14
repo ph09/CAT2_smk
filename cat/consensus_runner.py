@@ -2452,6 +2452,15 @@ def generate_consensus(args):
     logger.info("\n" + "="*80)
     logger.info("STEP 7: Writing Output Files")
     logger.info("="*80)
+    from cat.peptide_qc import drop_clearly_broken_coding
+    final_consensus, n_broken = drop_clearly_broken_coding(
+        final_consensus, tx_dict, args.fasta
+    )
+    if n_broken:
+        logger.info(
+            "Dropped %s coding transcripts whose translation has ≥3 internal stops",
+            n_broken,
+        )
     logger.info(f"Writing consensus genePred to {args.consensus_gp}")
     consensus_gene_dict = write_consensus_gps(args.consensus_gp, args.consensus_gp_info,
                                               final_consensus, tx_dict, args.genome)
