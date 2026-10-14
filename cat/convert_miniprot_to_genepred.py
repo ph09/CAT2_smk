@@ -42,24 +42,29 @@ def _parse_tags(tag_fields: Iterable[str]) -> dict:
 
 
 def parse_cigar_to_exons(
-    cg: str, t_start: int,
+    cg: str, t_start: int, t_end: int | None = None, strand: str = '+',
 ) -> Tuple[List[Tuple[int, int]], int, int, int]:
     """Walk a miniprot ``cg:Z:`` CIGAR and return:
 
-    * ``exons``      -- list of ``(genomic_start, genomic_end)`` half-open intervals.
-    * ``matched_aa`` -- sum of ``M`` operations (true aa-aa matches in BLOSUM space).
-    * ``aligned_aa`` -- ``M + I + U + V`` (aa positions consumed by alignment, the
-                       denominator for "fraction-of-query aligned" identity).
-    * ``frameshifts``-- count of ``F`` / ``G`` ops in the alignment (each one is a
-                       1-bp insertion or deletion in the target).
+    * ``exons``      -- ``(genomic_start, genomic_end)`` half-open CDS blocks,
+                       ascending in genome order.
+    * ``matched_aa`` -- sum of ``M`` operations: aligned codons, identical or
+                       not. For sequence identity use :func:`paf_identity`.
+    * ``aligned_aa`` -- ``M + I + G + U + V`` (aa positions consumed by alignment,
+                       the denominator for "fraction-of-query aligned" identity).
+    * ``frameshifts``-- count of ``F`` / ``G`` ops in the alignment.
 
-    Exon boundaries are opened/closed at ``N`` / ``U`` / ``V`` intron operations.
-    For simplicity, the 1–2 bp of a split codon spanning a U/V intron is folded
-    into the intron span; Augustus refines exon boundaries downstream anyway.
+    miniprot ops (README): ``M``/``D`` consume n codons (3n nt); ``F``
+    consumes n nt; ``G`` consumes n nt and one residue; ``N``/``U``/``V`` are
+    phase-0/1/2 introns whose length n includes the split codon -- U keeps
+    1 nt before the intron and 2 after, V keeps 2 before and 1 after. Ops run
+    in protein order, so on the minus strand they walk back from ``t_end``.
+    Without the split-codon bases or with ``D`` counted as 1 nt, the blocks
+    leave frame and translate with stops.
     """
-    exons: List[Tuple[int, int]] = []
-    cur_start = t_start
-    t_pos = t_start
+    blocks: List[Tuple[int, int]] = []
+    cur = 0
+    pos = 0  # offset from the protein N-terminus end of the alignment
     matched_aa = 0
     aligned_aa = 0
     frameshifts = 0
@@ -67,30 +72,49 @@ def parse_cigar_to_exons(
     for n_str, op in CIGAR_OP_RE.findall(cg):
         n = int(n_str)
         if op == 'M':
-            t_pos += 3 * n
+            pos += 3 * n
             matched_aa += n
             aligned_aa += n
         elif op == 'I':
             aligned_aa += n
         elif op == 'D':
-            t_pos += n
-        elif op in ('N', 'U', 'V'):
-            if t_pos > cur_start:
-                exons.append((cur_start, t_pos))
-            t_pos += n
-            cur_start = t_pos
-            if op in ('U', 'V'):
-                aligned_aa += 1
+            pos += 3 * n
+        elif op == 'N':
+            if pos > cur:
+                blocks.append((cur, pos))
+            pos += n
+            cur = pos
+        elif op in ('U', 'V'):
+            before = 1 if op == 'U' else 2
+            blocks.append((cur, pos + before))
+            pos += n
+            cur = pos - (3 - before)
+            aligned_aa += 1
         elif op == 'F':
-            t_pos += 1
+            pos += n
             frameshifts += 1
         elif op == 'G':
-            t_pos -= 1
+            pos += n
+            aligned_aa += 1
             frameshifts += 1
 
-    if t_pos > cur_start:
-        exons.append((cur_start, t_pos))
+    if pos > cur:
+        blocks.append((cur, pos))
+    if strand == '-':
+        end = t_end if t_end is not None else t_start + pos
+        exons = sorted((end - b, end - a) for a, b in blocks)
+    else:
+        exons = [(t_start + a, t_start + b) for a, b in blocks]
     return exons, matched_aa, aligned_aa, frameshifts
+
+
+def paf_identity(rec: dict) -> float:
+    """Residue identity of a miniprot hit: PAF matching / aligned bases.
+
+    The cg ``M`` count includes mismatches, so ``M / aligned`` is ~1 for any
+    gapless alignment (a 46%-identity paralog scores like a 99% ortholog).
+    """
+    return rec['paf_match'] / rec['paf_aln_len'] if rec['paf_aln_len'] else 0.0
 
 
 def parse_paf_row(line: str) -> dict | None:
@@ -157,8 +181,9 @@ def build_gp_line(
     exon_ends = ','.join(str(e[1]) for e in exons) + ','
     score = int(rec['tags'].get('AS', 0))
 
-    # cdsStartStat: complete if miniprot's start-codon tag (st:i:) is 1.
-    cds_start_stat = 'cmpl' if int(rec['tags'].get('st', 0)) == 1 else 'incmpl'
+    # cdsStartStat: complete iff alignment starts at the protein N-terminus.
+    # (miniprot's st:i: tag counts in-frame stop codons, not starts.)
+    cds_start_stat = 'cmpl' if rec['q_start'] == 0 else 'incmpl'
     # cdsEndStat: complete iff alignment reaches the C-terminus of the protein.
     cds_end_stat = 'cmpl' if rec['q_end'] == rec['q_len'] else 'incmpl'
 
@@ -280,7 +305,7 @@ def convert(
                     continue
 
                 exons, matched_aa, aligned_aa, frameshifts = parse_cigar_to_exons(
-                    cg, rec['t_start']
+                    cg, rec['t_start'], rec['t_end'], rec['strand']
                 )
                 if not exons:
                     n_dropped_no_exons += 1
@@ -288,7 +313,8 @@ def convert(
 
                 # Protein-space coverage / identity (Liftoff-style, kept for parity with the external Liftoff tool's metric definitions).
                 coverage = aligned_aa / rec['q_len'] if rec['q_len'] else 0.0
-                identity = matched_aa / aligned_aa if aligned_aa else 0.0
+                identity = paf_identity(rec)
+                matched_aa = int(round(identity * aligned_aa))
                 if coverage < min_coverage:
                     n_dropped_cov += 1
                     continue
@@ -358,9 +384,6 @@ def gp_to_hints(gp_path: str, hints_path: str) -> int:
             if len(exon_starts) != len(exon_ends):
                 continue
             score = f[10] if len(f) > 10 else "."
-            frames: List[int] = []
-            if len(f) > 15 and f[15]:
-                frames = [int(x) for x in f[15].rstrip(",").split(",") if x != ""]
 
             for i, (es, ee) in enumerate(zip(exon_starts, exon_ends)):
                 if i > 0:
@@ -382,12 +405,11 @@ def gp_to_hints(gp_path: str, hints_path: str) -> int:
                 part_e = gff_e - _HINTS_CDSPART_CUTOFF
                 if part_s > part_e:
                     part_s = part_e = (gff_s + gff_e) // 2
-                frame = frames[i] if i < len(frames) else 0
-                if frame < 0:
-                    frame = 0
+                # Phase unknown: a genePred exonFrame is not a GFF phase, and
+                # the CDSpart trim moves the start off the exon boundary.
                 out.write(
                     f"{chrom}\t{_HINTS_PRGSRC}\tCDSpart\t"
-                    f"{part_s}\t{part_e}\t{score}\t{strand}\t{frame}\t"
+                    f"{part_s}\t{part_e}\t{score}\t{strand}\t.\t"
                     f"src={_HINTS_SOURCE};grp={name};pri={_HINTS_PRIORITY}\n"
                 )
                 n_cds += 1
@@ -423,7 +445,7 @@ def main():
                          'filtering can act on them honestly). Raise to e.g. '
                          '0.50 to filter at converter time.')
     ap.add_argument('--min-identity', type=float, default=0.0,
-                    help='Drop records whose (matched_aa / aligned_aa) < this. '
+                    help='Drop records whose residue identity (PAF col10/col11) < this. '
                          'Default 0.0 = keep everything (same rationale as '
                          '--min-coverage).')
     ap.add_argument('--min-mapq', type=int, default=0,
