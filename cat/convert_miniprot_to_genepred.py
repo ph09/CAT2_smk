@@ -84,6 +84,11 @@ def parse_cigar_to_exons(
                 blocks.append((cur, pos))
             pos += n
             cur = pos
+        elif op in ('U', 'V') and n <= 3:
+            # Degenerate split-codon "intron" of length <= 0 (cs shows e.g.
+            # ~gt-2ag after another U/V): no real intron, stay in the exon.
+            pos += n
+            aligned_aa += 1
         elif op in ('U', 'V'):
             before = 1 if op == 'U' else 2
             blocks.append((cur, pos + before))
@@ -100,6 +105,17 @@ def parse_cigar_to_exons(
 
     if pos > cur:
         blocks.append((cur, pos))
+    # Never emit touching/overlapping blocks: downstream genePred parsing
+    # asserts every intron has non-negative length.
+    merged: List[Tuple[int, int]] = []
+    for a, b in blocks:
+        if b <= a:
+            continue
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    blocks = merged
     if strand == '-':
         end = t_end if t_end is not None else t_start + pos
         exons = sorted((end - b, end - a) for a, b in blocks)
