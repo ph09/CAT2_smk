@@ -247,6 +247,14 @@ def process_mode_with_cluster(tx_mode, path_dict, ref_tx_dict, tx_biotype_map,
         results.append((eval_tbl_name, ec_df))
 
         print(f"    Completed: {len(mc_df)} metrics records, {len(ec_df)} evaluation records")
+        if psl_list and len(mc_df) == 0:
+            # Alignments exist but none matched a transcript model (e.g. a stale
+            # alignment cache). Writing would replace the metrics table with an
+            # empty one and consensus would score this mode without metrics.
+            raise SystemExit(
+                f"ERROR: {len(psl_list)} {aln_mode} alignments for {tx_mode} produced 0 "
+                f"metrics records; alignment IDs do not match the transcript models"
+            )
 
         if args.cleanup:
             import shutil
