@@ -1844,8 +1844,16 @@ def write_consensus_gff3(consensus_gene_dict, consensus_gff3):
                         tools.fileOps.print_rows(out_gff3, [row])
 
 
-def write_consensus_fastas(consensus_gene_dict, consensus_fasta, consensus_protein_fasta, fasta):
+def write_consensus_fastas(
+    consensus_gene_dict, consensus_fasta, consensus_protein_fasta, fasta, seleno_symbols=None
+):
     """Write FASTA records for both transcripts and proteins"""
+    from cat.peptide_qc import best_orf_peptide, clearly_broken_peptide
+    try:
+        from cat.peptide_qc import protein_from_transcript, _symbol_of
+    except ImportError:
+        protein_from_transcript = None
+        _symbol_of = lambda attrs: ""
     seq_dict = tools.bio.get_sequence_dict(fasta)
     with open(consensus_fasta, 'w') as cfa, open(consensus_protein_fasta, 'w') as cpfa:
         for chrom in sorted(consensus_gene_dict):
@@ -1854,12 +1862,19 @@ def write_consensus_fastas(consensus_gene_dict, consensus_fasta, consensus_prote
                     mrna_seq = tx_obj.get_mrna(seq_dict)
                     tools.bio.write_fasta(cfa, attrs['transcript_id'], mrna_seq)
                     if tx_obj.cds_size > 0:
-                        protein_seq = tx_obj.get_protein_sequence(seq_dict)
+                        if protein_from_transcript is not None:
+                            protein_seq = protein_from_transcript(
+                                tx_obj, seq_dict, seleno=_symbol_of(attrs) in (seleno_symbols or ())
+                            )
+                        else:
+                            protein_seq = tx_obj.get_protein_sequence(seq_dict)
                     elif str(attrs.get('transcript_class', '')).startswith('putative_novel'):
-                        # For novel predictions without CDS annotations (e.g., StringTie),
-                        # treat the full spliced transcript as coding sequence.
-                        protein_seq = tools.bio.translate_sequence(mrna_seq)
+                        # StringTie has no CDS; score the longest intact ORF in
+                        # the spliced RNA instead of translating from nt 0.
+                        protein_seq = best_orf_peptide(mrna_seq)
                     else:
+                        protein_seq = ''
+                    if protein_seq and clearly_broken_peptide(protein_seq):
                         protein_seq = ''
                     if protein_seq:
                         tools.bio.write_fasta(cpfa, attrs['transcript_id'], protein_seq)
