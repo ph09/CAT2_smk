@@ -17,7 +17,12 @@ module keeps those models in the annotation and splits them on evidence.
                       HSA15; chimpanzee extras on other chroms).
   5. strong de novo   no reference homolog (lineage_specific / unknown),
                       >=5 exons, >=200 aa
-  6. otherwise        unknown_likely_coding
+  6. close relative   no reference homolog, but the peptide is intact and
+                      matches a protein from the genome's protein DB at
+                      >=90% identity over >=90% of both sequences (a
+                      same-clade ortholog the human reference lacks), with
+                      >=2 exons or a >=300 aa single exon
+  7. otherwise        unknown_likely_coding
 
 """
 from __future__ import annotations
@@ -38,6 +43,10 @@ INTERCHROM_CNV_MIN_EXON_FRAC = 0.70
 INTERCHROM_CNV_MIN_AA_FRAC = 0.70
 DENOVO_MIN_EXONS = 5
 DENOVO_MIN_AA = 200
+CLOSE_MIN_PID = 90.0
+CLOSE_MIN_COV = 90.0
+CLOSE_MIN_AA = 100
+CLOSE_SINGLE_EXON_MIN_AA = 300
 
 
 def has_rna_support(attrs: dict) -> bool:
@@ -99,6 +108,10 @@ def call_miniprot_novel(
     parent_n_exons: Optional[int] = None,
     parent_cds_aa: Optional[int] = None,
     as_coding: bool = False,
+    evidence_pid: Optional[float] = None,
+    evidence_qcov: Optional[float] = None,
+    evidence_scov: Optional[float] = None,
+    peptide_intact: Optional[bool] = None,
 ) -> tuple[str, str]:
     """Return ``(biotype, reason)`` for one miniprot-only gene.
 
@@ -108,6 +121,11 @@ def call_miniprot_novel(
 
     ``as_coding`` forces protein_coding (high_recall). Models are still
     labeled with a reason so they can be audited.
+
+    ``evidence_*`` are the best DIAMOND hit of the model's peptide against the
+    genome's protein DB (percent identity, query and subject coverage);
+    ``peptide_intact`` is whether that peptide has no internal stop. They are
+    None when no evidence search was run, which disables rule 6.
     """
     n_exons = int(n_exons or 0)
     cds_aa = int(cds_aa or 0)
@@ -145,6 +163,16 @@ def call_miniprot_novel(
     if ncl in ("", "lineage_specific") or ncl is None:
         if n_exons >= DENOVO_MIN_EXONS and cds_aa >= DENOVO_MIN_AA:
             return PROTEIN_CODING, "strong_de_novo"
+        if (
+            peptide_intact
+            and evidence_pid is not None
+            and evidence_pid >= CLOSE_MIN_PID
+            and (evidence_qcov or 0) >= CLOSE_MIN_COV
+            and (evidence_scov or 0) >= CLOSE_MIN_COV
+            and cds_aa >= CLOSE_MIN_AA
+            and (n_exons >= 2 or cds_aa >= CLOSE_SINGLE_EXON_MIN_AA)
+        ):
+            return PROTEIN_CODING, "close_relative"
 
     if n_exons <= 1:
         return UNKNOWN_LIKELY_CODING, "single_exon"
@@ -192,5 +220,19 @@ if __name__ == "__main__":
         parent_already_projected=True, same_chrom_as_parent=False,
     )
     assert (bt, reason) == (UNKNOWN_LIKELY_CODING, "dispersed_paralog"), (bt, reason)
+
+    # Lemur gene with no human homolog, full-length 96% match to E. rufifrons.
+    bt, reason = call_miniprot_novel(
+        3, 180, novel_class="lineage_specific",
+        evidence_pid=96.0, evidence_qcov=98.0, evidence_scov=97.0, peptide_intact=True,
+    )
+    assert (bt, reason) == (PROTEIN_CODING, "close_relative"), (bt, reason)
+
+    # Same hit but a partial match of the relative's protein: stay unknown.
+    bt, reason = call_miniprot_novel(
+        3, 180, novel_class="lineage_specific",
+        evidence_pid=96.0, evidence_qcov=98.0, evidence_scov=40.0, peptide_intact=True,
+    )
+    assert (bt, reason) == (UNKNOWN_LIKELY_CODING, "weak_structure"), (bt, reason)
 
     print("ok")
