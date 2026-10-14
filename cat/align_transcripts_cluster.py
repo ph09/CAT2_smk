@@ -345,7 +345,11 @@ def run_cluster_alignment_pipeline(args):
         for aln_mode, out_path in [('mRNA', mrna_path), ('CDS', cds_path)]:
             logger.info(f"\nProcessing {aln_mode} alignments for {tx_mode}")
             stable = Path(str(out_path) + ".complete")
-            if stable.exists() and stable.stat().st_size > 0:
+            # Reuse only if the cached alignments postdate the transcript models:
+            # a stale cache has alignment IDs that no longer match the genePred,
+            # so classify yields 0 records and the metrics tables are wiped.
+            if (stable.exists() and stable.stat().st_size > 0
+                    and stable.stat().st_mtime >= Path(gp_path).stat().st_mtime):
                 logger.info(f"Reusing completed {aln_mode} alignments: {stable}")
                 shutil.copy2(stable, out_path)
                 continue
