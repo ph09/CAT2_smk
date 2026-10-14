@@ -332,8 +332,15 @@ def best_evidence_hits(query_fasta, evidence_fasta, tmpdir, threads, evalue):
     close-relative rule in call_miniprot_novel: a full-length, high-identity
     match to a same-clade protein the human reference lacks.
     """
+    # diamond makedb rejects '.' (gffread's untranslatable-codon mark, e.g. in
+    # the GRCh38 base set); mask it as X in a temporary copy rather than
+    # rewriting the shared protein DB, which would re-trigger miniprot.
+    clean = Path(tmpdir) / 'evidence_proteins.faa'
+    with open(evidence_fasta) as fin, open(clean, 'w') as fout:
+        for line in fin:
+            fout.write(line if line.startswith('>') else line.replace('.', 'X'))
     db = str(Path(tmpdir) / 'evidence_proteins')
-    build_diamond_db(evidence_fasta, db, threads)
+    build_diamond_db(str(clean), db, threads)
     out = Path(tmpdir) / 'evidence_hits.tsv'
     cmd = [
         'diamond', 'blastp',
