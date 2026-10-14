@@ -1730,7 +1730,16 @@ def generate_consensus(args):
     logger.info("\n" + "="*80)
     logger.info("STEP 7: Writing Output Files")
     logger.info("="*80)
-    
+    from cat.peptide_qc import drop_clearly_broken_coding
+    final_consensus, n_broken = drop_clearly_broken_coding(
+        final_consensus, tx_dict, args.fasta
+    )
+    if n_broken:
+        logger.info(
+            "Dropped %s coding transcripts whose translation has ≥3 internal stops",
+            n_broken,
+        )
+
     logger.info(f"Writing consensus genePred to {args.consensus_gp}")
     consensus_gene_dict = write_consensus_gps(args.consensus_gp, args.consensus_gp_info,
                                               final_consensus, tx_dict, args.genome)
@@ -3463,8 +3472,10 @@ def create_transcript_attributes(row, mode, normalized_id, tx_dict=None, consens
     #      near-intronless target. Classic retrotransposed-mRNA signature.
     #   2. Fragment: both alignment coverage AND identity below 30%. Below this
     #      joint threshold we cannot meaningfully claim ortholog status.
-    # Frameshifts / improper ORFs alone are NOT used to demote, since real
-    # cross-species orthologs frequently have indels in their alignments.
+    # Alignment frameshifts / improper ORFs alone are NOT used to demote:
+    # real cross-species orthologs frequently have indels in their alignments.
+    # Transcripts whose *translated* peptide still has ≥3 internal stops are
+    # dropped later (see cat.peptide_qc); that is independent of these flags.
     if not is_augpb and transcript_class == 'ortholog':
         ref_exon_count_map = _get_ref_exon_count_map(args) if args is not None else None
 
@@ -5845,11 +5856,12 @@ def write_consensus_gff3(consensus_gene_dict, consensus_gff3):
     original_write_gff3(consensus_gene_dict, consensus_gff3)
 
 
-def write_consensus_fastas(consensus_gene_dict, consensus_fasta, consensus_protein_fasta, fasta):
+def write_consensus_fastas(consensus_gene_dict, consensus_fasta, consensus_protein_fasta, fasta, seleno_symbols=None):
     """Write consensus FASTA files"""
     import logging
     logger = logging.getLogger(__name__)
     
+    from cat.peptide_qc import best_orf_peptide, clearly_broken_peptide, protein_from_transcript, _symbol_of
     seq_dict = tools.bio.get_sequence_dict(fasta)
     skipped_count = 0
     
@@ -5861,12 +5873,16 @@ def write_consensus_fastas(consensus_gene_dict, consensus_fasta, consensus_prote
                         mrna_seq = tx_obj.get_mrna(seq_dict)
                         tools.bio.write_fasta(cfa, attrs['transcript_id'], mrna_seq)
                         if tx_obj.cds_size > 0:
-                            protein_seq = tx_obj.get_protein_sequence(seq_dict)
+                            protein_seq = protein_from_transcript(
+                                tx_obj, seq_dict, seleno=_symbol_of(attrs) in (seleno_symbols or ())
+                            )
                         elif str(attrs.get('transcript_class', '')).startswith('putative_novel'):
-                            # For novel predictions without CDS annotations (e.g., StringTie),
-                            # treat the full spliced transcript as coding sequence.
-                            protein_seq = tools.bio.translate_sequence(mrna_seq)
+                            # StringTie has no CDS; score the longest intact ORF
+                            # in the spliced RNA instead of translating from nt 0.
+                            protein_seq = best_orf_peptide(mrna_seq)
                         else:
+                            protein_seq = ''
+                        if protein_seq and clearly_broken_peptide(protein_seq):
                             protein_seq = ''
                         if protein_seq:
                             tools.bio.write_fasta(cpfa, attrs['transcript_id'], protein_seq)
