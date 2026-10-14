@@ -38,7 +38,8 @@ from cat.convert_miniprot_to_genepred import (
     parse_cigar_to_exons,
     parse_paf_row,
 )
-from tools.bio import reverse_complement
+from cat.peptide_qc import clearly_broken_peptide, recode_selenocysteine, protein_from_transcript
+from tools.bio import get_sequence_dict, reverse_complement
 from tools.transcripts import GenePredTranscript, gene_pred_iterator
 
 logger = logging.getLogger("protein_refine")
@@ -66,6 +67,11 @@ RESCUE_CANDIDATES_PER_SYMBOL = 3
 RESCUE_MAX_NAMED_OVERLAP = 0.10
 FULL_PROTEIN_QCOV = 0.80
 MIN_PROTEIN_SPAN = 2_000
+# Nucleotide projection: a clean long transMap/augTM parse is the real locus.
+# Protein modes (miniprot / augMP) often emit a compact isoform — use typical
+# length for those, never let them overwrite a clean projection peptide.
+PROJECTION_MODES = {"transMap", "transMap_pairwise", "augTM", "augTM_pairwise"}
+PROTEIN_MODES = {"miniprot", "augMP"}
 
 
 def _na(val) -> bool:
@@ -103,7 +109,7 @@ def _percentile(vals: list[int], p: float) -> float:
 
 def load_query_symbols(
     protein_fasta: str | None, gp_attrs: str | None
-) -> tuple[dict[str, str], dict[str, int]]:
+) -> tuple[dict[str, str], dict[str, int], set[str]]:
     """Map protein query IDs to gene symbols, plus typical UniProt length per symbol.
 
     Parent length comes from the protein DB (reviewed ``sp|`` median, else a
@@ -123,6 +129,7 @@ def load_query_symbols(
         logger.info("  transcript→symbol from gp_attrs: %s", f"{len(out):,}")
     by_sp: dict[str, list[int]] = defaultdict(list)
     by_all: dict[str, list[int]] = defaultdict(list)
+    seleno_symbols: set[str] = set()
     if protein_fasta and Path(protein_fasta).exists():
         n_gn = 0
         cur_sym = None
@@ -132,12 +139,15 @@ def load_query_symbols(
         def _flush() -> None:
             if not cur_sym or not buf:
                 return
-            n = sum(len(x) for x in buf)
+            seq = "".join(buf)
+            n = len(seq)
             if n <= 0:
                 return
             by_all[cur_sym].append(n)
             if cur_sp:
                 by_sp[cur_sym].append(n)
+            if "U" in seq.upper():
+                seleno_symbols.add(cur_sym)
 
         with open(protein_fasta) as fh:
             for line in fh:
@@ -163,7 +173,9 @@ def load_query_symbols(
         elif by_all.get(sym):
             uniprot_aa[sym] = typical_peptide_length(by_all[sym])
     logger.info("  UniProt typical lengths: %s symbols", f"{len(uniprot_aa):,}")
-    return out, uniprot_aa
+    if seleno_symbols:
+        logger.info("  UniProt selenoproteins (U in peptide): %s symbols", f"{len(seleno_symbols):,}")
+    return out, uniprot_aa, seleno_symbols
 
 
 def symbol_for_query(qid: str, query_symbols: dict[str, str]) -> str | None:
@@ -741,6 +753,7 @@ def load_genes(gp_path: str, gp_info_path: str) -> tuple[list[dict], pd.DataFram
                 "biotype": str(rec.get("gene_biotype") or rec.get("transcript_biotype") or ""),
                 "source_name": "" if _na(rec.get("source_gene_common_name")) else str(rec["source_gene_common_name"]),
                 "transcript_class": str(rec.get("transcript_class") or ""),
+                "alignment_mode": str(rec.get("alignment_mode") or ""),
                 "cds_size": tx.cds_size,
                 "coding_exons": coding_exon_count(tx),
             }
@@ -748,16 +761,67 @@ def load_genes(gp_path: str, gp_info_path: str) -> tuple[list[dict], pd.DataFram
     return genes, info
 
 
-def pick_representatives(genes: list[dict]) -> list[int]:
-    """Longest-CDS transcript index per gene_id."""
+def alignment_mode_of(g: dict) -> str:
+    return str(g.get("alignment_mode") or (g.get("info") or {}).get("alignment_mode") or "")
+
+
+def is_projection_mode(g: dict) -> bool:
+    mode = alignment_mode_of(g)
+    return mode in PROJECTION_MODES or mode.startswith("transMap") or mode.startswith("augTM")
+
+
+def is_protein_mode(g: dict) -> bool:
+    mode = alignment_mode_of(g)
+    return mode in PROTEIN_MODES or mode.startswith("augMP") or mode == "miniprot"
+
+
+def pick_representatives(
+    genes: list[dict],
+    proteins: dict[str, str] | None = None,
+    typical_aa: dict[str, int] | None = None,
+    seleno_symbols: set[str] | None = None,
+) -> list[int]:
+    """Best transcript index per gene_id.
+
+    A clean peptide beats a broken one (alignment frameshift flags are
+    ignored). Among clean isoforms, a transMap/augTM model wins by longest
+    peptide — those are spliced projections of the real locus. miniprot /
+    augMP (and Augustus/StringTie extras) still pick the peptide nearest the
+    UniProt typical length, because those modes invent compact or extended
+    ORFs that are not the parent protein.
+    """
+    proteins = proteins or {}
+    typical_aa = typical_aa or {}
+
+    def peptide_len(g: dict, aa: str | None) -> int:
+        if aa:
+            seq = aa[:-1] if aa.endswith("*") else aa
+            if seq and "*" not in seq:
+                return len(seq)
+        return int(g.get("cds_size") or 0) // 3
+
+    def rank(g: dict) -> tuple:
+        aa = proteins.get(g["transcript_id"])
+        typ = typical_aa.get(g.get("source_name") or "") or 0
+        plen = peptide_len(g, aa)
+        clean = peptide_is_clean(aa, seleno=(g.get("source_name") or "") in (seleno_symbols or ()))
+        proj = is_projection_mode(g)
+        near_typical = -abs(plen - typ) if typ else 0
+        return (
+            not clearly_broken_peptide(aa),
+            clean,
+            clean and proj,
+            plen if clean and proj else 0,
+            near_typical if not proj else 0,
+            near_typical,
+            g["cds_size"],
+            g["end"] - g["start"],
+        )
+
     best: dict[str, int] = {}
     for i, g in enumerate(genes):
         prev = best.get(g["gene_id"])
-        if prev is None or g["cds_size"] > genes[prev]["cds_size"]:
-            best[g["gene_id"]] = i
-        elif g["cds_size"] == genes[prev]["cds_size"] and (g["end"] - g["start"]) > (
-            genes[prev]["end"] - genes[prev]["start"]
-        ):
+        if prev is None or rank(g) > rank(genes[prev]):
             best[g["gene_id"]] = i
     return sorted(best.values(), key=lambda i: (genes[i]["chrom"], genes[i]["start"]))
 
@@ -808,9 +872,188 @@ def orf_intact(g: dict, protein: str | None) -> bool:
     if protein is None:
         return True
     seq = protein[:-1] if protein.endswith("*") else protein
+    seq = seq.replace("U", "A")
     if not seq or not seq.startswith("M"):
         return False
     return "*" not in seq
+
+
+def peptide_is_clean(protein: str | None, *, seleno: bool = False) -> bool:
+    """True when the translated peptide is one start-to-stop ORF.
+
+    Alignment ``frameshift`` flags are ignored. ``U`` is Sec and is only
+    accepted (along with leftover ``*`` below the broken floor) when this
+    gene's parent protein is a selenoprotein. A premature TGA in anything
+    else stays a stop and is not clean.
+    """
+    if not protein:
+        return False
+    seq = protein[:-1] if protein.endswith("*") else protein
+    if not seq or not seq.startswith("M"):
+        return False
+    seq = seq.replace("U", "A")
+    if seleno:
+        return not clearly_broken_peptide(seq)
+    return "*" not in seq
+
+
+def peptide_aa_len(protein: str | None, cds_size: int, *, seleno: bool = False) -> int:
+    """Usable peptide length. Sec counts as a residue only for selenoproteins."""
+    if protein:
+        seq = protein[:-1] if protein.endswith("*") else protein
+        if not seq:
+            return cds_size // 3 if cds_size else 0
+        if peptide_is_clean(protein, seleno=seleno):
+            return len(seq)
+        parts = [p for p in seq.split("*") if p]
+        return max((len(p) for p in parts), default=0)
+    return cds_size // 3 if cds_size else 0
+
+
+def _near_typical(aa: int, typ_aa: int) -> bool:
+    return bool(typ_aa) and MIN_COPY_AA_FRAC * typ_aa <= aa <= MAX_COPY_AA_FRAC * typ_aa
+
+
+def cds_needs_replace(
+    g: dict,
+    protein: str | None,
+    symbol: str,
+    ref_struct: dict[str, tuple[int, int]],
+    old_span: int,
+    new_span: int,
+    new_aa: int | None = None,
+    seleno_symbols: set[str] | None = None,
+) -> str | None:
+    """Whether miniprot exons should replace the current CDS.
+
+    Genomic span alone is not a fusion signal. JAK1's real first intron is
+    ~200 kb, so a compact miniprot block looks like a shrink and destroys a
+    complete transMap protein. A clean peptide near the parent length is
+    never replaced, including when an alignment frameshift flag is set.
+    A clean peptide may change only when it is the wrong length versus the
+    parent *and* the new CDS is closer to that length (fusion shrink or
+    truncation expand). Broken peptides may still be replaced.
+    """
+    if new_span + 50 >= old_span and new_span - 50 <= old_span:
+        return None
+    typ_aa, _ = parent_structure(symbol, ref_struct)
+    seleno = symbol in (seleno_symbols or ())
+    old_aa = peptide_aa_len(protein, int(g.get("cds_size") or 0), seleno=seleno)
+    if peptide_is_clean(protein, seleno=seleno):
+        # A clean transMap/augTM peptide is the spliced locus. Miniprot's
+        # compact block is often a short isoform of the same protein and
+        # must not replace it, even when UniProt "typical" is that stub.
+        if is_projection_mode(g) and new_span < old_span:
+            return None
+        if not typ_aa:
+            return None
+        if _near_typical(old_aa, typ_aa):
+            return None
+        if new_aa is not None:
+            if abs(new_aa - typ_aa) >= abs(old_aa - typ_aa):
+                return None
+            if new_span < old_span and old_aa <= MAX_COPY_AA_FRAC * typ_aa:
+                return None
+            if new_span > old_span and old_aa >= MIN_COPY_AA_FRAC * typ_aa:
+                return None
+            if not _near_typical(new_aa, typ_aa):
+                return None
+            return "shrink" if new_span < old_span else "expand"
+        if old_aa > MAX_COPY_AA_FRAC * typ_aa and new_span < old_span:
+            return "shrink"
+        if old_aa < MIN_COPY_AA_FRAC * typ_aa and new_span > old_span:
+            return "expand"
+        return None
+    return "shrink" if new_span < old_span else "expand"
+
+
+def isoform_worth_keeping(
+    g: dict,
+    protein: str | None,
+    symbol: str,
+    ref_struct: dict[str, tuple[int, int]],
+) -> bool:
+    """True if this isoform should survive after its representative is dropped.
+
+    A superseded work transcript can be a wrecked or chimeric parse. Sibling
+    isoforms of the same gene_id are kept when they still translate as a
+    non-fusion protein. Fusion-length siblings of a split chimera are not.
+    """
+    if clearly_broken_peptide(protein):
+        return False
+    aa = peptide_aa_len(protein, int(g.get("cds_size") or 0))
+    if aa < 50:
+        return False
+    typ_aa, _ = parent_structure(symbol, ref_struct)
+    if typ_aa and aa > MAX_COPY_AA_FRAC * typ_aa:
+        return False
+    if protein and not peptide_is_clean(protein) and not clearly_broken_peptide(protein):
+        return aa >= 50
+    return True
+
+
+def intact_sibling(
+    work_gene: dict,
+    siblings: list[dict],
+    proteins: dict[str, str],
+    symbol: str,
+    ref_struct: dict[str, tuple[int, int]],
+) -> dict | None:
+    """Best clean non-fusion isoform of the same gene, excluding ``work_gene``."""
+    typ_aa, _ = parent_structure(symbol, ref_struct)
+    best = None
+    best_key = None
+    work_tid = work_gene.get("transcript_id")
+    for g in siblings:
+        if g.get("transcript_id") == work_tid:
+            continue
+        if g.get("gene_id") != work_gene.get("gene_id"):
+            continue
+        prot = proteins.get(g["transcript_id"])
+        if not isoform_worth_keeping(g, prot, symbol, ref_struct):
+            continue
+        if prot and not peptide_is_clean(prot):
+            continue
+        plen = peptide_aa_len(prot, int(g.get("cds_size") or 0))
+        key = (-abs(plen - typ_aa) if typ_aa else 0, plen)
+        if best is None or key > best_key:
+            best, best_key = g, key
+    return best
+
+
+def prune_superseded_isoforms(
+    keep_tx: set[str],
+    work: list[dict],
+    superseded: set[int],
+    all_genes: list[dict],
+    proteins: dict[str, str],
+    ref_struct: dict[str, tuple[int, int]],
+) -> tuple[int, int]:
+    """Drop superseded representatives; keep intact non-fusion siblings.
+
+    Replacing a chimeric or still-broken work transcript must not delete the
+    rest of the gene. Woolly JAK1 lost 29 intact 1154 aa isoforms because the
+    representative was superseded and every ``gene_id`` member was discarded.
+    Returns ``(n_dropped_siblings, n_kept_siblings)``.
+    """
+    by_gid: dict[str, list[dict]] = defaultdict(list)
+    for g in all_genes:
+        by_gid[g["gene_id"]].append(g)
+    n_drop = n_keep = 0
+    for wi in superseded:
+        g = work[wi]
+        keep_tx.discard(g["transcript_id"])
+        sym = g.get("source_name") or ""
+        for sib in by_gid[g["gene_id"]]:
+            if sib["transcript_id"] == g["transcript_id"]:
+                continue
+            prot = proteins.get(sib["transcript_id"])
+            if isoform_worth_keeping(sib, prot, sym or sib.get("source_name") or "", ref_struct):
+                n_keep += 1
+                continue
+            keep_tx.discard(sib["transcript_id"])
+            n_drop += 1
+    return n_drop, n_keep
 
 
 def coding_call(
@@ -1351,9 +1594,11 @@ def project_template_exons(
     Miniprot often keeps a 10-exon AMY parse that is stop-ridden on an
     inverted unit; the named neighbour's 11–12 exon structure still translates.
     """
-    seq = seq_dict.get(chrom)
     tmpl_chrom = getattr(template, "chromosome", chrom)
-    tmpl_seq = seq_dict.get(tmpl_chrom)
+    if chrom not in seq_dict or tmpl_chrom not in seq_dict:
+        return None
+    seq = seq_dict[chrom]
+    tmpl_seq = seq_dict[tmpl_chrom]
     if not seq or not tmpl_seq:
         return None
     segs = []
@@ -1393,6 +1638,7 @@ def place_rescues(
     ref_struct: dict[str, tuple[int, int]],
     extra_cands: list[Hit] | None = None,
     seq_dict: dict[str, str] | None = None,
+    seleno_symbols: set[str] | None = None,
 ) -> tuple[list[tuple[Hit, GenePredTranscript]], set[int]]:
     """Accept one rescue per absent symbol, then extra copies of present genes.
 
@@ -1425,8 +1671,10 @@ def place_rescues(
                 return
             if seq_dict and tx.chromosome in seq_dict:
                 try:
-                    prot = tx.get_protein_sequence(seq_dict)
-                except (KeyError, AssertionError, ValueError, RuntimeError):
+                    prot = protein_from_transcript(
+                        tx, seq_dict, seleno=h.symbol in (seleno_symbols or ())
+                    )
+                except (KeyError, AssertionError, ValueError, RuntimeError, TypeError):
                     prot = None
                 if prot is not None and not orf_intact(
                     {"cds_size": tx.cds_size, "info": {}}, prot
@@ -1457,8 +1705,10 @@ def place_rescues(
                     if rebuilt is None:
                         return
                     try:
-                        prot = rebuilt.get_protein_sequence(seq_dict)
-                    except (KeyError, AssertionError, ValueError, RuntimeError):
+                        prot = protein_from_transcript(
+                            rebuilt, seq_dict, seleno=h.symbol in (seleno_symbols or ())
+                        )
+                    except (KeyError, AssertionError, ValueError, RuntimeError, TypeError):
                         return
                     aa = rebuilt.cds_size // 3
                     n_ex = coding_exon_count(rebuilt)
@@ -1569,7 +1819,10 @@ def apply_structure(
     index_by_chrom: dict[str, LocusIndex],
     exon_lookup: dict[tuple, list[tuple[int, int]]],
     ref_struct: dict[str, tuple[int, int]],
+    proteins: dict[str, str] | None = None,
+    seleno_symbols: set[str] | None = None,
 ) -> tuple[int, int]:
+    proteins = proteins or {}
     n_shrink = n_expand = 0
     genes_by_chrom: dict[str, list[int]] = defaultdict(list)
     for gi, g in enumerate(genes):
@@ -1587,18 +1840,29 @@ def apply_structure(
             continue
         old_span = g["end"] - g["start"] + 1
         new_span = chosen.length
-        if new_span + 50 >= old_span and new_span - 50 <= old_span:
-            continue
         line = gp_line_from_exons(
             g["transcript_id"], chosen.chrom, chosen.strand, exons, a["symbol"]
         )
         new_tx = GenePredTranscript(line.split("\t"))
+        reason = cds_needs_replace(
+            g,
+            proteins.get(g["transcript_id"]),
+            a["symbol"],
+            ref_struct,
+            old_span,
+            new_span,
+            new_aa=new_tx.cds_size // 3,
+            seleno_symbols=seleno_symbols,
+        )
+        if reason is None:
+            continue
         genes[gi]["tx"] = new_tx
         genes[gi]["start"] = new_tx.start
         genes[gi]["end"] = new_tx.stop
         genes[gi]["strand"] = new_tx.strand
+        genes[gi]["cds_size"] = new_tx.cds_size
         a["hit"] = chosen
-        if new_span < old_span:
+        if reason == "shrink":
             n_shrink += 1
         else:
             n_expand += 1
@@ -1641,6 +1905,7 @@ def write_outputs(
     keep_tx: set[str],
     args,
     stats: dict,
+    seleno_symbols: set[str] | None = None,
 ) -> None:
     from cat.consensus import write_consensus_fastas, write_consensus_gff3
 
@@ -1706,7 +1971,9 @@ def write_outputs(
     out_df[ordered + extra].to_csv(args.output_gp_info, sep="\t", index=False)
 
     write_consensus_gff3(gene_dict, args.output_gff3)
-    write_consensus_fastas(gene_dict, args.output_fasta, args.output_protein_fasta, args.fasta)
+    write_consensus_fastas(
+        gene_dict, args.output_fasta, args.output_protein_fasta, args.fasta, seleno_symbols
+    )
 
     with open(args.output_metrics_json, "w") as fh:
         json.dump(stats, fh, indent=2)
@@ -1734,7 +2001,7 @@ def run(args) -> int:
         return copy_through(args)
 
     logger.info("protein_refine %s", args.genome)
-    query_symbols, uniprot_aa = load_query_symbols(args.protein_fasta, args.ref_gp_attrs)
+    query_symbols, uniprot_aa, seleno_symbols = load_query_symbols(args.protein_fasta, args.ref_gp_attrs)
     ref_order = load_ref_gene_order(args.ref_gp, query_symbols)
     ref_symbols = set()
     for genes in ref_order.values():
@@ -1754,14 +2021,14 @@ def run(args) -> int:
         or str(g["transcript_class"]).startswith("putative_novel")
         or g["cds_size"] > 0
     ]
-    work = [pc_genes[i] for i in pick_representatives(pc_genes)]
+    proteins = load_proteins(
+        args.consensus_protein_fasta,
+        {g["transcript_id"] for g in pc_genes},
+    )
+    work = [pc_genes[i] for i in pick_representatives(pc_genes, proteins, uniprot_aa, seleno_symbols)]
     chrom_hits = hits_by_chrom(hits)
     index_by_chrom = {c: LocusIndex(hs) for c, hs in chrom_hits.items()}
     ref_struct = load_ref_structure(args.ref_gp, query_symbols, uniprot_aa)
-    proteins = load_proteins(
-        args.consensus_protein_fasta,
-        {g["transcript_id"] for g in work if not g["source_name"]},
-    )
 
     assign, calls, present = assign_names(work, index_by_chrom, ref_symbols, ref_struct, proteins)
     n_frag = demote_redundant_fragments(work, assign, calls, present, ref_struct)
@@ -1813,14 +2080,48 @@ def run(args) -> int:
     exon_lookup = fetch_exons(args.miniprot_paf, query_symbols, needed)
     logger.info("  exon records fetched: %s / %s", len(exon_lookup), len(needed))
 
-    n_shrink, n_expand = apply_structure(work, assign, index_by_chrom, exon_lookup, ref_struct)
+    n_shrink, n_expand = apply_structure(
+        work, assign, index_by_chrom, exon_lookup, ref_struct, proteins, seleno_symbols
+    )
     logger.info("  shrunk %s chimeric; expanded %s truncated", n_shrink, n_expand)
 
-    seq_dict = load_fasta_chroms(args.fasta, {h.chrom for h in copies})
-    rescues, superseded = place_rescues(
-        cands, exon_lookup, work, assign, ref_struct, extra_cands=copies, seq_dict=seq_dict
+    seq_dict = get_sequence_dict(args.fasta) if args.fasta else {}
+    superseded = set(split)
+    n_drop_broken = 0
+    n_promote = 0
+    broken_only: set[str] = set()
+    if seq_dict:
+        for wi, g in enumerate(work):
+            try:
+                symbol = assign[wi]["symbol"] if wi in assign else g.get("source_name") or ""
+                aa = protein_from_transcript(g["tx"], seq_dict, seleno=symbol in seleno_symbols)
+            except (ValueError, KeyError, AssertionError, RuntimeError, TypeError):
+                continue
+            if not clearly_broken_peptide(aa):
+                continue
+            sibling = intact_sibling(g, all_genes, proteins, symbol, ref_struct)
+            if sibling is not None:
+                broken_only.add(g["transcript_id"])
+                work[wi] = sibling
+                n_promote += 1
+                continue
+            if wi in assign:
+                present[assign[wi]["symbol"]] -= 1
+                del assign[wi]
+            g["source_name"] = ""
+            superseded.add(wi)
+            n_drop_broken += 1
+        if n_drop_broken:
+            logger.info("  dropped %s still-broken coding models for miniprot rescue", n_drop_broken)
+        if n_promote:
+            logger.info("  kept %s genes by promoting an intact sibling isoform", n_promote)
+
+    if not seq_dict:
+        seq_dict = load_fasta_chroms(args.fasta, {h.chrom for h in copies})
+    rescues, rescued_super = place_rescues(
+        cands, exon_lookup, work, assign, ref_struct, extra_cands=copies, seq_dict=seq_dict, seleno_symbols=seleno_symbols
     )
-    superseded.update(split)
+    superseded.update(rescued_super)
     n_extra_placed = sum(1 for h, _ in rescues if present.get(h.symbol, 0) > 0)
     logger.info(
         "  rescued %s genes (%s extra copies); superseded %s unnamed/chimeric models; "
@@ -1846,12 +2147,22 @@ def run(args) -> int:
             ov = overlap_bp((int(g["start"]), int(g["end"])), rspan)
             gl = max(1, int(g["end"]) - int(g["start"]) + 1)
             if ov / gl < 0.50:
+                prot = proteins.get(g["transcript_id"])
+                if isoform_worth_keeping(g, prot, a.get("symbol") or "", ref_struct):
+                    continue
                 keep_tx.discard(g["transcript_id"])
                 n_drop_iso += 1
 
-    for wi in superseded:
-        for gi in by_gid[work[wi]["gene_id"]]:
-            keep_tx.discard(all_genes[gi]["transcript_id"])
+    n_drop_sib, n_keep_sib = prune_superseded_isoforms(
+        keep_tx, work, superseded, all_genes, proteins, ref_struct
+    )
+    for tid in broken_only:
+        keep_tx.discard(tid)
+    if n_keep_sib:
+        logger.info(
+            "  kept %s intact sibling isoforms after superseding a broken/chimeric representative",
+            n_keep_sib,
+        )
 
     orphan_rows = []
     for h, tx in rescues:
@@ -1875,6 +2186,9 @@ def run(args) -> int:
         "n_shrink": n_shrink,
         "n_expand": n_expand,
         "n_drop_isoform": n_drop_iso,
+        "n_drop_superseded_siblings": n_drop_sib,
+        "n_keep_superseded_siblings": n_keep_sib,
+        "n_promote_sibling": n_promote,
         "n_fragment_demoted": n_frag,
     }
     if args.consensus_metrics_json and Path(args.consensus_metrics_json).exists():
@@ -1889,7 +2203,9 @@ def run(args) -> int:
 
     assign_by_gid = {work[wi]["gene_id"]: a for wi, a in assign.items()}
     calls_by_gid = {work[wi]["gene_id"]: c for wi, c in calls.items()}
-    write_outputs(all_genes, info, assign_by_gid, calls_by_gid, orphan_rows, keep_tx, args, stats)
+    write_outputs(
+        all_genes, info, assign_by_gid, calls_by_gid, orphan_rows, keep_tx, args, stats, seleno_symbols
+    )
     logger.info("  wrote %s", args.output_gp)
     return 0
 
