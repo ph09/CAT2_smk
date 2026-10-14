@@ -499,7 +499,10 @@ def filter_clusters(clustered, transcript_gene_map, gene_name_map, scores, metri
             for gene_biotype in gene_biotypes:
                 metrics['Gene Family Collapse'][gene_biotype][len(collapsed_gene_ids)] += 1
             collapsed_gene_names = {gene_name_map[x] for x in collapsed_gene_ids}
-            genes_to_remove.update(collapsed_gene_ids)
+            # Remove only the genes that lost the cluster. Removing the best
+            # gene too emptied every locus where two genes' CDS projections
+            # touch (e.g. 686 conserved E. fulvus genes such as MED17, ATP1A3).
+            genes_to_remove.update(collapsed_gene_ids - set(best_genes))
             for best_gene in best_genes:
                 collapsed_genes.append([best_gene, ','.join(collapsed_gene_ids), ','.join(collapsed_gene_names)])
     if filter_overlapping_genes == True:
