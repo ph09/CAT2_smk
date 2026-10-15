@@ -179,6 +179,12 @@ def add_arguments(parser):
     parser.add_argument("--original-intron-support", type=float, default=0.0, help="Percent of original introns that must be preserved.")
     parser.add_argument("--in-species-rna-support-only", action="store_true", help="Use in-species RNA-seq support only, ignoring cross-species evidence.")
     parser.add_argument("--filter-overlapping-genes", action="store_true", help="Filter out overlapping CDS intervals from different genes.")
+    parser.add_argument(
+        "--dedupe-shared-exon-genes",
+        action="store_true",
+        help="Keep one protein-coding gene where different source genes share >50%% of coding-exon bases "
+             "(stacked paralog projections). Nested genes are not affected.",
+    )
     parser.add_argument("--overlapping-ignore-bases", type=int, default=0, help="Number of bases to ignore when clustering for overlap.")
     parser.add_argument("--cnv-score-similarity", type=float, default=0.80, help="Keep multi-locus transcripts if scores are within this fraction of max (default: 0.80 = 80%%)")
     parser.add_argument("--fragment-max-coverage", type=float, default=30.0, help="A non-denovo transcript with coverage AND identity below their respective thresholds is reclassified as 'fragment'. Coverage threshold (percent); set to 0 to disable fragment reclassification (keeps them as regular orthologs).")
@@ -2461,6 +2467,16 @@ def generate_consensus(args):
             "Dropped %s coding transcripts whose translation has ≥3 internal stops",
             n_broken,
         )
+    if getattr(args, "dedupe_shared_exon_genes", False):
+        # Run after the rescue steps too: they append transcripts after the
+        # finalize-time dedupe and would otherwise re-stack genes.
+        final_consensus = _cp.dedupe_shared_exon_genes(final_consensus, tx_dict, readthrough_gene_set)
+    # Rescues append after the genomic sort; write_consensus_gps groups
+    # transcripts into genes greedily in list order, so unsorted additions
+    # split one gene into two IDs at the same locus (704 such pairs in E. fulvus).
+    final_consensus = sorted(
+        final_consensus, key=lambda ta: (tx_dict[ta[0]].chromosome, tx_dict[ta[0]].start)
+    )
     logger.info(f"Writing consensus genePred to {args.consensus_gp}")
     consensus_gene_dict = write_consensus_gps(args.consensus_gp, args.consensus_gp_info,
                                               final_consensus, tx_dict, args.genome)
