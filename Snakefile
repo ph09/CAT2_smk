@@ -657,6 +657,13 @@ _HIGH_RECALL_OVERRIDES = {
     "denovo_allow_unsupported":         True,
 }
 
+def cfg_bool(value):
+    """Config booleans from YAML or ``--config`` (which passes ``false`` as a string)."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "no", "0", "off", "")
+    return bool(value)
+
+
 def rcfg(key, default):
     """Recall-aware ``config.get``: honours the high_recall preset overrides."""
     if HIGH_RECALL and key in _HIGH_RECALL_OVERRIDES:
@@ -1661,7 +1668,7 @@ rule transmap_filter:
         db_path=f"{config['work_dir']}/databases/{{genome}}.db",
         # Honour input.yaml's `global_near_best` as a fallback (historical key name).
         global_near_best=rcfg("tm_global_near_best", config.get("global_near_best", 0.1)),
-        filter_overlapping_genes="--filter-overlapping-genes" if rcfg("tm_filter_overlapping", True) else "",
+        filter_overlapping_genes="--filter-overlapping-genes" if cfg_bool(rcfg("tm_filter_overlapping", True)) else "",
         overlapping_ignore_bases=config.get("tm_overlapping_ignore_bases", 0),
         min_cover=rcfg("tm_min_cover", 0.1),
         min_span=rcfg("tm_min_span", 0.2),
@@ -2105,7 +2112,7 @@ rule transmap_pairwise_filter:
     params:
         db_path=f"{config['work_dir']}/databases/{{genome}}.db",
         global_near_best=config.get("tm_global_near_best", 0.1),
-        filter_overlapping_genes="--filter-overlapping-genes" if config.get("tm_filter_overlapping", True) else "",
+        filter_overlapping_genes="--filter-overlapping-genes" if cfg_bool(config.get("tm_filter_overlapping", True)) else "",
         overlapping_ignore_bases=config.get("tm_overlapping_ignore_bases", 0),
         script="cat.filter_transmap"
     log:
@@ -4147,6 +4154,9 @@ rule store_psl_metrics_transMap:
         db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
         ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
         prior_txTM=psl_metrics_prior_after_txTM,
+        # Store after evaluate_transcripts(transMap), which replaces the
+        # mRNA_transMap_Metrics table; otherwise job order decides what survives.
+        transMap_evaluated=f"{config['work_dir']}/databases/{{genome}}_transMap_evaluation.done",
     output:
         done=touch(f"{config['work_dir']}/databases/{{genome}}_transMap_psl_metrics.done")
     wildcard_constraints:
@@ -4171,6 +4181,9 @@ rule store_psl_metrics_transMap_pairwise:
         db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
         ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
         prior_transMap=f"{config['work_dir']}/databases/{{genome}}_transMap_psl_metrics.done",
+        # Store after evaluate_transcripts(transMap_pairwise), which replaces the
+        # mRNA_transMap_pairwise_Metrics table; otherwise job order decides what survives.
+        transMap_pairwise_evaluated=f"{config['work_dir']}/databases/{{genome}}_transMap_pairwise_evaluation.done",
     output:
         done=touch(f"{config['work_dir']}/databases/{{genome}}_transMap_pairwise_psl_metrics.done")
     wildcard_constraints:
@@ -4242,8 +4255,10 @@ rule filter_augMP:
     align_transcripts, evaluate_transcripts, store_psl_metrics_augMP and consensus.
     """
     input:
-        raw_gp=ancient(f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.gp"),
-        raw_psl=ancient(f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl"),
+        # Not ancient(): a new augMP run must reach consensus. With ancient() the
+        # canonical augMP.gp/psl stayed at the previous run (found 2026-10-14).
+        raw_gp=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.gp",
+        raw_psl=f"{config['work_dir']}/augustus/{{genome}}_augMP.raw.psl",
         generated=ancient(f"{config['work_dir']}/databases/{{genome}}_augMP_psl_generated.done"),
         augmp_fix=ancient(f"{config['work_dir']}/databases/{{genome}}_augMP_gene_names_fixed.done"),
     output:
@@ -4285,6 +4300,10 @@ rule store_psl_metrics_augMP:
         db_path=ancient(f"{config['work_dir']}/databases/{{genome}}.db"),
         ref_gp=f"{config['work_dir']}/reference/{config['ref_genome']}.gp",
         prior_pairwise=psl_metrics_prior_for_augMP,
+        # evaluate_transcripts(augMP) rewrites mRNA_augMP_Metrics (empty: augMP
+        # models have no reference transcript to align to). Store after it, or
+        # the stored PSL metrics are wiped depending on job order.
+        augmp_evaluated=f"{config['work_dir']}/databases/{{genome}}_augMP_evaluation.done",
     output:
         done=f"{config['work_dir']}/databases/{{genome}}_augMP_psl_metrics.done"
     wildcard_constraints:
@@ -4447,6 +4466,8 @@ rule generate_consensus:
             optional_flags.append("--filter-overlapping-genes")
         if config.get("filter_spurious_pc_overlaps_not_in_reference", False):
             optional_flags.append("--filter-spurious-pc-overlaps-not-in-reference")
+        if cfg_bool(config.get("dedupe_shared_exon_genes", False)):
+            optional_flags.append("--dedupe-shared-exon-genes")
         if config.get("in_species_rna_support_only", False):
             optional_flags.append("--in-species-rna-support-only")
         if not config.get("consensus_postprocess", True):
@@ -4610,6 +4631,7 @@ rule protein_refine_consensus:
         if (not PROTEIN_REFINE) or (not paf):
             copy_flag = "--copy-through"
         paf_arg = f"--miniprot-paf {paf}" if paf else ""
+        dedupe_flag = "--dedupe-shared-exon-genes" if cfg_bool(config.get("dedupe_shared_exon_genes", False)) else ""
         script_content = build_sbatch_header(
             "protein_refine",
             f"protein-refine-{genome}",
@@ -4637,6 +4659,7 @@ python -m cat.protein_refine \\
     --output-fasta {output.fasta} \\
     --output-protein-fasta {output.protein_fasta} \\
     --output-metrics-json {output.metrics_json} \\
+    {dedupe_flag} \\
     {copy_flag}
 echo "protein_refine complete for {genome}"
 echo "End time: $(date)"
@@ -4669,6 +4692,9 @@ rule annotate_novel_genes:
         ref_gtf         = WORK_DIR / f"reference/{REF_GENOME}.gtf",
         ref_fasta       = WORK_DIR / f"genome_files/{REF_GENOME}.fa",
         ref_gp_attrs    = WORK_DIR / f"reference/{REF_GENOME}.gp_attrs",
+        # close_relative evidence search is off: in the human negative control it
+        # promoted ~530 repeat-derived ORFs (2026-10-14). Re-enable by passing
+        # --evidence-protein-fasta {input.evidence_fa} once the rule is fixed.
         evidence_fa     = lambda wc: protein_fasta_for(wc.genome),
     output:
         gff3    = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_novel_annotated.gff3",
@@ -4731,7 +4757,6 @@ python -m cat.annotate_novel_genes \\
     --evalue                  {novel_evalue} \\
     --min-identity            {novel_min_id} \\
     --min-query-cover         {novel_min_qcov} \\
-    --evidence-protein-fasta  {input.evidence_fa} \\
     2>&1 | tee -a {log[0]}
 
 echo "Novel gene annotation complete for {genome}"
