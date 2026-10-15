@@ -901,6 +901,12 @@ def add_arguments(parser):
     parser.add_argument("--original-intron-support", type=float, default=0.0, help="Percent of original introns that must be preserved.")
     parser.add_argument("--in-species-rna-support-only", action="store_true", help="Use in-species RNA-seq support only, ignoring cross-species evidence.")
     parser.add_argument("--filter-overlapping-genes", action="store_true", help="Filter out overlapping CDS intervals from different genes.")
+    parser.add_argument(
+        "--dedupe-shared-exon-genes",
+        action="store_true",
+        help="Keep one protein-coding gene where different source genes share >50%% of coding-exon bases "
+             "(stacked paralog projections). Nested genes are not affected.",
+    )
     parser.add_argument("--overlapping-ignore-bases", type=int, default=0, help="Number of bases to ignore when clustering for overlap.")
     parser.add_argument("--cnv-score-similarity", type=float, default=0.80, help="Keep multi-locus transcripts if scores are within this fraction of max (default: 0.80 = 80%)")
     parser.add_argument(
@@ -1740,6 +1746,16 @@ def generate_consensus(args):
             n_broken,
         )
 
+    if getattr(args, "dedupe_shared_exon_genes", False):
+        # Run after the rescue steps too: they append transcripts after the
+        # finalize-time dedupe and would otherwise re-stack genes.
+        final_consensus = dedupe_shared_exon_genes(final_consensus, tx_dict, readthrough_gene_set)
+    # Rescues append after the genomic sort; write_consensus_gps groups
+    # transcripts into genes greedily in list order, so unsorted additions
+    # split one gene into two IDs at the same locus (704 such pairs in E. fulvus).
+    final_consensus = sorted(
+        final_consensus, key=lambda ta: (tx_dict[ta[0]].chromosome, tx_dict[ta[0]].start)
+    )
     logger.info(f"Writing consensus genePred to {args.consensus_gp}")
     consensus_gene_dict = write_consensus_gps(args.consensus_gp, args.consensus_gp_info,
                                               final_consensus, tx_dict, args.genome)
@@ -5334,6 +5350,13 @@ def finalize_consensus_after_source_gene_resolution(
         )
         logger.info(f"✓ After spurious overlap filter: {len(deduplicated_strand_resolved_consensus)} transcripts")
 
+    if bool(getattr(args, "dedupe_shared_exon_genes", False)):
+        logger.info("\nDeduplicating protein-coding genes that share coding exons...")
+        deduplicated_strand_resolved_consensus = dedupe_shared_exon_genes(
+            deduplicated_strand_resolved_consensus, tx_dict, readthrough_gene_set
+        )
+        logger.info(f"✓ After shared-exon dedupe: {len(deduplicated_strand_resolved_consensus)} transcripts")
+
     if run_resolve_overlapping_different_genes:
         logger.info("\nResolving overlapping genes with different source_gene IDs...")
         deduplicated_strand_resolved_consensus = resolve_overlapping_different_genes(
@@ -5360,6 +5383,149 @@ def finalize_consensus_after_source_gene_resolution(
     )
     logger.info(f"\n✓ Final consensus set: {len(final_consensus)} transcripts")
     return final_consensus
+
+
+def _merged_cds_blocks(tx_objs):
+    """Union of coding-exon intervals over a gene's transcripts."""
+    blocks = []
+    for tx in tx_objs:
+        s, e = tx.thick_start, tx.thick_stop
+        for iv in tx.exon_intervals:
+            a, b = max(iv.start, s), min(iv.stop, e)
+            if b > a:
+                blocks.append((a, b))
+    merged = []
+    for a, b in sorted(blocks):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _shared_bases(a, b):
+    i = j = shared = 0
+    while i < len(a) and j < len(b):
+        shared += max(0, min(a[i][1], b[j][1]) - max(a[i][0], b[j][0]))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return shared
+
+
+def dedupe_shared_exon_genes(consensus, tx_dict, readthrough_gene_set=None, min_shared_frac=0.5):
+    """Keep one protein-coding gene where different genes share coding exons.
+
+    Projecting several human paralogs onto one lemur locus leaves stacked
+    "genes" on the same coding exons (collapse-off transMap: +~1,200 such
+    pairs in E. fulvus). Genes are units of (source_gene, chromosome, strand,
+    overlapping span); two units are the same locus when they share more than
+    ``min_shared_frac`` of the shorter one's coding-exon bases. Spans alone are
+    not used, so a gene nested in another's intron is kept.
+
+    The kept unit is ranked by: reference ortholog, not a reference
+    readthrough, proper ORF, best TranscriptScore, then coding length. The
+    consensus ``score`` attribute is not used: its scale differs by mode.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    readthrough_gene_set = readthrough_gene_set or set()
+
+    by_key = collections.defaultdict(list)
+    for tx_id, attrs in consensus:
+        tx = tx_dict[tx_id]
+        if tx.cds_size <= 0:
+            continue
+        if 'protein_coding' not in (attrs.get('transcript_biotype'), attrs.get('gene_biotype')):
+            continue
+        by_key[(attrs.get('source_gene') or tx_id, tx.chromosome, tx.strand)].append((tx_id, attrs))
+
+    units = []
+    for (sg, chrom, strand), members in by_key.items():
+        members.sort(key=lambda m: tx_dict[m[0]].start)
+        cur, cur_end = [], -1
+        for m in members:
+            tx = tx_dict[m[0]]
+            if cur and tx.start < cur_end:
+                cur.append(m)
+                cur_end = max(cur_end, tx.stop)
+            else:
+                if cur:
+                    units.append((sg, chrom, strand, cur))
+                cur, cur_end = [m], tx.stop
+        if cur:
+            units.append((sg, chrom, strand, cur))
+
+    info = []
+    for sg, chrom, strand, members in units:
+        blocks = _merged_cds_blocks([tx_dict[t] for t, _ in members])
+        def _num(v):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return 0.0
+            return 0.0 if v != v else v  # NaN -> 0
+
+        def _true(v):
+            return v is True or str(v).strip().lower() in ('true', '1')
+        rank = (
+            any(a.get('transcript_class') == 'ortholog' and str(sg).startswith('ENSG') for _, a in members),
+            str(sg).split('.')[0] not in {str(x).split('.')[0] for x in readthrough_gene_set},
+            any(_true(a.get('proper_orf')) for _, a in members),
+            max(_num(a.get('transcript_score')) for _, a in members),
+            sum(b - a for a, b in blocks),
+        )
+        info.append({'sg': sg, 'chrom': chrom, 'strand': strand, 'members': members,
+                     'blocks': blocks, 'len': sum(b - a for a, b in blocks), 'rank': rank,
+                     'start': blocks[0][0], 'end': blocks[-1][1]})
+
+    parent = list(range(len(info)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    by_locus = collections.defaultdict(list)
+    for i, u in enumerate(info):
+        by_locus[(u['chrom'], u['strand'])].append(i)
+    for idxs in by_locus.values():
+        idxs.sort(key=lambda i: info[i]['start'])
+        active = []
+        for i in idxs:
+            active = [j for j in active if info[j]['end'] > info[i]['start']]
+            for j in active:
+                if info[i]['sg'] == info[j]['sg']:
+                    continue
+                shorter = min(info[i]['len'], info[j]['len'])
+                if shorter and _shared_bases(info[i]['blocks'], info[j]['blocks']) > min_shared_frac * shorter:
+                    parent[find(i)] = find(j)
+            active.append(i)
+
+    clusters = collections.defaultdict(list)
+    for i in range(len(info)):
+        clusters[find(i)].append(i)
+    drop_tx = set()
+    n_clusters = 0
+    examples = []
+    for idxs in clusters.values():
+        if len(idxs) < 2:
+            continue
+        n_clusters += 1
+        best = max(idxs, key=lambda i: info[i]['rank'])
+        for i in idxs:
+            if i != best:
+                drop_tx.update(t for t, _ in info[i]['members'])
+        if len(examples) < 5:
+            examples.append(f"kept {info[best]['sg']} over "
+                            + ",".join(str(info[i]['sg']) for i in idxs if i != best))
+    logger.info(f"  shared-exon dedupe: {n_clusters} loci with stacked genes; "
+                f"removed {len(drop_tx)} transcripts")
+    for ex in examples:
+        logger.info(f"    {ex}")
+    return [[t, a] for t, a in consensus if t not in drop_tx]
 
 
 def filter_spurious_pc_overlaps_not_in_reference(
