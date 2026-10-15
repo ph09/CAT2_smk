@@ -88,6 +88,7 @@ def _import_consensus_parallel():
         'rescue_alternative_source_isoforms',
         'build_alignment_coverage_map',
         'norm_ensg',
+        'dedupe_shared_exon_genes',
     ]
     out = {n: getattr(cp, n) for n in names}
     missing = [n for n, fn in out.items() if fn is None]
@@ -113,6 +114,7 @@ load_metrics_from_db = _cp['load_metrics_from_db']
 load_evaluations_from_db = _cp['load_evaluations_from_db']
 deduplicate_consensus = _cp['deduplicate_consensus']
 finalize_consensus_after_source_gene_resolution = _cp['finalize_consensus_after_source_gene_resolution']
+dedupe_shared_exon_genes = _cp['dedupe_shared_exon_genes']
 resolve_overlapping_cds_intervals = _cp['resolve_overlapping_cds_intervals']
 calculate_completeness = _cp['calculate_completeness']
 write_consensus_gps = _cp['write_consensus_gps']
@@ -2470,7 +2472,7 @@ def generate_consensus(args):
     if getattr(args, "dedupe_shared_exon_genes", False):
         # Run after the rescue steps too: they append transcripts after the
         # finalize-time dedupe and would otherwise re-stack genes.
-        final_consensus = _cp.dedupe_shared_exon_genes(final_consensus, tx_dict, readthrough_gene_set)
+        final_consensus = dedupe_shared_exon_genes(final_consensus, tx_dict, readthrough_gene_set)
     # Rescues append after the genomic sort; write_consensus_gps groups
     # transcripts into genes greedily in list order, so unsorted additions
     # split one gene into two IDs at the same locus (704 such pairs in E. fulvus).
