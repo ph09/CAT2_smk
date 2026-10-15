@@ -943,14 +943,20 @@ def cds_needs_replace(
     seleno = symbol in (seleno_symbols or ())
     old_aa = peptide_aa_len(protein, int(g.get("cds_size") or 0), seleno=seleno)
     if peptide_is_clean(protein, seleno=seleno):
-        # A clean transMap/augTM peptide is the spliced locus. Miniprot's
-        # compact block is often a short isoform of the same protein and
-        # must not replace it, even when UniProt "typical" is that stub.
-        if is_projection_mode(g) and new_span < old_span:
-            return None
         if not typ_aa:
             return None
         if _near_typical(old_aa, typ_aa):
+            return None
+        if new_aa is not None and is_projection_mode(g):
+            # A clean transMap/augTM peptide is never shortened: miniprot's
+            # compact block is often a short isoform, even when UniProt
+            # "typical" is that stub. A truncated projection may be expanded,
+            # judged on protein length: its genomic span is often longer
+            # than the full miniprot gene (PPP1R3A 191 aa vs typical 1123).
+            if new_aa <= old_aa or not _near_typical(new_aa, typ_aa):
+                return None
+            return "expand"
+        if is_projection_mode(g) and new_span < old_span:
             return None
         if new_aa is not None:
             if abs(new_aa - typ_aa) >= abs(old_aa - typ_aa):
@@ -1795,11 +1801,24 @@ def overlaps_other_gene(
     self_gi: int,
     genes: list[dict],
     same_chrom: list[int],
+    strand: str | None = None,
 ) -> bool:
+    """True when the new span would run into a different protein-coding gene.
+
+    Only same-strand protein_coding models of another gene block: antisense
+    models, lncRNAs and demoted unknown_likely_coding fragments (often pieces
+    of this same gene) cannot be fused into it. Counting them blocked ~2/3 of
+    candidate corrections in E. fulvus, including truncated CENPE and NEDD4.
+    """
+    self_gene = genes[self_gi].get("gene_id")
     for gj in same_chrom:
         if gj == self_gi:
             continue
         g = genes[gj]
+        if strand is not None and g.get("strand") != strand:
+            continue
+        if g.get("biotype") != "protein_coding" or g.get("gene_id") == self_gene:
+            continue
         if overlap_bp(span, (int(g["start"]), int(g["end"]))) >= 100:
             return True
     return False
@@ -1849,7 +1868,7 @@ def apply_structure(
         chosen = choose_protein_span(g, a["hit"], index_by_chrom.get(g["chrom"]), ref_struct)
         if chosen.qcov < FULL_PROTEIN_QCOV or chosen.length < MIN_PROTEIN_SPAN:
             continue
-        if overlaps_other_gene(chosen.span, gi, genes, genes_by_chrom[g["chrom"]]):
+        if overlaps_other_gene(chosen.span, gi, genes, genes_by_chrom[g["chrom"]], chosen.strand):
             continue
         key = (chosen.chrom, chosen.start, chosen.end, chosen.query)
         exons = exon_lookup.get(key)
@@ -1967,6 +1986,27 @@ def write_outputs(
         if not attrs.get("protein_refine") or attrs.get("protein_refine") in NA:
             attrs["protein_refine"] = "rescued"
         gene_dict[tx.chromosome].setdefault(rec["gene_id"], []).append((tx, attrs))
+
+    if getattr(args, "dedupe_shared_exon_genes", False):
+        # Rescues and real-copy calls can land on the coding exons of an
+        # existing ortholog; keep one gene per locus with the consensus rule.
+        from cat.consensus_parallel import dedupe_shared_exon_genes
+        tx_dict, flat = {}, []
+        for chrom in gene_dict:
+            for tx_list in gene_dict[chrom].values():
+                for tx_obj, attrs in tx_list:
+                    tx_dict[tx_obj.name] = tx_obj
+                    flat.append([tx_obj.name, attrs])
+        kept = {t for t, _ in dedupe_shared_exon_genes(flat, tx_dict)}
+        dropped = set(tx_dict) - kept
+        if dropped:
+            for chrom in gene_dict:
+                for gid in list(gene_dict[chrom]):
+                    gene_dict[chrom][gid] = [(t, a) for t, a in gene_dict[chrom][gid] if t.name not in dropped]
+                    if not gene_dict[chrom][gid]:
+                        del gene_dict[chrom][gid]
+            out_info_rows = [r for r in out_info_rows if str(r.get("transcript_id")) not in dropped]
+            stats["shared_exon_dedupe_removed"] = len(dropped)
 
     gp_lines = []
     for chrom in sorted(gene_dict):
@@ -2234,6 +2274,8 @@ def _safe(sym: str) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--genome", required=True)
+    ap.add_argument("--dedupe-shared-exon-genes", action="store_true",
+                    help="Keep one protein-coding gene where different genes share coding exons.")
     ap.add_argument("--consensus-gp", required=True)
     ap.add_argument("--consensus-gp-info", required=True)
     ap.add_argument("--consensus-gff3", required=True)
