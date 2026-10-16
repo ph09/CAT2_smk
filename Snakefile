@@ -4765,6 +4765,7 @@ python -m cat.evidence_rules \\
     --protein-db     {input.evidence_fa} \\
     --close-taxids   {close_taxids} \\
     --ref-gp-attrs   {input.ref_gp_attrs} \\
+    --ref-gp         {work_dir}/reference/{REF_GENOME}.gp \\
     --report         {work_dir}/consensus_gene_set/{genome}_evidence_rules.txt \\
     2>&1 | tee -a {log[0]}
 rm -f {output.gp}.pre {output.gp_info}.pre {output.gff3}.pre
