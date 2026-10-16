@@ -5414,18 +5414,21 @@ def _shared_bases(a, b):
     return shared
 
 
-def dedupe_shared_exon_genes(consensus, tx_dict, readthrough_gene_set=None, min_shared_frac=0.5):
+def dedupe_shared_exon_genes(consensus, tx_dict, readthrough_gene_set=None, min_shared_frac=0.5,
+                             reciprocal=True):
     """Keep one protein-coding gene where different genes share coding exons.
 
     Projecting several human paralogs onto one lemur locus leaves stacked
     "genes" on the same coding exons (collapse-off transMap: +~1,200 such
     pairs in E. fulvus). Genes are units of (source_gene, chromosome, strand,
-    overlapping span); two units are the same locus when they share more than
-    ``min_shared_frac`` of the shorter one's coding-exon bases. Spans alone are
-    not used, so a gene nested in another's intron is kept.
+    overlapping span); two units are the same locus when their shared
+    coding-exon bases exceed ``min_shared_frac`` of BOTH units. Spans alone are
+    not used, so a gene nested in another's intron is kept, and a short gene
+    inside a readthrough/long model's exons is not merged into it.
 
-    The kept unit is ranked by: reference ortholog, not a reference
-    readthrough, proper ORF, best TranscriptScore, then coding length. The
+    The kept unit is ranked by: protein_refine rescue, reference ortholog,
+    not a reference readthrough, proper ORF, best TranscriptScore, then
+    coding length. The
     consensus ``score`` attribute is not used: its scale differs by mode.
     """
     import logging
@@ -5470,6 +5473,11 @@ def dedupe_shared_exon_genes(consensus, tx_dict, readthrough_gene_set=None, min_
         def _true(v):
             return v is True or str(v).strip().lower() in ('true', '1')
         rank = (
+            # protein_refine rescues were placed only after checking they are
+            # not the same gene as a named model there, and are full-length,
+            # intact and >=80% identical; an overlapping model is then usually
+            # a mislabelled paralog projection (43 of 50 BUSCOs lost otherwise).
+            any(str(a.get('protein_refine')) == 'rescued' for _, a in members),
             any(a.get('transcript_class') == 'ortholog' and str(sg).startswith('ENSG') for _, a in members),
             str(sg).split('.')[0] not in {str(x).split('.')[0] for x in readthrough_gene_set},
             any(_true(a.get('proper_orf')) for _, a in members),
@@ -5499,8 +5507,12 @@ def dedupe_shared_exon_genes(consensus, tx_dict, readthrough_gene_set=None, min_
             for j in active:
                 if info[i]['sg'] == info[j]['sg']:
                     continue
-                shorter = min(info[i]['len'], info[j]['len'])
-                if shorter and _shared_bases(info[i]['blocks'], info[j]['blocks']) > min_shared_frac * shorter:
+                # Reciprocal: the shared coding bases must cover most of BOTH
+                # genes. Against the shorter gene only, a readthrough or long
+                # isoform "stacked" with each real neighbour and one of two
+                # distinct genes was dropped (39 BUSCOs lost in E. fulvus).
+                ref_len = (max if reciprocal else min)(info[i]['len'], info[j]['len'])
+                if ref_len and _shared_bases(info[i]['blocks'], info[j]['blocks']) > min_shared_frac * ref_len:
                     parent[find(i)] = find(j)
             active.append(i)
 
