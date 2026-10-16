@@ -56,10 +56,14 @@ def validate_config():
         if not isinstance(pdb, dict):
             errors.append("'protein_db' must be a mapping (species / taxa / clades / base_fasta / out)")
         else:
-            if not (pdb.get("species") or pdb.get("taxa") or pdb.get("clades") or pdb.get("base_fasta")):
-                errors.append("'protein_db' must set at least one of species, taxa, clades, or base_fasta")
+            if not (pdb.get("species") or pdb.get("taxa") or pdb.get("clades") or pdb.get("base_fasta")
+                    or pdb.get("extra_fastas")):
+                errors.append("'protein_db' must set at least one of species, taxa, clades, base_fasta, "
+                              "or extra_fastas")
             if pdb.get("base_fasta"):
                 file_checks.append(("protein_db.base_fasta", pdb["base_fasta"]))
+            for ef in pdb.get("extra_fastas") or []:
+                file_checks.append(("protein_db.extra_fastas", ef))
     elif config.get("protein_fasta"):
         file_checks.append(("protein_fasta", config["protein_fasta"]))
     elif config.get("augustus", False):
@@ -2719,6 +2723,7 @@ if BUILD_PROTEIN_DB:
             max_per_clade=_PROTEIN_DB_CFG.get("max_per_clade", 25),
             clade_include_other=_PROTEIN_DB_CFG.get("clade_include_other", False),
             base_fasta=_PROTEIN_DB_CFG.get("base_fasta", ""),
+            extra_fastas=_PROTEIN_DB_CFG.get("extra_fastas") or [],
             min_len=_PROTEIN_DB_CFG.get("min_len", 20),
             dedup=_PROTEIN_DB_CFG.get("dedup", True),
             script=str(CAT2_ROOT / "scripts" / "build_protein_db.py"),
@@ -2742,6 +2747,8 @@ if BUILD_PROTEIN_DB:
                 args += ["--clade-include-other"]
             if params.base_fasta:
                 args += ["--base-fasta", str(params.base_fasta)]
+            for ef in params.extra_fastas:
+                args += ["--extra-fasta", str(ef)]
             args += ["--min-len", str(params.min_len)]
             if not params.dedup:
                 args += ["--no-dedup"]
