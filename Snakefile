@@ -197,6 +197,18 @@ _PROTEIN_FASTA_BY_GENOME = config.get("protein_fasta_by_genome") or {}
 def protein_fasta_for(genome):
     return _PROTEIN_FASTA_BY_GENOME.get(genome, PROTEIN_FASTA)
 
+
+# Per-genome close relatives for cat.evidence_rules: `close_relative_taxids:
+# {genome: [taxid, ...]}` (protein DB header prefixes). Genomes listed here get
+# evidence copies + protein_coding precision rules after annotate_novel_genes;
+# others are unchanged. Exclude the genome's own species.
+_CLOSE_RELATIVE_TAXIDS = config.get("close_relative_taxids") or {}
+
+
+def close_taxids_for(genome):
+    t = _CLOSE_RELATIVE_TAXIDS.get(genome) or []
+    return ",".join(str(x) for x in (t if isinstance(t, (list, tuple)) else str(t).split(",")))
+
 # Pipeline modes and constraints
 VALID_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "miniprot", "txTM", "augPB", "strg"]
 VALID_ALIGNMENT_MODES = ["transMap", "transMap_pairwise", "augTM", "augTMR", "augTM_pairwise", "augTMR_pairwise", "augMP", "txTM"]
@@ -4696,6 +4708,10 @@ rule annotate_novel_genes:
         # promoted ~530 repeat-derived ORFs (2026-10-14). Re-enable by passing
         # --evidence-protein-fasta {input.evidence_fa} once the rule is fixed.
         evidence_fa     = lambda wc: protein_fasta_for(wc.genome),
+        # cat.evidence_rules inputs, only for genomes in close_relative_taxids
+        ev_paf          = lambda wc: [f"{config['work_dir']}/miniprot/{wc.genome}_miniprot.paf"] if close_taxids_for(wc.genome) else [],
+        ev_miniprot_gp  = lambda wc: [f"{config['work_dir']}/miniprot/{wc.genome}_miniprot_consensus.gp"] if close_taxids_for(wc.genome) else [],
+        ev_genome_fa    = lambda wc: [f"{config['work_dir']}/genome_files/{wc.genome}.fa"] if close_taxids_for(wc.genome) else [],
     output:
         gff3    = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_novel_annotated.gff3",
         gp_info = f"{config['work_dir']}/consensus_gene_set/{{genome}}_consensus_novel_annotated.gp_info",
@@ -4728,6 +4744,32 @@ rule annotate_novel_genes:
         novel_min_qcov   = config.get('novel_annotation_min_query_cover', 20.0)
         novel_paralog_cap = config.get('novel_paralog_max_copies', 20)
 
+        # Genomes with close relatives get cat.evidence_rules as a post-pass:
+        # annotate_novel_genes writes *.pre files that evidence_rules rewrites.
+        close_taxids = close_taxids_for(genome)
+        pre = ".pre" if close_taxids else ""
+        evidence_step = ""
+        if close_taxids:
+            evidence_step = f"""
+set -o pipefail
+python -m cat.evidence_rules \\
+    --gp             {output.gp}.pre \\
+    --gp-info        {output.gp_info}.pre \\
+    --gff3           {output.gff3}.pre \\
+    --output-gp      {output.gp} \\
+    --output-gp-info {output.gp_info} \\
+    --output-gff3    {output.gff3} \\
+    --genome-fasta   {input.ev_genome_fa} \\
+    --miniprot-paf   {input.ev_paf} \\
+    --miniprot-gp    {input.ev_miniprot_gp} \\
+    --protein-db     {input.evidence_fa} \\
+    --close-taxids   {close_taxids} \\
+    --ref-gp-attrs   {input.ref_gp_attrs} \\
+    --report         {work_dir}/consensus_gene_set/{genome}_evidence_rules.txt \\
+    2>&1 | tee -a {log[0]}
+rm -f {output.gp}.pre {output.gp_info}.pre {output.gff3}.pre
+"""
+
         script_content = build_sbatch_header(
             "annotate_novel_genes",
             f"novel-annot-{genome}",
@@ -4747,9 +4789,9 @@ python -m cat.annotate_novel_genes \\
     --ref-gtf                 {input.ref_gtf} \\
     --ref-fasta               {input.ref_fasta} \\
     --ref-gp-attrs            {input.ref_gp_attrs} \\
-    --output-gff3             {output.gff3} \\
-    --output-gp-info          {output.gp_info} \\
-    --output-gp               {output.gp} \\
+    --output-gff3             {output.gff3}{pre} \\
+    --output-gp-info          {output.gp_info}{pre} \\
+    --output-gp               {output.gp}{pre} \\
     --consensus-metrics-json  {input.metrics_json} \\
     --output-metrics-json     {output.metrics_json} \\
     --novel-paralog-max-copies {novel_paralog_cap} \\
@@ -4758,7 +4800,7 @@ python -m cat.annotate_novel_genes \\
     --min-identity            {novel_min_id} \\
     --min-query-cover         {novel_min_qcov} \\
     2>&1 | tee -a {log[0]}
-
+{evidence_step}
 echo "Novel gene annotation complete for {genome}"
 echo "End time: $(date)"
 """
