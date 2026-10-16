@@ -389,6 +389,11 @@ def main() -> int:
     ap.add_argument("--base-fasta", default=None,
                     help="Optional local protein FASTA to include (e.g. proteins "
                          "derived from your reference GFF3).")
+    ap.add_argument("--extra-fasta", action="append", default=[],
+                    help="Local protein FASTA merged with headers kept as-is "
+                         "(repeatable), e.g. RefSeq sets already tagged "
+                         "'taxid|ref|XP_...' with GN= symbols "
+                         "(scripts/refseq_proteins_for_db.py).")
     ap.add_argument("--source", default="uniprot", choices=("uniprot",),
                     help="Protein source (only 'uniprot' is implemented).")
     ap.add_argument("--cache-dir", default=None,
@@ -418,8 +423,8 @@ def main() -> int:
 
     clades = _split_list(args.clades)
 
-    if not species and not taxa and not clades and not args.base_fasta:
-        ap.error("nothing to do: give --species, --taxa, --clades, and/or --base-fasta")
+    if not species and not taxa and not clades and not args.base_fasta and not args.extra_fasta:
+        ap.error("nothing to do: give --species, --taxa, --clades, --base-fasta and/or --extra-fasta")
 
     out = Path(args.out)
     cache_dir = Path(args.cache_dir) if args.cache_dir else out.parent / "_cache"
@@ -508,6 +513,10 @@ def main() -> int:
         if not bf.exists():
             raise SystemExit(f"ERROR: --base-fasta not found: {bf}")
         sources.append(("ref", bf))
+    for ef in args.extra_fasta:
+        if not Path(ef).exists():
+            raise SystemExit(f"ERROR: --extra-fasta not found: {ef}")
+        sources.append((None, Path(ef)))
 
     if not sources:
         raise SystemExit("ERROR: no protein sources were obtained; nothing written.")
