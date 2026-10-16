@@ -28,8 +28,18 @@ Precision rules (genes not projected from a reference protein-coding gene)
     R5 protein_refine copy named by symbol, < 70% of that symbol's longest
        projected protein                       -> unknown_likely_coding
 
+Evidence extensions (protein_coding genes projected from a reference gene)
+    A gene whose longest protein is < 90% of its reference gene's longest
+    protein gets, as an extra isoform, an intact miniprot model built from a
+    full-length close-relative alignment of the same gene symbol that is >= 10%
+    longer and at most 5% longer than the reference protein (close-relative
+    predictions often carry spurious extensions). The model must cover >= 50%
+    of the gene's CDS and share <= 20% of its CDS with any other protein_coding
+    gene.
+
 Demoted genes stay in the annotation; the reason is written to
-miniprot_novel_call. Evidence copies are labelled 'evidence_copy'.
+miniprot_novel_call. Evidence copies are labelled 'evidence_copy', added
+isoforms 'evidence_extension'.
 """
 from __future__ import annotations
 
@@ -61,6 +71,11 @@ COPY_MAX_PC_SHARE = 0.2
 RECOVERED_COV = 0.5
 MASK_MAX = 0.5
 NAMED_COPY_MIN_FRAC = 0.7
+EXT_MIN_GAIN = 1.1
+EXT_MIN_OLD_COV = 0.5
+EXT_MATCH_COV = 0.9
+EXT_TRUNCATED = 0.9
+EXT_MAX_OVER_REF = 1.05
 
 TE_RE = re.compile(r"retrovir|transpos|reverse transcriptase|LINE-1|\bL1\b|ORF1p|ORF2p|\bgag\b|\bpol\b|"
                    r"\benv\b|envelope|integrase|piggybac|tigger|jerky|pogo|endogenous", re.I)
@@ -247,6 +262,28 @@ class Annotation:
             "pseudogene" in b or b in ("lncRNA", "TEC") or b.startswith(("TR_", "IG_")))
 
 
+def read_ref_protein_aa(ref_gp, gp_attrs):
+    """reference gene (versionless) -> longest protein length (aa)."""
+    tx2g = {}
+    with open(gp_attrs) as fh:
+        for line in fh:
+            k, a, v = line.rstrip("\n").split("\t")[:3]
+            if k.startswith("ENST") and a == "gene_id":
+                tx2g[k] = v.split(".")[0]
+    out = collections.defaultdict(int)
+    with open(ref_gp) as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            g = tx2g.get(f[0])
+            cs, ce = int(f[5]), int(f[6])
+            if not g or ce <= cs:
+                continue
+            n = sum(max(0, min(int(e), ce) - max(int(s), cs))
+                    for s, e in zip(f[8].rstrip(",").split(","), f[9].rstrip(",").split(",")))
+            out[g] = max(out[g], n // 3 - 1)
+    return out
+
+
 def read_ref_biotypes(gp_attrs):
     bt = {}
     with open(gp_attrs) as fh:
@@ -413,6 +450,77 @@ def precision_rules(ann, loci, seqs, stats, skip_genes=()):
     return set_bt, regene
 
 
+# ── evidence extensions ───────────────────────────────────────────────────────
+
+def evidence_extensions(ann, alns, miniprot_rows, seqs, stats, ref_aa, skip_genes=()):
+    """Return [(gp_row, gene_id)]: full-length miniprot models to add as isoforms."""
+    mp_idx = Index()
+    for row in miniprot_rows:
+        tx = GenePredTranscript(row)
+        if tx.cds_size > 0:
+            mp_idx.add(tx.chromosome, tx.strand, tx.thick_start, tx.thick_stop, (row, tx))
+    mp_idx.finish()
+    pc_idx = Index()
+    pc = {}
+    for g in ann.genes:
+        if g in skip_genes or not ann.is_pc(g):
+            continue
+        txs = ann.coding(g)
+        if not txs:
+            continue
+        m = _merged_cds_blocks(txs)
+        pc[g] = (txs, m)
+        pc_idx.add(txs[0].chromosome, txs[0].strand, m[0][0], m[-1][1], (g, m))
+    pc_idx.finish()
+    by_sym = collections.defaultdict(list)
+    for a in alns:
+        by_sym[(a[0], a[1], a[3])].append(a)
+
+    out = []
+    for g, (txs, m) in pc.items():
+        name = ann.gene_x(g)["source_gene_common_name"].upper()
+        if not name or name in ("N/A", "NONE", "NAN"):
+            continue
+        ref_max = max((ref_aa.get(ann.src(t), 0) for t in ann.genes[g]), default=0)
+        old_aa = max(t.cds_size for t in txs) // 3 - 1
+        if not ref_max or old_aa >= EXT_TRUNCATED * ref_max:
+            continue
+        c, s_ = txs[0].chromosome, txs[0].strand
+        old_len = sum(b - a for a, b in m)
+        best = None
+        for a in by_sym.get((c, s_, name), []):
+            ex = a[2]
+            if ex[-1][1] <= m[0][0] or ex[0][0] >= m[-1][1]:
+                continue
+            ev_len = sum(y - x for x, y in ex)
+            if ev_len // 3 < EXT_MIN_GAIN * old_aa or ev_len // 3 > EXT_MAX_OVER_REF * ref_max \
+                    or _shared_bases(ex, m) < EXT_MIN_OLD_COV * old_len:
+                continue
+            for row, tx in mp_idx.overlapping(c, s_, ex[0][0], ex[-1][1]):
+                b = cds_blocks(tx)
+                L = sum(y - x for x, y in b)
+                sh = _shared_bases(ex, b)
+                if sh < EXT_MATCH_COV * ev_len or sh < EXT_MATCH_COV * L:
+                    continue
+                new_aa = L // 3 - 1
+                if new_aa < EXT_MIN_GAIN * old_aa or new_aa > EXT_MAX_OVER_REF * ref_max \
+                        or _shared_bases(b, m) < EXT_MIN_OLD_COV * old_len:
+                    continue
+                if any(og != g and _shared_bases(b, om) > COPY_MAX_PC_SHARE * L
+                       for og, om in pc_idx.overlapping(c, s_, tx.thick_start, tx.thick_stop)):
+                    stats["ext: would fuse with another protein_coding gene"] += 1
+                    continue
+                if not intact_peptide(tx, seqs):
+                    continue
+                if best is None or L > best[1]:
+                    best = (row, L)
+        if best:
+            out.append((best[0], g))
+            stats[f"ext: isoform added ({ann.gene_x(g)['alignment_mode']} gene)"] += 1
+    stats["ext: genes extended"] = len(out)
+    return out
+
+
 # ── writing ───────────────────────────────────────────────────────────────────
 
 def _attrs(s):
@@ -428,15 +536,25 @@ def _render(d):
     return ";".join(f"{k}={v}" for k, v in d.items())
 
 
+def _prefix(ann):
+    m = re.match(r"^(.*_)G\d+$", next(iter(ann.genes)))
+    return m.group(1) if m else "EV_"
+
+
+def _next_index(ids, tag):
+    """1 + the largest number already used after `tag` in ids (so reruns never collide)."""
+    nums = [int(m.group(1)) for i in ids for m in [re.search(tag + r"(\d+)$", i)] if m]
+    return max(nums, default=0) + 1
+
+
 def new_ids(ann, n):
     """n fresh (gene_id, transcript_id) pairs in the annotation's naming scheme."""
-    some = next(iter(ann.genes))
-    m = re.match(r"^(.*_)G\d+$", some)
-    prefix = m.group(1) if m else "EVC_"
-    return [(f"{prefix}GEVC{i:06d}", f"{prefix}TEVC{i:06d}") for i in range(1, n + 1)]
+    prefix = _prefix(ann)
+    start = max(_next_index(ann.genes, "GEVC"), _next_index(ann.info, "TEVC"))
+    return [(f"{prefix}GEVC{i:06d}", f"{prefix}TEVC{i:06d}") for i in range(start, start + n)]
 
 
-def gff3_records(row, gene_id, tx_id, attrs):
+def gff3_records(row, gene_id, tx_id, attrs, with_gene=True):
     tx = GenePredTranscript(row)
     chrom, strand = tx.chromosome, tx.strand
     base = dict(attrs, gene_id=gene_id, transcript_id=tx_id)
@@ -446,6 +564,8 @@ def gff3_records(row, gene_id, tx_id, attrs):
                                               gene_sources="miniprot", ID=gene_id, Name=gene_id))],
              [chrom, "CAT", "transcript", tx.start + 1, tx.stop, ".", strand, ".",
               _render(collections.OrderedDict(base, Parent=gene_id, ID=tx_id, Name=gene_id))]]
+    if not with_gene:
+        lines = lines[1:]
     exons = [(e.start, e.stop) for e in tx.exon_intervals]
     order = exons if strand == "+" else exons[::-1]
     for i, (a, b) in enumerate(order):
@@ -463,7 +583,7 @@ def gff3_records(row, gene_id, tx_id, attrs):
     return ["\t".join(map(str, l)) for l in lines]
 
 
-def write_outputs(ann, args, set_bt, regene, promote, inserts, drop):
+def write_outputs(ann, args, set_bt, regene, promote, inserts, drop, extensions=()):
     tx_set = {}       # transcript -> dict of gp_info/GFF3 attribute overrides
     for g in promote:
         for t in ann.genes[g]:
@@ -484,12 +604,20 @@ def write_outputs(ann, args, set_bt, regene, promote, inserts, drop):
                  alignment_mode="miniprot", transcript_class="putative_novel", source_transcript=row[0],
                  alignment_id=row[0], source_gene_common_name=r["symbol"], miniprot_novel_call="evidence_copy")
         new_rows.append((row, gid, tid, x))
+    ext_rows = []
+    tprefix = _prefix(ann)
+    for i, (row, g) in enumerate(extensions, _next_index(ann.info, "TEVX")):
+        x = dict(ann.gene_x(g))
+        x.update(transcript_id=f"{tprefix}TEVX{i:06d}", transcript_biotype=PROTEIN_CODING,
+                 alignment_mode="miniprot", alignment_id=row[0], source_transcript=row[0],
+                 miniprot_novel_call="evidence_extension")
+        ext_rows.append((row, g, x["transcript_id"], x))
 
     with open(args.output_gp, "w") as fh:
         for t, f in ann.gp_rows.items():
             if t not in drop_tx:
                 fh.write("\t".join(f) + "\n")
-        for row, gid, tid, _ in new_rows:
+        for row, gid, tid, _ in new_rows + ext_rows:
             fh.write("\t".join([tid] + row[1:]) + "\n")
     with open(args.output_gp_info, "w") as fh:
         w = csv.DictWriter(fh, fieldnames=ann.fields, delimiter="\t", extrasaction="ignore")
@@ -498,7 +626,7 @@ def write_outputs(ann, args, set_bt, regene, promote, inserts, drop):
             if t in drop_tx:
                 continue
             w.writerow(dict(x, **tx_set.get(t, {})))
-        for _, _, _, x in new_rows:
+        for _, _, _, x in new_rows + ext_rows:
             w.writerow(x)
 
     # gene spans after R3 merges
@@ -508,6 +636,10 @@ def write_outputs(ann, args, set_bt, regene, promote, inserts, drop):
             tx = ann.tx(t)
             a, b = span.get(kg, (tx.start, tx.stop))
             span[kg] = (min(a, tx.start), max(b, tx.stop))
+    for row, g, _, _ in ext_rows:
+        tx = GenePredTranscript(row)
+        a, b = span.get(g, (min(ann.tx(t).start for t in ann.genes[g]), max(ann.tx(t).stop for t in ann.genes[g])))
+        span[g] = (min(a, tx.start), max(b, tx.stop))
     merged_away = set(regene)
     gene_bt = {g: v[0] for g, v in set_bt.items()}
     gene_bt.update({g: PROTEIN_CODING for g in promote})
@@ -547,6 +679,12 @@ def write_outputs(ann, args, set_bt, regene, promote, inserts, drop):
                 "alignment_id", "source_transcript", "transcript_class", "miniprot_novel_call"))
             for l in gff3_records(row, gid, tid, attrs):
                 out.write(l + "\n")
+        for row, g, tid, x in ext_rows:
+            attrs = collections.OrderedDict((k, x.get(k, "N/A")) for k in (
+                "source_gene", "source_gene_common_name", "gene_biotype", "transcript_biotype", "alignment_mode",
+                "alignment_id", "source_transcript", "transcript_class", "miniprot_novel_call"))
+            for l in gff3_records(row, g, tid, attrs, with_gene=False):
+                out.write(l + "\n")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -567,6 +705,7 @@ def main():
     ap.add_argument("--protein-db", required=True, help="protein FASTA miniprot was run with")
     ap.add_argument("--close-taxids", required=True, help="comma-separated taxids counted as close relatives")
     ap.add_argument("--ref-gp-attrs", required=True)
+    ap.add_argument("--ref-gp", required=True, help="reference genePred (reference protein lengths)")
     ap.add_argument("--report", default=None)
     args = ap.parse_args()
 
@@ -584,7 +723,9 @@ def main():
     n_pc_before = sum(ann.is_pc(g) for g in ann.genes)
     promote, inserts, drop = evidence_copies(ann, loci, miniprot_rows, seqs, stats)
     set_bt, regene = precision_rules(ann, loci, seqs, stats, skip_genes=promote | drop)
-    write_outputs(ann, args, set_bt, regene, promote, inserts, drop)
+    extensions = evidence_extensions(ann, alns, miniprot_rows, seqs, stats,
+                                     read_ref_protein_aa(args.ref_gp, args.ref_gp_attrs), skip_genes=promote | drop | set(set_bt) | set(regene))
+    write_outputs(ann, args, set_bt, regene, promote, inserts, drop, extensions)
     n_pc_after = n_pc_before + len(promote) + len(inserts) - len(set_bt) - len(regene) \
         - sum(ann.is_pc(g) for g in drop)
     lines = [f"protein_coding genes {n_pc_before:,} -> {n_pc_after:,}"] + \
