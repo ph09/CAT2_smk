@@ -37,6 +37,14 @@ Evidence extensions (protein_coding genes projected from a reference gene)
     of the gene's CDS and share <= 20% of its CDS with any other protein_coding
     gene.
 
+protein_coding genes with no CDS in any transcript
+    A gene projected from a reference protein-coding gene gets, as an isoform,
+    an intact miniprot model of the same gene symbol (any species, the genome's
+    own included: the gene itself is already known) that overlaps it, is at most
+    5% longer than the reference protein and shares <= 20% of its CDS with any
+    other protein_coding gene ('evidence_cds_restored'). Otherwise the gene is
+    unknown_likely_coding ('no_cds').
+
 Demoted genes stay in the annotation; the reason is written to
 miniprot_novel_call. Evidence copies are labelled 'evidence_copy', added
 isoforms 'evidence_extension'.
@@ -85,12 +93,12 @@ UNCHAR_RE = re.compile(r"(PREDICTED: )?uncharacterized", re.I)
 
 # ── evidence loci ─────────────────────────────────────────────────────────────
 
-def read_protein_db_headers(path, taxa):
-    """protein id -> (SYMBOL, description) for proteins of ``taxa`` with a GN= symbol."""
+def read_protein_db_headers(path, taxa=None):
+    """protein id -> (SYMBOL, description) for proteins of ``taxa`` (all if None) with a GN= symbol."""
     out = {}
     with open(path) as fh:
         for line in fh:
-            if not (line.startswith(">") and line[1:].startswith(taxa)):
+            if not line.startswith(">") or (taxa is not None and not line[1:].startswith(taxa)):
                 continue
             m = re.search(r"GN=(\S+)", line)
             if not m:
@@ -522,6 +530,65 @@ def evidence_extensions(ann, alns, miniprot_rows, seqs, stats, ref_aa, skip_gene
     return out
 
 
+# ── protein_coding genes without a CDS ────────────────────────────────────────
+
+def _miniprot_symbol(name, all_sym):
+    p = re.sub(r"^miniprot-", "", name)
+    if p not in all_sym:
+        p = re.sub(r"_\d+$", "", p)
+    return all_sym.get(p, ("", ""))[0]
+
+
+def restore_no_cds(ann, miniprot_rows, all_sym, ref_aa, seqs, stats, skip_genes=()):
+    """Return (restored [(gp_row, gene_id)], demoted {gene_id})."""
+    pc_idx = Index()
+    for g in ann.genes:
+        txs = ann.coding(g)
+        if ann.is_pc(g) and txs:
+            m = _merged_cds_blocks(txs)
+            pc_idx.add(txs[0].chromosome, txs[0].strand, m[0][0], m[-1][1], (g, m))
+    pc_idx.finish()
+    by_sym = collections.defaultdict(list)
+    for row in miniprot_rows:
+        sym = _miniprot_symbol(row[0], all_sym)
+        if sym and int(row[6]) > int(row[5]):
+            by_sym[(row[1], row[2], sym)].append(row)
+    restored, demoted = [], set()
+    for g, ts in ann.genes.items():
+        if g in skip_genes or not ann.is_pc(g) or ann.coding(g):
+            continue
+        txs = [ann.tx(t) for t in ts]
+        chrom, strand = txs[0].chromosome, txs[0].strand
+        lo, hi = min(t.start for t in txs), max(t.stop for t in txs)
+        ref_max = max((ref_aa.get(ann.src(t), 0) for t in ts), default=0)
+        name = ann.gene_x(g)["source_gene_common_name"].upper()
+        best = None
+        if ann.ref_sourced(g) and ref_max and name not in ("", "N/A", "NONE"):
+            for row in by_sym.get((chrom, strand, name), []):
+                tx = GenePredTranscript(row)
+                if tx.stop <= lo or tx.start >= hi:
+                    continue
+                aa = tx.cds_size // 3 - 1
+                if aa > EXT_MAX_OVER_REF * ref_max or aa < COPY_MIN_AA // 2:
+                    continue
+                b = cds_blocks(tx)
+                L = sum(y - x for x, y in b)
+                if any(_shared_bases(b, om) > COPY_MAX_PC_SHARE * L
+                       for og, om in pc_idx.overlapping(chrom, strand, tx.thick_start, tx.thick_stop)):
+                    continue
+                if not intact_peptide(tx, seqs):
+                    continue
+                if best is None or aa > best[1]:
+                    best = (row, aa)
+        if best:
+            restored.append((best[0], g))
+            stats["no_cds: CDS restored from miniprot model"] += 1
+        else:
+            demoted.add(g)
+            stats["no_cds: demoted (" + ("reference-sourced" if ann.ref_sourced(g) else "other") + ")"] += 1
+    return restored, demoted
+
+
 # ── writing ───────────────────────────────────────────────────────────────────
 
 def _attrs(s):
@@ -607,11 +674,12 @@ def write_outputs(ann, args, set_bt, regene, promote, inserts, drop, extensions=
         new_rows.append((row, gid, tid, x))
     ext_rows = []
     tprefix = _prefix(ann)
-    for i, (row, g) in enumerate(extensions, _next_index(ann.info, "TEVX")):
+    for i, ext in enumerate(extensions, _next_index(ann.info, "TEVX")):
+        row, g = ext[0], ext[1]
         x = dict(ann.gene_x(g))
         x.update(transcript_id=f"{tprefix}TEVX{i:06d}", transcript_biotype=PROTEIN_CODING,
                  alignment_mode="miniprot", alignment_id=row[0], source_transcript=row[0],
-                 miniprot_novel_call="evidence_extension")
+                 miniprot_novel_call=ext[2] if len(ext) > 2 else "evidence_extension")
         ext_rows.append((row, g, x["transcript_id"], x))
 
     with open(args.output_gp, "w") as fh:
@@ -724,8 +792,14 @@ def main():
     n_pc_before = sum(ann.is_pc(g) for g in ann.genes)
     promote, inserts, drop = evidence_copies(ann, loci, miniprot_rows, seqs, stats)
     set_bt, regene = precision_rules(ann, loci, seqs, stats, skip_genes=promote | drop)
-    extensions = evidence_extensions(ann, alns, miniprot_rows, seqs, stats,
-                                     read_ref_protein_aa(args.ref_gp, args.ref_gp_attrs), skip_genes=promote | drop | set(set_bt) | set(regene))
+    ref_aa = read_ref_protein_aa(args.ref_gp, args.ref_gp_attrs)
+    skip = promote | drop | set(set_bt) | set(regene)
+    extensions = evidence_extensions(ann, alns, miniprot_rows, seqs, stats, ref_aa, skip_genes=skip)
+    restored, no_cds = restore_no_cds(ann, miniprot_rows, read_protein_db_headers(args.protein_db),
+                                      ref_aa, seqs, stats, skip_genes=skip)
+    extensions = extensions + [(row, g, "evidence_cds_restored") for row, g in restored]
+    for g in no_cds:
+        set_bt[g] = (UNKNOWN_LIKELY_CODING, "no_cds")
     write_outputs(ann, args, set_bt, regene, promote, inserts, drop, extensions)
     n_pc_after = n_pc_before + len(promote) + len(inserts) - len(set_bt) - len(regene) \
         - sum(ann.is_pc(g) for g in drop)
