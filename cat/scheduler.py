@@ -471,6 +471,9 @@ class Scheduler(ABC):
 # sacct states considered terminal failures (mirrors historical *_slurm.py).
 _SLURM_FAILED_STATES = {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL"}
 _SLURM_SUCCESS_STATES = {"COMPLETED"}
+_SLURM_FINAL_STATES = _SLURM_FAILED_STATES | _SLURM_SUCCESS_STATES | {"DEADLINE", "REVOKED", "SPECIAL_EXIT"}
+_SACCT_SETTLE_TRIES = 18
+_SACCT_SETTLE_WAIT_S = 10
 
 
 class SlurmScheduler(Scheduler):
@@ -712,14 +715,27 @@ class SlurmScheduler(Scheduler):
         ``.batch`` row is treated as failure (the payload exit code lives
         there even when the parent shows COMPLETED 0:0).
         """
-        try:
-            res = subprocess.run(
-                ["sacct", "-j", str(job_id), "--format=JobID,State,ExitCode",
-                 "--noheader", "--parsable2"],
-                capture_output=True, text=True, check=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            return JobResult(ok=True, detail=f"sacct unavailable: {e}; assuming success")
+        # sacct can lag squeue by a few seconds: a task that has just left the
+        # queue may still read RUNNING / COMPLETING. Re-query until every row
+        # is in a final state (or give up after ~3 min and judge what we have).
+        for attempt in range(_SACCT_SETTLE_TRIES):
+            try:
+                res = subprocess.run(
+                    ["sacct", "-j", str(job_id), "--format=JobID,State,ExitCode",
+                     "--noheader", "--parsable2"],
+                    capture_output=True, text=True, check=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                return JobResult(ok=True, detail=f"sacct unavailable: {e}; assuming success")
+            pending = [line.split("|")[0] for line in res.stdout.strip().splitlines()
+                       if len(line.split("|")) >= 3 and ".extern" not in line.split("|")[0]
+                       and (line.split("|")[1].split() or [""])[0] not in _SLURM_FINAL_STATES]
+            if not pending:
+                break
+            if attempt + 1 < _SACCT_SETTLE_TRIES:
+                logger.info(f"sacct still shows {len(pending)} non-final row(s) for {job_id} "
+                            f"(e.g. {pending[0]}); re-checking in {_SACCT_SETTLE_WAIT_S}s")
+                time.sleep(_SACCT_SETTLE_WAIT_S)
 
         failed: list[str] = []
         failed_task_ids: list[str] = []
