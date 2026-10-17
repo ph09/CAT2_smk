@@ -77,8 +77,9 @@ EXT_MATCH_COV = 0.9
 EXT_TRUNCATED = 0.9
 EXT_MAX_OVER_REF = 1.05
 
-TE_RE = re.compile(r"retrovir|transpos|reverse transcriptase|LINE-1|\bL1\b|ORF1p|ORF2p|\bgag\b|\bpol\b|"
-                   r"\benv\b|envelope|integrase|piggybac|tigger|jerky|pogo|endogenous", re.I)
+TE_RE = re.compile(r"retrovir|transpos|reverse transcriptase|RNA-directed DNA polymerase|LINE-1|\bL1\b|"
+                   r"ORF1p|ORF2p|\bgag\b|\bpol\b|\benv\b|envelope|integrase|ribonuclease H-like|RNase H-like|"
+                   r"RNase H type-1 domain|NYNRIN-like|piggybac|tigger|jerky|pogo|endogenous", re.I)
 UNCHAR_RE = re.compile(r"(PREDICTED: )?uncharacterized", re.I)
 
 
@@ -392,7 +393,7 @@ def precision_rules(ann, loci, seqs, stats, skip_genes=()):
     known_idx.finish()
     ev_idx = Index()
     for r in loci:
-        if not UNCHAR_RE.match(r["desc"]):
+        if not UNCHAR_RE.match(r["desc"]) and not TE_RE.search(r["desc"]):
             ev_idx.add(r["chrom"], r["strand"], r["blocks"][0][0], r["blocks"][-1][1], r)
     ev_idx.finish()
 
