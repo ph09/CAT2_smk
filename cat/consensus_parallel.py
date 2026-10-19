@@ -15,6 +15,7 @@ import multiprocessing as mp
 from functools import partial
 from pathlib import Path
 import tools.fileOps
+import tools.gff3
 import tools.intervals
 import tools.mathOps
 import tools.misc
@@ -51,6 +52,7 @@ RESCUE_REF_NONCODING_BIOTYPES = frozenset({
     'pseudogene',
     'transcribed_pseudogene',
     'lncRNA',
+    'lincRNA',  # lncRNA in older Ensembl releases
     'unprocessed_pseudogene',
 })
 
@@ -1369,14 +1371,10 @@ def generate_consensus(args):
     coding_count = ref_biotype_counts['protein_coding']
     non_coding_count = sum(y for x, y in ref_biotype_counts.items() if x != 'protein_coding')
     
-    # Create readthrough gene map from ExtraTags (check both readthrough_gene and readthrough_transcript)
-    readthrough_gene_set = set()
-    if 'ExtraTags' in ref_df.columns:
-        # Some annotations have readthrough_gene tag, some have readthrough_transcript tag
-        readthrough_mask = (ref_df['ExtraTags'].str.contains('readthrough_gene', na=False) | 
-                           ref_df['ExtraTags'].str.contains('readthrough_transcript', na=False))
-        readthrough_gene_set = set(ref_df[readthrough_mask]['GeneId'].unique())
-        logger.info(f"  Found {len(readthrough_gene_set)} readthrough genes in reference")
+    # Reference readthrough genes (GENCODE tags, else description / NAME1-NAME2)
+    readthrough_gene_set = tools.gff3.readthrough_genes(ref_df)
+    logger.info(f"  Found {len(readthrough_gene_set)} readthrough genes in reference")
+    tools.gff3.set_reference_gene_ids(ref_df['GeneId'].unique())
     
     # Build reference gene coordinate map for checking overlaps
     # This will be used to check if overlapping genes in the target also overlap in the reference
@@ -4147,15 +4145,14 @@ def filter_gene_fragments(deduplicated_consensus, tx_dict, ref_gene_coords, metr
         if mode == 'txTM':
             continue
         
-        # Check if source_gene is a valid gene ID in reference
-        # Also check if it looks like a transcript ID (starts with ENST)
-        is_transcript_id = source_gene.startswith('ENST')
+        # Check if source_gene is a valid gene ID in reference (a transcript ID
+        # or other bad data is not a key of ref_gene_coords)
         is_valid_gene = source_gene in ref_gene_coords
         
-        if not is_valid_gene or is_transcript_id:
-            # Invalid source_gene (likely a transcript ID or bad data) - remove for non-augPB/augMP
+        if not is_valid_gene:
+            # Invalid source_gene - remove for non-augPB/augMP
             source_name = tx_list[0][2].get('source_gene_common_name', source_gene)
-            reason = "transcript ID" if is_transcript_id else "not found in reference"
+            reason = "not found in reference"
             logger.info(f"  Removing gene with invalid source_gene: {source_name} ({source_gene}) on {chrom}")
             logger.info(f"    Mode: {mode}, Transcripts: {len(tx_list)} - {reason}")
             
@@ -5478,7 +5475,7 @@ def dedupe_shared_exon_genes(consensus, tx_dict, readthrough_gene_set=None, min_
             # intact and >=80% identical; an overlapping model is then usually
             # a mislabelled paralog projection (43 of 50 BUSCOs lost otherwise).
             any(str(a.get('protein_refine')) == 'rescued' for _, a in members),
-            any(a.get('transcript_class') == 'ortholog' and str(sg).startswith('ENSG') for _, a in members),
+            any(a.get('transcript_class') == 'ortholog' and tools.gff3.is_reference_gene(sg) for _, a in members),
             str(sg).split('.')[0] not in {str(x).split('.')[0] for x in readthrough_gene_set},
             any(_true(a.get('proper_orf')) for _, a in members),
             max(_num(a.get('transcript_score')) for _, a in members),
