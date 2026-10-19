@@ -161,6 +161,23 @@ if REF_GENOME not in ALL_GENOMES:
     ALL_GENOMES.append(REF_GENOME)
 TARGET_GENOMES = [g for g in ALL_GENOMES if g != REF_GENOME]
 RNASEQ_GENOMES = config.get("rnaseq_genomes", [])
+
+# --- Reference annotation format -------------------------------------------------
+# GENCODE-style GFF3 is read as is. A native Ensembl GFF3 (any species) is first
+# normalised by rule normalize_reference_gff3; RefSeq/NCBI GFF3 must be converted
+# once with programs/convert_refseq_gff3.
+from cat.reference_gff3 import detect_format as _detect_ref_format
+REF_GFF3_FORMAT = _detect_ref_format(config["annotation"]) if os.path.exists(config["annotation"]) else "gencode"
+if REF_GFF3_FORMAT == "refseq":
+    raise ValueError(
+        f"annotation {config['annotation']} is an NCBI RefSeq GFF3. Convert it first:\n"
+        f"  programs/convert_refseq_gff3 {config['annotation']} ref.cat.gff3 --assembly-report <GCF_..._assembly_report.txt>\n"
+        "and set annotation: to the converted file.")
+if REF_GFF3_FORMAT == "unknown":
+    print(f"WARNING: could not recognise the layout of {config['annotation']}; using it as GENCODE-style GFF3",
+          file=sys.stderr)
+REF_ANNOTATION = (config["annotation"] if REF_GFF3_FORMAT in ("gencode", "unknown")
+                  else str(WORK_DIR / f"reference/{REF_GENOME}.normalized.gff3"))
 ISOSEQ_GENOMES = config.get("isoseq_genomes", [])
 NON_RNASEQ_GENOMES = [g for g in TARGET_GENOMES if g not in RNASEQ_GENOMES]
 
@@ -1245,7 +1262,7 @@ def run_or_submit(script_body, job_script_path, outputs_to_check,
 # declared local so Snakemake doesn't double-count their threads — actual
 # concurrency is gated by threads: / mem_gb: in each rule's resources block.
 localrules: setup_pipeline_directories, build_db, prepare_genome_files, \
-    build_miniprot_index, prepare_reference_files, transmap_map_psl, run_miniprot, run_transcript_map, \
+    build_miniprot_index, normalize_reference_gff3, prepare_reference_files, transmap_map_psl, run_miniprot, run_transcript_map, \
     run_chaining_per_genome, transmap_unfiltered_gtf, minimap2_bam, \
     bam_to_chain, transmap_pairwise_map_psl, augustus_run_tm_and_tmr, \
     augustus_run_tm_only, augustus_run_tm_pairwise_and_tmr_pairwise, \
@@ -1467,13 +1484,36 @@ rule init_target_genome_database:
     shell:
         "touch {output.genome_db}"
 
+rule normalize_reference_gff3:
+    """Native Ensembl GFF3 -> GENCODE-style GFF3 (only used when the reference is not GENCODE-style)."""
+    input:
+        gff3 = config["annotation"]
+    output:
+        gff3 = WORK_DIR / f"reference/{REF_GENOME}.normalized.gff3"
+    log:
+        WORK_DIR / f"logs/prepare_reference_files/{REF_GENOME}.normalize.log"
+    run:
+        with open(log[0], "a") as log_file:
+            run_or_submit(
+                build_sbatch_header(
+                    "prepare_reference_files", f"norm-ref-{REF_GENOME}",
+                    f"{config['work_dir']}/logs/prepare_reference_files/{REF_GENOME}_normalize_slurm.out",
+                    f"{config['work_dir']}/logs/prepare_reference_files/{REF_GENOME}_normalize_slurm.err",
+                ) + f"""
+python -m cat.reference_gff3 ensembl {input.gff3} {output.gff3} 2>> {log[0]}
+""",
+                f"{config['work_dir']}/reference/{REF_GENOME}_normalize_job.sh",
+                [output.gff3], log_file, "prepare_reference_files",
+                max_wait_s=timeout_s("prepare_reference_files"))
+
+
 rule prepare_reference_files:
     """
     Submits reference file preparation as a SLURM job to process reference 
     annotation into various formats and create databases.
     """
     input:
-        gff3 = config["annotation"],
+        gff3 = REF_ANNOTATION,
         ref_fasta = WORK_DIR / f"genome_files/{REF_GENOME}.fa",
         ref_sizes = WORK_DIR / f"genome_files/{REF_GENOME}.chrom.sizes"
     output:
