@@ -17,6 +17,7 @@ from cat.miniprot_novel_call import (
     has_rna_support,
 )
 import tools.fileOps
+import tools.gff3
 import tools.intervals
 import tools.mathOps
 import tools.misc
@@ -1519,7 +1520,7 @@ def rescue_expressed_noncoding_to_pc(final_consensus, tx_dict, metrics,
     # IG/TR biotypes are protein-coding-competent by construction and are never gated.
     def _needs_protein_gate(attrs):
         src = attrs.get('source_gene_biotype') or ''
-        return src == 'lncRNA' or 'pseudogene' in src or src in ('misc_RNA', 'TEC')
+        return src in ('lncRNA', 'lincRNA') or 'pseudogene' in src or src in ('misc_RNA', 'TEC')
 
     # Merged augMP CDS-span footprint per (chrom, strand) from ALL augMP inputs.
     nc = tools.nameConversions
@@ -1851,14 +1852,10 @@ def generate_consensus(args):
     coding_count = ref_biotype_counts['protein_coding']
     non_coding_count = sum(y for x, y in ref_biotype_counts.items() if x != 'protein_coding')
     
-    # Create readthrough gene map from ExtraTags (check both readthrough_gene and readthrough_transcript)
-    readthrough_gene_set = set()
-    if 'ExtraTags' in ref_df.columns:
-        # Some annotations have readthrough_gene tag, some have readthrough_transcript tag
-        readthrough_mask = (ref_df['ExtraTags'].str.contains('readthrough_gene', na=False) | 
-                           ref_df['ExtraTags'].str.contains('readthrough_transcript', na=False))
-        readthrough_gene_set = set(ref_df[readthrough_mask]['GeneId'].unique())
-        logger.info(f"  Found {len(readthrough_gene_set)} readthrough genes in reference")
+    # Reference readthrough genes (GENCODE tags, else description / NAME1-NAME2)
+    readthrough_gene_set = tools.gff3.readthrough_genes(ref_df)
+    logger.info(f"  Found {len(readthrough_gene_set)} readthrough genes in reference")
+    tools.gff3.set_reference_gene_ids(ref_df['GeneId'].unique())
     
     # Build reference gene coordinate map for checking overlaps
     # This will be used to check if overlapping genes in the target also overlap in the reference
