@@ -102,6 +102,7 @@ def _iter_gene_only_features(gff3_path, existing_ids):
         attrs = raw["attrs"]
         biotype = (
             _first(attrs, "gene_biotype")
+            or _first(attrs, "gene_type")
             or _first(attrs, "biotype")
             or raw["featuretype"]
         )
