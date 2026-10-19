@@ -1,4 +1,5 @@
 import collections
+import re
 import pandas as pd
 from . import fileOps
 from . import transcripts
@@ -16,6 +17,52 @@ reserved_keys = ['gene_biotype',
                  'ID',
                  'Name',
                  'Parent']
+
+
+# Reference gene IDs of the current run (versionless). Set by the consensus
+# entry points from the reference annotation; inherited by forked workers.
+_REF_GENE_IDS = None
+# Fallback when unset: any Ensembl species gene ID (ENSG, ENSMUSG, ENSGALG...).
+ENSEMBL_GENE_RE = re.compile(r"^ENS[A-Z]*G\d+")
+
+
+def set_reference_gene_ids(gene_ids):
+    global _REF_GENE_IDS
+    _REF_GENE_IDS = {str(g).split('.')[0] for g in gene_ids}
+
+
+def is_reference_gene(gene_id):
+    """True if gene_id is a gene of the reference annotation (any naming scheme)."""
+    g = str(gene_id)
+    if _REF_GENE_IDS is not None:
+        return g.split('.')[0] in _REF_GENE_IDS
+    return bool(ENSEMBL_GENE_RE.match(g))
+
+
+def readthrough_genes(ref_df):
+    """Reference readthrough gene IDs.
+
+    GENCODE (and converted RefSeq) tag them readthrough_gene / readthrough_transcript.
+    Native Ensembl annotations of other species carry no such tag: there a gene
+    counts when its description says readthrough, or, only if nothing was found
+    that way, when its name is NAME1-NAME2 with both parts reference genes.
+    """
+    if 'ExtraTags' not in ref_df.columns:
+        return set()
+    tags = ref_df['ExtraTags'].fillna('')
+    mask = tags.str.contains('readthrough_gene') | tags.str.contains('readthrough_transcript')
+    found = set(ref_df[mask]['GeneId'].unique())
+    if found:
+        return found
+    found = set(ref_df[tags.str.contains(r'description=[^;]*readthrough', case=False)]['GeneId'].unique())
+    if found or 'GeneName' not in ref_df.columns:
+        return found
+    names = set(ref_df['GeneName'].dropna().astype(str).str.upper())
+    for gid, name in zip(ref_df['GeneId'], ref_df['GeneName'].astype(str).str.upper()):
+        parts = name.split('-')
+        if len(parts) == 2 and all(p in names and p != name for p in parts):
+            found.add(gid)
+    return found
 
 
 def check_gff3_for_disjoint_gene_ids(tx_dict, by_chrom=True):
