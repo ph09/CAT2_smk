@@ -1557,7 +1557,8 @@ def calculate_improvement_metrics(final_consensus, scored_df, tm_eval_df, suppor
             continue
         elif aln_id.startswith('exRef-') or _is_denovo(aln_id):
             continue
-        elif aln_id.startswith('ENST'):  # transMap uses Ensembl IDs
+        elif (tools.nameConversions.remove_augustus_alignment_number(aln_id) == aln_id
+              and not tools.nameConversions.aln_id_is_miniprot(aln_id)):  # transMap: bare reference IDs
             metrics['Evaluation Improvement']['unchanged'] += 1
             continue
         # Check if the alignment ID exists in the DataFrame before trying to access it
