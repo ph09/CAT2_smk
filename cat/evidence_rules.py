@@ -69,6 +69,11 @@ logger = logging.getLogger(__name__)
 PROTEIN_CODING = "protein_coding"
 UNKNOWN_LIKELY_CODING = "unknown_likely_coding"
 PROJ_MODES = ("transMap", "transMap_pairwise", "augTM", "augTM_pairwise")
+# lncRNA-class reference biotypes: current GENCODE/Ensembl, older Ensembl releases
+# (still used for many species), and RefSeq names kept by reference_gff3.
+REF_LNC_BIOTYPES = {"lncRNA", "TEC", "lincRNA", "antisense", "antisense_RNA", "sense_intronic",
+                    "sense_overlapping", "macro_lncRNA", "bidirectional_promoter_lncRNA",
+                    "3prime_overlapping_ncRNA", "non_coding", "processed_transcript"}
 
 EV_MIN_QCOV = 0.9
 EV_MIN_PID = 0.9
@@ -268,17 +273,23 @@ class Annotation:
         x = self.info[t]
         b = x.get("gene_biotype", "")
         return x.get("alignment_mode") in PROJ_MODES and b != PROTEIN_CODING and "unitary" not in b and (
-            "pseudogene" in b or b in ("lncRNA", "TEC") or b.startswith(("TR_", "IG_")))
+            "pseudogene" in b or b in REF_LNC_BIOTYPES or b.startswith(("TR_", "IG_")))
+
+
+def _read_gp_attrs(gp_attrs):
+    """gp_attrs rows -> {feature ID: {attr: value}} (gene and transcript rows)."""
+    rows = collections.defaultdict(dict)
+    with open(gp_attrs) as fh:
+        for line in fh:
+            k, a, v = line.rstrip("\n").split("\t")[:3]
+            rows[k][a] = v
+    return rows
 
 
 def read_ref_protein_aa(ref_gp, gp_attrs):
     """reference gene (versionless) -> longest protein length (aa)."""
-    tx2g = {}
-    with open(gp_attrs) as fh:
-        for line in fh:
-            k, a, v = line.rstrip("\n").split("\t")[:3]
-            if k.startswith("ENST") and a == "gene_id":
-                tx2g[k] = v.split(".")[0]
+    tx2g = {k: d["gene_id"].split(".")[0] for k, d in _read_gp_attrs(gp_attrs).items()
+            if "transcript_id" in d and "gene_id" in d}
     out = collections.defaultdict(int)
     with open(ref_gp) as fh:
         for line in fh:
@@ -294,12 +305,16 @@ def read_ref_protein_aa(ref_gp, gp_attrs):
 
 
 def read_ref_biotypes(gp_attrs):
+    """reference gene (versionless) -> gene biotype, for any Ensembl-style reference.
+
+    Taken from gene rows, else from the gene_* attributes on its transcripts.
+    """
     bt = {}
-    with open(gp_attrs) as fh:
-        for line in fh:
-            k, a, v = line.rstrip("\n").split("\t")[:3]
-            if k.startswith("ENSG") and a in ("gene_biotype", "gene_type"):
-                bt[k.split(".")[0]] = v
+    for k, d in _read_gp_attrs(gp_attrs).items():
+        b = d.get("gene_biotype") or d.get("gene_type")
+        g = d.get("gene_id", k)
+        if b and (g == k or g.split(".")[0] not in bt):
+            bt[g.split(".")[0]] = b
     return bt
 
 
@@ -450,7 +465,7 @@ def precision_rules(ann, loci, seqs, stats, skip_genes=()):
                 stats["R4 masked, no close-relative evidence"] += 1
                 continue
         call = x.get("protein_refine_call", "")
-        if call in ("real_copy", "named_copy", "rescued") and not s.startswith("ENS"):
+        if call in ("real_copy", "named_copy", "rescued") and s not in ann.ref_bt:
             name = x["source_gene_common_name"].upper()
             aa = max(t.cds_size for t in txs) // 3
             if longest_aa.get(name) and aa < NAMED_COPY_MIN_FRAC * longest_aa[name]:
