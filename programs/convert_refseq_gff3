@@ -1,0 +1,28 @@
+#!/usr/bin/env python
+"""Convert an NCBI RefSeq / Gnomon GFF3 (GCF_*_genomic.gff[.gz]) into the
+Ensembl/GENCODE-style GFF3 CAT2 uses as its reference annotation.
+
+  genes        gene_id = NCBI GeneID, gene_name = symbol, Ensembl biotypes
+               (V_segment -> IG_V_gene / TR_V_gene, antisense_RNA -> lncRNA, ...)
+  transcripts  transcript_id = RefSeq accession (NM_/NR_/XM_/XR_), biotype from
+               CDS presence and feature type (non-coding isoforms of coding genes
+               -> processed_transcript), tag = MANE_Select / RefSeq_Select /
+               readthrough_transcript
+  dropped      regulatory/region features, mature miRNAs (precursor kept),
+               trans-spliced genes, alt/patch scaffolds (unless --keep-alt)
+  seqids       --assembly-report renames NC_000001.11 -> chr1 (default UCSC
+               column); --chrom-map takes a 2-column file instead. The names
+               must match the reference genome FASTA in the HAL.
+
+example:
+  programs/convert_refseq_gff3 GCF_016699485.2_genomic.gff.gz chicken.cat.gff3 \\
+      --assembly-report GCF_016699485.2_assembly_report.txt --seq-names genbank
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from cat.reference_gff3 import main  # noqa: E402
+
+if __name__ == "__main__":
+    main(["refseq"] + sys.argv[1:])
