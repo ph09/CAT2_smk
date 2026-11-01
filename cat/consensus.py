@@ -1818,13 +1818,16 @@ def write_consensus_gff3(consensus_gene_dict, consensus_gff3):
             yield [chrom, 'CAT', 'intron', intron.start + 1, intron.stop, score, intron.strand, '.', attrs_field]
 
     def generate_start_stop_codon_records(chrom, tx_obj, tx_id, attrs):
+        # A codon split over a splice junction is two records; each gets its own
+        # ID (start_codon:{tx}:{i}) like exons/CDS. A shared ID is legal GFF3 but
+        # gffutils (IsoQuant, merge_strategy='error') rejects it as a duplicate.
         if attrs.get('valid_start'):
-            score, attrs_field = convert_attrs(attrs, f'start_codon:{tx_id}')
-            for iv in tx_obj.get_start_intervals():
+            for i, iv in enumerate(tx_obj.get_start_intervals()):
+                score, attrs_field = convert_attrs(attrs, f'start_codon:{tx_id}:{i}')
                 yield [chrom, 'CAT', 'start_codon', iv.start + 1, iv.stop, score, tx_obj.strand, iv.data, attrs_field]
         if attrs.get('valid_stop'):
-            score, attrs_field = convert_attrs(attrs, f'stop_codon:{tx_id}')
-            for iv in tx_obj.get_stop_intervals():
+            for i, iv in enumerate(tx_obj.get_stop_intervals()):
+                score, attrs_field = convert_attrs(attrs, f'stop_codon:{tx_id}:{i}')
                 yield [chrom, 'CAT', 'stop_codon', iv.start + 1, iv.stop, score, tx_obj.strand, iv.data, attrs_field]
 
     # Main writing logic: open file directly
