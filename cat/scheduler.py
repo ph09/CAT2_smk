@@ -474,6 +474,11 @@ _SLURM_SUCCESS_STATES = {"COMPLETED"}
 _SLURM_FINAL_STATES = _SLURM_FAILED_STATES | _SLURM_SUCCESS_STATES | {"DEADLINE", "REVOKED", "SPECIAL_EXIT"}
 _SACCT_SETTLE_TRIES = 18
 _SACCT_SETTLE_WAIT_S = 10
+# States meaning the job has not finished; squeue may briefly drop such jobs.
+_SLURM_QUEUED_STATES = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED", "CONFIGURING",
+                        "REQUEUE_HOLD", "REQUEUE_FED"}
+# How long to keep waiting on a job squeue no longer lists but sacct still shows queued.
+_SQUEUE_GONE_GRACE_S = 6 * 3600
 
 
 class SlurmScheduler(Scheduler):
@@ -486,6 +491,8 @@ class SlurmScheduler(Scheduler):
         self.default_partition: Optional[str] = cfg.get("partition")
         self.default_exclude: str = cfg.get("exclude_nodes", "") or ""
         self.default_module_load: str = cfg.get("module_load", "") or ""
+        # job_id -> first time squeue dropped it while sacct still showed it queued
+        self._gone_but_queued: dict[str, float] = {}
 
     # ── identity ─────────────────────────────────────────────────────────
     def task_id_env(self) -> str:
@@ -702,8 +709,46 @@ class SlurmScheduler(Scheduler):
             )
         except FileNotFoundError:
             return True  # squeue gone? Be conservative.
-        # squeue exits 0 with empty stdout when the job is no longer queued.
-        return bool(res.stdout.strip())
+        if res.stdout.strip():
+            self._gone_but_queued.pop(str(job_id), None)
+            return True
+        # Empty squeue output normally means the job finished ("Invalid job id"
+        # with rc=1 once slurmctld has purged it). But a controller glitch gives
+        # the same picture while the job is still PENDING/RUNNING (2026-11-01:
+        # two Augustus waits failed with every task still PENDING), and a
+        # slurmctld timeout exits non-zero with empty stdout. Ask sacct; keep
+        # waiting while it still shows the job queued, for at most
+        # _SQUEUE_GONE_GRACE_S, then fall through to verify_completed.
+        queued = self._sacct_queued_rows(job_id)
+        squeue_error = res.returncode != 0 and "invalid job id" not in (res.stderr or "").lower()
+        if queued is None:
+            still = squeue_error      # sacct unavailable too: trust squeue's error state
+        else:
+            still = bool(queued)
+        if still:
+            first = self._gone_but_queued.setdefault(str(job_id), time.time())
+            if time.time() - first < _SQUEUE_GONE_GRACE_S:
+                what = (f"squeue failed (rc={res.returncode}: {res.stderr.strip()[:120]})" if squeue_error
+                        else "squeue no longer lists it")
+                eg = f" sacct still shows {len(queued)} queued row(s), e.g. {queued[0]}" if queued else ""
+                logger.warning(f"job {job_id}: {what};{eg} still waiting")
+                return True
+        self._gone_but_queued.pop(str(job_id), None)
+        return False
+
+    @staticmethod
+    def _sacct_queued_rows(job_id: str) -> Optional[list[str]]:
+        """sacct rows of job_id still PENDING/RUNNING/etc.; None if sacct fails."""
+        try:
+            res = subprocess.run(
+                ["sacct", "-j", str(job_id), "-n", "-X", "-o", "JobID,State", "--parsable2"],
+                capture_output=True, text=True, check=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        return [line.split("|")[0] for line in res.stdout.strip().splitlines()
+                if len(line.split("|")) >= 2
+                and (line.split("|")[1].split() or [""])[0] in _SLURM_QUEUED_STATES]
 
     def verify_completed(self, job_id: str) -> JobResult:
         """Inspect sacct for per-task State / ExitCode after the job drains.
