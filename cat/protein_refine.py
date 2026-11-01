@@ -2224,7 +2224,9 @@ def run(args) -> int:
     orphan_rows = []
     for h, tx in rescues:
         tx_id = tx.name
-        gene_id = tx_id
+        # Distinct gene ID (MPRG-SYM-pos vs transcript MPR-SYM-pos): GFF3 IDs must be
+        # unique, and gffutils/IsoQuant reject a gene and transcript sharing one.
+        gene_id = "MPRG-" + tx_id[len("MPR-"):] if tx_id.startswith("MPR-") else f"{tx_id}_gene"
         template = info.iloc[0].to_dict() if len(info) else {}
         rec = info_row_for_orphan(template, gene_id, tx_id, h, args.genome)
         rec["_tx"] = tx
